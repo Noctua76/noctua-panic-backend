@@ -18,6 +18,17 @@ app.post('/trigger-alert', (req, res) => {
   return res.json({ status: 'ok', message: 'Alert received by backend' });
 });
 
+// === ALERT ENDPOINT used by the WebApp ===
+app.post('/alert', (req, res) => {
+  console.log('ALERT ENDPOINT HIT:', req.body);
+
+  return res.json({
+    status: 'ok',
+    message: 'Alert received by backend (via /alert)',
+    data: req.body
+  });
+});
+
 // --- OpenAI Assistant connection ---
 const OpenAI = require("openai");
 
@@ -130,3 +141,4 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
