@@ -137,13 +137,16 @@ app.post('/send-sms', async (req, res) => {
 });
 
 // --- Health check για το webapp ---
+// --- Health check για το webapp (TEST: να φαίνεται OFFLINE) ---
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+  // Σκόπιμα επιστρέφουμε error status για να “κοκκινίσει” το webapp
+  res.status(500).json({ status: 'error' });
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
 
 
