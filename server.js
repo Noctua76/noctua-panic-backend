@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
-// 🔹 Vonage SDK
 
 const app = express();
 app.use(cors());
@@ -141,29 +140,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-
-// ----------------------------------------------------------
-// Vonage SMS Test Route (Για δοκιμή με το κινητό σου)
-// ----------------------------------------------------------
-
-app.post('/test-sms', async (req, res) => {
-  const { to, text } = req.body;
-
-  try {
-    const response = await vonage.sms.send({
-      to,
-      from: "NOCTUA",   // alpha sender ID (όχι generic τύπου INFO/SMS)
-      text
-    });
-
-    console.log("Vonage SMS Response:", response);
-    res.json({ status: "ok", message: "SMS sent", response });
-
-  } catch (err) {
-    console.error("Vonage SMS Error:", err);
-    res.status(500).json({ error: "SMS failed", details: err });
-  }
-});
 // ----------------------------------------------------------
 // Vonage SMS Test Route (χωρίς SDK – καθαρό HTTP request)
 // ----------------------------------------------------------
@@ -198,7 +174,6 @@ app.post('/test-sms', async (req, res) => {
   }
 });
 
-
 // ----------------------------------------------------------
 // START SERVER
 // ----------------------------------------------------------
@@ -206,4 +181,3 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
-
