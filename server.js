@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 // 🔹 Vonage SDK
-const { Vonage } = require('@vonage/server-sdk');
 
 const app = express();
 app.use(cors());
@@ -146,10 +145,6 @@ app.get('/health', (req, res) => {
 // ----------------------------------------------------------
 // Vonage SMS Test Route (Για δοκιμή με το κινητό σου)
 // ----------------------------------------------------------
-const vonage = new Vonage({
-  apiKey: process.env.VONAGE_API_KEY,
-  apiSecret: process.env.VONAGE_API_SECRET
-});
 
 app.post('/test-sms', async (req, res) => {
   const { to, text } = req.body;
@@ -169,6 +164,39 @@ app.post('/test-sms', async (req, res) => {
     res.status(500).json({ error: "SMS failed", details: err });
   }
 });
+// ----------------------------------------------------------
+// Vonage SMS Test Route (χωρίς SDK – καθαρό HTTP request)
+// ----------------------------------------------------------
+app.post('/test-sms', async (req, res) => {
+  const { to, text } = req.body;
+
+  if (!to || !text) {
+    return res.status(400).json({ error: 'Required fields: to, text' });
+  }
+
+  try {
+    const params = new URLSearchParams();
+    params.append('api_key', process.env.VONAGE_API_KEY);
+    params.append('api_secret', process.env.VONAGE_API_SECRET);
+    params.append('to', to);
+    params.append('from', 'NOCTUA');   // alpha sender ID (επιτρεπτό)
+    params.append('text', text);
+
+    const response = await fetch('https://rest.nexmo.com/sms/json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+
+    const data = await response.json();
+    console.log('Vonage SMS Response:', data);
+
+    res.json({ status: 'ok', data });
+  } catch (err) {
+    console.error('Vonage SMS Error:', err);
+    res.status(500).json({ error: 'SMS failed', details: err.message });
+  }
+});
 
 
 // ----------------------------------------------------------
@@ -178,3 +206,4 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
