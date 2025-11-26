@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
+// 🔹 Vonage SDK
+const { Vonage } = require('@vonage/server-sdk');
 
 const app = express();
 app.use(cors());
@@ -33,24 +35,24 @@ app.post('/alert', (req, res) => {
 const OpenAI = require("openai");
 
 const client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 // Λειτουργία: Στέλνει το alert log στον Assistant για καταγραφή
 async function processIncidentLog(message) {
-    try {
-        const response = await client.responses.create({
-            model: "gpt-4.1-mini",
-            input: message
-        });
+  try {
+    const response = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: message
+    });
 
-        console.log("Assistant log:", response.output[0].content[0].text);
-        return response.output[0].content[0].text;
+    console.log("Assistant log:", response.output[0].content[0].text);
+    return response.output[0].content[0].text;
 
-    } catch (err) {
-        console.error("Assistant error:", err);
-        return "Assistant failed to process log";
-    }
+  } catch (err) {
+    console.error("Assistant error:", err);
+    return "Assistant failed to process log";
+  }
 }
 
 // ----------------------------------------------------------
@@ -102,51 +104,77 @@ ${message}
 });
 
 
-
 // ---------------------------------------------------------------------
 // GreekSMS API route
 // ---------------------------------------------------------------------
 app.post('/send-sms', async (req, res) => {
   try {
-      const { phone, message } = req.body;
+    const { phone, message } = req.body;
 
-      if (!phone || !message) {
-          return res.status(400).json({ error: 'Phone and message are required' });
-      }
+    if (!phone || !message) {
+      return res.status(400).json({ error: 'Phone and message are required' });
+    }
 
-      const response = await fetch('https://www.greecesms.gr/api/send', {
-          method: 'POST',
-          headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${process.env.GREEK_SMS_API_KEY}`
-          },
-          body: JSON.stringify({
-              to: phone,
-              message: message,
-              sender: process.env.GREEK_SMS_SENDER_ID
-          })
-      });
+    const response = await fetch('https://www.greecesms.gr/api/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GREEK_SMS_API_KEY}`
+      },
+      body: JSON.stringify({
+        to: phone,
+        message: message,
+        sender: process.env.GREEK_SMS_SENDER_ID
+      })
+    });
 
-      const data = await response.json();
-      return res.json({ status: 'ok', data });
+    const data = await response.json();
+    return res.json({ status: 'ok', data });
 
   } catch (error) {
-      console.error('SMS Error:', error);
-      return res.status(500).json({ error: 'SMS sending failed' });
+    console.error('SMS Error:', error);
+    return res.status(500).json({ error: 'SMS sending failed' });
   }
 });
 
-// --- Health check για το webapp ---
 // --- Health check για το webapp (NORMAL) ---
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+
+// ----------------------------------------------------------
+// Vonage SMS Test Route (Για δοκιμή με το κινητό σου)
+// ----------------------------------------------------------
+const vonage = new Vonage({
+  apiKey: process.env.VONAGE_API_KEY,
+  apiSecret: process.env.VONAGE_API_SECRET
+});
+
+app.post('/test-sms', async (req, res) => {
+  const { to, text } = req.body;
+
+  try {
+    const response = await vonage.sms.send({
+      to,
+      from: "NOCTUA",   // alpha sender ID (όχι generic τύπου INFO/SMS)
+      text
+    });
+
+    console.log("Vonage SMS Response:", response);
+    res.json({ status: "ok", message: "SMS sent", response });
+
+  } catch (err) {
+    console.error("Vonage SMS Error:", err);
+    res.status(500).json({ error: "SMS failed", details: err });
+  }
+});
+
+
+// ----------------------------------------------------------
+// START SERVER
+// ----------------------------------------------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
-
-
-
-
