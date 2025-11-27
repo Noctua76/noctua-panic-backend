@@ -18,17 +18,6 @@ app.post('/trigger-alert', (req, res) => {
   return res.json({ status: 'ok', message: 'Alert received by backend' });
 });
 
-// === ALERT ENDPOINT used by the WebApp ===
-app.post('/alert', (req, res) => {
-  console.log('ALERT ENDPOINT HIT:', req.body);
-
-  return res.json({
-    status: 'ok',
-    message: 'Alert received by backend (via /alert)',
-    data: req.body
-  });
-});
-
 // --- OpenAI Assistant connection ---
 const OpenAI = require("openai");
 
@@ -140,8 +129,32 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+
 // ----------------------------------------------------------
-// Vonage SMS Test Route (χωρίς SDK – καθαρό HTTP request)
+// Helper: Αποστολή SMS μέσω Vonage (κοινή λογική)
+// ----------------------------------------------------------
+async function sendVonageSms(to, text) {
+  const params = new URLSearchParams();
+  params.append('api_key', process.env.VONAGE_API_KEY);
+  params.append('api_secret', process.env.VONAGE_API_SECRET);
+  params.append('to', to);
+  params.append('from', 'NOCTUA');   // alpha sender ID (επιτρεπτό)
+  params.append('text', text);
+
+  const response = await fetch('https://rest.nexmo.com/sms/json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+
+  const data = await response.json();
+  console.log('Vonage SMS Response:', data);
+  return data;
+}
+
+
+// ----------------------------------------------------------
+// Vonage SMS Test Route (χρησιμοποιεί το helper sendVonageSms)
 // ----------------------------------------------------------
 app.post('/test-sms', async (req, res) => {
   const { to, text } = req.body;
@@ -151,28 +164,67 @@ app.post('/test-sms', async (req, res) => {
   }
 
   try {
-    const params = new URLSearchParams();
-    params.append('api_key', process.env.VONAGE_API_KEY);
-    params.append('api_secret', process.env.VONAGE_API_SECRET);
-    params.append('to', to);
-    params.append('from', 'NOCTUA');   // alpha sender ID (επιτρεπτό)
-    params.append('text', text);
-
-    const response = await fetch('https://rest.nexmo.com/sms/json', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString()
-    });
-
-    const data = await response.json();
-    console.log('Vonage SMS Response:', data);
-
+    const data = await sendVonageSms(to, text);
     res.json({ status: 'ok', data });
   } catch (err) {
     console.error('Vonage SMS Error:', err);
     res.status(500).json({ error: 'SMS failed', details: err.message });
   }
 });
+
+
+// === ALERT ENDPOINT used by the WebApp ===
+app.post('/alert', async (req, res) => {
+  console.log('ALERT ENDPOINT HIT:', req.body);
+
+  const { siteId, guardId, triggeredAt, source } = req.body || {};
+
+  // Παίρνουμε τους παραλήπτες από το env
+  const recipientsEnv =
+    process.env.ALERT_RECIPIENTS || process.env.ALERT_TARGET || '';
+
+  const recipients = recipientsEnv
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  if (recipients.length === 0) {
+    console.error('No alert recipients configured (ALERT_RECIPIENTS empty)');
+    return res.status(500).json({
+      status: 'error',
+      message: 'No alert recipients configured on server.'
+    });
+  }
+
+  const text =
+    `NOCTUA PANIC ALERT\n` +
+    `Site: ${siteId || 'N/A'}\n` +
+    `Guard: ${guardId || 'N/A'}\n` +
+    `Source: ${source || 'noctua-panic-webapp'}\n` +
+    `Time: ${triggeredAt || new Date().toISOString()}`;
+
+  try {
+    // Στέλνουμε SMS σε όλους τους παραλήπτες παράλληλα
+    const results = await Promise.all(
+      recipients.map(to => sendVonageSms(to, text))
+    );
+
+    return res.json({
+      status: 'ok',
+      message: 'Alert received & SMS sent',
+      recipients,
+      smsResults: results
+    });
+  } catch (err) {
+    console.error('Error sending panic SMS from /alert:', err);
+    return res.status(500).json({
+      status: 'error',
+      message: 'Alert received but SMS failed',
+      error: err.message
+    });
+  }
+});
+
 
 // ----------------------------------------------------------
 // START SERVER
