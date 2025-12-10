@@ -138,7 +138,7 @@ async function sendVonageSms(to, text) {
   params.append('api_key', process.env.VONAGE_API_KEY);
   params.append('api_secret', process.env.VONAGE_API_SECRET);
   params.append('to', to);
-  params.append('from', 'NOCTUA');   // alpha sender ID (επιτρεπτό)
+  params.append('from', '+12029334212');
   params.append('text', text);
 
   const response = await fetch('https://rest.nexmo.com/sms/json', {
@@ -233,3 +233,4 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
