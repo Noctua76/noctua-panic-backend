@@ -2,10 +2,22 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
+const { Vonage } = require('@vonage/server-sdk');
+
+const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
+  ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  : process.env.VONAGE_PRIVATE_KEY;
+
+const vonageVoice = new Vonage({
+  applicationId: process.env.VONAGE_APPLICATION_ID,
+  privateKey: VONAGE_PRIVATE_KEY
+});
+
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 app.use(morgan('dev'));
 
 app.get('/', (req, res) => {
@@ -138,7 +150,7 @@ async function sendVonageSms(to, text) {
   params.append('api_key', process.env.VONAGE_API_KEY);
   params.append('api_secret', process.env.VONAGE_API_SECRET);
   params.append('to', to);
-  params.append('from', '+12029334212');
+  params.append('from', process.env.VONAGE_FROM_NUMBER || '+12029334212');
   params.append('text', text);
 
   const response = await fetch('https://rest.nexmo.com/sms/json', {
@@ -172,6 +184,21 @@ app.post('/test-sms', async (req, res) => {
   }
 });
 
+async function startVoiceCalls(recipients) {
+  const baseUrl = 'https://noctua-panic-backend-production.up.railway.app';
+
+  const results = [];
+  for (const to of recipients) {
+    const r = await vonageVoice.voice.createOutboundCall({
+      to: [{ type: 'phone', number: to }],
+      from: { type: 'phone', number: process.env.VONAGE_FROM_NUMBER },
+      answer_url: [`${baseUrl}/webhooks/answer`],
+      event_url: [`${baseUrl}/webhooks/event`]
+    });
+    results.push({ to, response: r });
+  }
+  return results;
+}
 
 // === ALERT ENDPOINT used by the WebApp ===
 app.post('/alert', async (req, res) => {
@@ -205,16 +232,25 @@ app.post('/alert', async (req, res) => {
 
   try {
     // Στέλνουμε SMS σε όλους τους παραλήπτες παράλληλα
-    const results = await Promise.all(
-      recipients.map(to => sendVonageSms(to, text))
-    );
+const results = await Promise.all(
+  recipients.map(to => sendVonageSms(to, text))
+);
 
-    return res.json({
-      status: 'ok',
-      message: 'Alert received & SMS sent',
-      recipients,
-      smsResults: results
-    });
+// Ξεκινάμε και κλήσεις (χωρίς να επηρεάζει τα SMS αν αποτύχουν)
+let callResults = [];
+try {
+  callResults = await startVoiceCalls(recipients);
+} catch (callErr) {
+  console.error('Voice call failed (non-blocking):', callErr);
+}
+
+return res.json({
+  status: 'ok',
+  message: 'Alert received & SMS sent',
+  recipients,
+  smsResults: results,
+  callResults
+});
   } catch (err) {
     console.error('Error sending panic SMS from /alert:', err);
     return res.status(500).json({
@@ -256,5 +292,6 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
 
 
