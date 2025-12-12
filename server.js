@@ -193,7 +193,8 @@ async function startVoiceCalls(recipients) {
       to: [{ type: 'phone', number: to }],
       from: { type: 'phone', number: process.env.VONAGE_FROM_NUMBER },
       answer_url: [`${baseUrl}/webhooks/answer`],
-      event_url: [`${baseUrl}/webhooks/event`]
+      event_url:  [`${baseUrl}/webhooks/event`],
+      event_method: 'POST'   // 👈 ΜΠΑΙΝΕΙ ΕΔΩ
     });
     results.push({ to, response: r });
   }
@@ -281,10 +282,17 @@ function answerNcco(req, res) {
 app.get('/webhooks/answer', answerNcco);
 app.post('/webhooks/answer', answerNcco);
 
-app.post('/webhooks/event', (req, res) => {
-  console.log("VONAGE VOICE EVENT:", req.body);
+function eventHook(req, res) {
+  console.log("VONAGE VOICE EVENT:", {
+    method: req.method,
+    query: req.query,
+    body: req.body
+  });
   return res.status(200).send('ok');
-});
+}
+
+app.get('/webhooks/event', eventHook);
+app.post('/webhooks/event', eventHook);
 
 
 // ----------------------------------------------------------
@@ -294,6 +302,7 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
 
 
 
