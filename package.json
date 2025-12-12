@@ -8,11 +8,14 @@
     "dev": "nodemon server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@vonage/server-sdk": "^3.0.0"
+    "@vonage/server-sdk": "^3.0.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
@@ -23,5 +26,6 @@
     "nodemon": "^3.1.11"
   }
 }
+
 
 
