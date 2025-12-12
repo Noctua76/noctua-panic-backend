@@ -136,9 +136,12 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
-// --- Health check για το webapp (NORMAL) ---
+// --- Health check για το webapp (NO CACHE) ---
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.status(200).json({ status: 'ok' });
 });
 
 
@@ -302,6 +305,7 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
 
 
 
