@@ -227,10 +227,34 @@ app.post('/alert', async (req, res) => {
 
 
 // ----------------------------------------------------------
+// Vonage Voice Webhooks (match Vonage Application URLs)
+// ----------------------------------------------------------
+
+app.post('/webhooks/answer', (req, res) => {
+  // NCCO που παίζει το mp3
+  const audioUrl = process.env.ALERT_AUDIO_URL;
+
+  if (!audioUrl) {
+    return res.status(500).json([{ action: "talk", text: "Audio URL is not configured." }]);
+  }
+
+  return res.json([
+    { action: "stream", streamUrl: [audioUrl] }
+  ]);
+});
+
+app.post('/webhooks/event', (req, res) => {
+  console.log("VONAGE VOICE EVENT:", req.body);
+  return res.status(200).send('ok');
+});
+
+
+// ----------------------------------------------------------
 // START SERVER
 // ----------------------------------------------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
 
