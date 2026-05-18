@@ -170,20 +170,56 @@ app.post("/setup/users-table", async (req, res) => {
         username VARCHAR(100) UNIQUE NOT NULL,
         email VARCHAR(255),
         phone VARCHAR(50),
-
         role VARCHAR(50) NOT NULL DEFAULT 'guard',
-
         password_hash TEXT NOT NULL,
-
         status VARCHAR(50) NOT NULL DEFAULT 'active',
-
-        must_change_password BOOLEAN
-        NOT NULL DEFAULT true,
-
-        created_at TIMESTAMP
-        DEFAULT CURRENT_TIMESTAMP
+        must_change_password BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    res.json({ status: "ok", message: "Users table ready" });
+  } catch (err) {
+    console.error("Users table setup error:", err);
+    res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+app.post("/admin/users/create", async (req, res) => {
+  try {
+    const { full_name, username, email, phone, role, password } = req.body;
+
+    if (!full_name || !username || !password) {
+      return res.status(400).json({
+        status: "error",
+        message: "full_name, username and password are required"
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `
+      INSERT INTO users (
+        full_name, username, email, phone, role,
+        password_hash, status, must_change_password
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'active', true)
+      RETURNING id, full_name, username, email, phone, role, status, must_change_password, created_at
+      `,
+      [full_name, username, email || null, phone || null, role || "guard", passwordHash]
+    );
+
+    res.json({
+      status: "ok",
+      message: "User created",
+      user: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Create user error:", err);
+    res.status(500).json({ status: "error", message: err.message });
+  }
+});
     app.post("/admin/users/create", async (req, res) => {
   try {
     const {
