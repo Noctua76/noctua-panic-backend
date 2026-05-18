@@ -4,6 +4,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const { Vonage } = require('@vonage/server-sdk');
 const pool = require("./db");
+const bcrypt = require("bcrypt");
 
 const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -183,6 +184,66 @@ app.post("/setup/users-table", async (req, res) => {
         DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    app.post("/admin/users/create", async (req, res) => {
+  try {
+    const {
+      full_name,
+      username,
+      email,
+      phone,
+      role,
+      password
+    } = req.body;
+
+    if (!full_name || !username || !password) {
+      return res.status(400).json({
+        status: "error",
+        message: "full_name, username and password are required"
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `
+      INSERT INTO users (
+        full_name,
+        username,
+        email,
+        phone,
+        role,
+        password_hash,
+        status,
+        must_change_password
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'active', true)
+      RETURNING id, full_name, username, email, phone, role, status, must_change_password, created_at
+      `,
+      [
+        full_name,
+        username,
+        email || null,
+        phone || null,
+        role || "guard",
+        passwordHash
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "User created",
+      user: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error("Create user error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
     res.json({
       status: "ok",
