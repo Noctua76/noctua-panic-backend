@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const { Vonage } = require('@vonage/server-sdk');
+const pool = require("./db");
 
 const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -142,6 +143,22 @@ app.get('/health', (req, res) => {
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.status(200).json({ status: 'ok' });
+});
+app.get("/db-test", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    res.json({
+      status: "ok",
+      dbTime: result.rows[0]
+    });
+  } catch (err) {
+    console.error("DB test error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
 });
 
 
