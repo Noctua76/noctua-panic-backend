@@ -225,6 +225,56 @@ app.post("/admin/users/create", async (req, res) => {
   }
 });
 
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    const result = await pool.query(
+      "SELECT * FROM users WHERE username = $1",
+      [username]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid credentials"
+      });
+    }
+
+    const user = result.rows[0];
+
+    const validPassword = await bcrypt.compare(
+      password,
+      user.password_hash
+    );
+
+    if (!validPassword) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid credentials"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Login successful",
+      user: {
+        id: user.id,
+        full_name: user.full_name,
+        username: user.username,
+        role: user.role,
+        must_change_password: user.must_change_password
+      }
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 
 
 // ----------------------------------------------------------
