@@ -274,7 +274,131 @@ app.post("/auth/login", async (req, res) => {
     });
   }
 });
+// ----------------------------------------------------------
+// GUARD CHECK IN
+// ----------------------------------------------------------
+app.post("/guards/checkin", async (req, res) => {
+  try {
+    const { guard_id, site_id } = req.body;
 
+    const result = await pool.query(
+      `
+      INSERT INTO guard_shifts (
+        company_id,
+        guard_id,
+        site_id,
+        check_in_time,
+        status,
+        created_at
+      )
+      VALUES (
+        1,
+        $1,
+        $2,
+        NOW(),
+        'on_duty',
+        NOW()
+      )
+      RETURNING *
+      `,
+      [guard_id, site_id]
+    );
+
+    await pool.query(
+      `
+      UPDATE sites
+      SET active_guard_id = $1
+      WHERE id = $2
+      `,
+      [guard_id, site_id]
+    );
+
+    res.json({
+      status: "ok",
+      shift: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// GUARD CHECK OUT
+// ----------------------------------------------------------
+app.post("/guards/checkout", async (req, res) => {
+  try {
+    const { guard_id, site_id } = req.body;
+
+    await pool.query(
+      `
+      UPDATE guard_shifts
+      SET
+        check_out_time = NOW(),
+        status='completed'
+      WHERE
+        guard_id = $1
+        AND site_id = $2
+        AND check_out_time IS NULL
+      `,
+      [guard_id, site_id]
+    );
+
+    await pool.query(
+      `
+      UPDATE sites
+      SET active_guard_id = NULL
+      WHERE id = $1
+      `,
+      [site_id]
+    );
+
+    res.json({
+      status:"ok"
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      status:"error",
+      message:err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// ACTIVE GUARDS
+// ----------------------------------------------------------
+app.get("/guards/active", async (req,res)=>{
+
+const result = await pool.query(`
+SELECT
+s.id as site_id,
+s.name as site_name,
+u.id as guard_id,
+u.full_name,
+gs.check_in_time
+
+FROM sites s
+
+LEFT JOIN users u
+ON s.active_guard_id=u.id
+
+LEFT JOIN guard_shifts gs
+ON gs.guard_id=u.id
+
+WHERE gs.check_out_time IS NULL
+`);
+
+res.json(result.rows);
+
+});
 
 
 // ----------------------------------------------------------
