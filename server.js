@@ -242,6 +242,24 @@ app.post("/auth/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+    await pool.query(
+`
+INSERT INTO admin_sessions (
+  user_id,
+  username,
+  role,
+  login_time,
+  last_seen,
+  is_active
+)
+VALUES ($1,$2,$3,NOW(),NOW(),true)
+`,
+[
+  user.id,
+  user.username,
+  user.role
+]
+);
 
     if (user.status !== "active") {
   return res.status(403).json({
