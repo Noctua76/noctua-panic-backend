@@ -280,6 +280,14 @@ app.post("/auth/login", async (req, res) => {
 app.post("/guards/checkin", async (req, res) => {
   try {
     const { guard_id, site_id } = req.body;
+    await pool.query(
+  `
+  DELETE FROM guard_shifts
+  WHERE guard_id = $1
+    AND check_out_time IS NULL
+  `,
+  [guard_id]
+);
 
     const result = await pool.query(
       `
