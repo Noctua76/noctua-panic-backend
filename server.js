@@ -290,17 +290,17 @@ ORDER BY login_time DESC
 );
 
 let csv =
-"username,role,login_time,last_seen,logout_time,is_active,session_duration_seconds\n";
+"username;role;login_time;last_seen;logout_time;is_active;session_duration_seconds\n";
 
 result.rows.forEach(row=>{
 
 csv +=
-`${row.username},`+
-`${row.role},`+
-`${row.login_time},`+
-`${row.last_seen},`+
-`${row.logout_time || ""},`+
-`${row.is_active},`+
+`${row.username};`+
+`${row.role};`+
+`${row.login_time};`+
+`${row.last_seen};`+
+`${row.logout_time || ""};`+
+`${row.is_active};`+
 `${row.session_duration_seconds || ""}\n`;
 
 });
