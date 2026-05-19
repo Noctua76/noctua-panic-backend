@@ -243,10 +243,12 @@ app.post("/auth/login", async (req, res) => {
 
     const user = result.rows[0];
 
-    const validPassword = await bcrypt.compare(
-      password,
-      user.password_hash
-    );
+    if (user.status !== "active") {
+  return res.status(403).json({
+    status: "error",
+    message: "User account is inactive"
+  });
+}
 
     if (!validPassword) {
       return res.status(401).json({
