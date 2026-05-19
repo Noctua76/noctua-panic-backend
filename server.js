@@ -194,7 +194,9 @@ UPDATE admin_sessions
 SET
 logout_time = NOW(),
 is_active = false,
-last_seen = NOW()
+last_seen = NOW(),
+session_duration_seconds =
+EXTRACT(EPOCH FROM (NOW() - login_time))
 
 WHERE username = $1
 AND is_active = true
