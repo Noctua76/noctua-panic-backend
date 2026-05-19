@@ -289,6 +289,31 @@ ORDER BY login_time DESC
 `
 );
 
+result.rows.forEach(row => {
+
+row.login_time = row.login_time
+? new Date(row.login_time).toLocaleString(
+"el-GR",
+{ timeZone: "Europe/Athens" }
+)
+: "";
+
+row.last_seen = row.last_seen
+? new Date(row.last_seen).toLocaleString(
+"el-GR",
+{ timeZone: "Europe/Athens" }
+)
+: "";
+
+row.logout_time = row.logout_time
+? new Date(row.logout_time).toLocaleString(
+"el-GR",
+{ timeZone: "Europe/Athens" }
+)
+: "";
+
+});
+
 let csv =
 "username;role;login_time;last_seen;logout_time;is_active;session_duration_seconds\n";
 
