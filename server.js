@@ -227,10 +227,10 @@ app.get("/admin/sessions/history", async (req,res)=>{
 
 try{
 
-const result = await pool.query(
-`
-SELECT
+const { user, from, to, active } = req.query;
 
+let query = `
+SELECT
 id,
 username,
 role,
@@ -239,12 +239,35 @@ last_seen,
 logout_time,
 is_active,
 session_duration_seconds
-
 FROM admin_sessions
+WHERE 1=1
+`;
 
-ORDER BY login_time DESC
-`
-);
+const values = [];
+
+if(user){
+values.push(user);
+query += ` AND username = $${values.length}`;
+}
+
+if(from){
+values.push(from);
+query += ` AND login_time >= $${values.length}`;
+}
+
+if(to){
+values.push(to);
+query += ` AND login_time < ($${values.length}::date + INTERVAL '1 day')`;
+}
+
+if(active === "true" || active === "false"){
+values.push(active === "true");
+query += ` AND is_active = $${values.length}`;
+}
+
+query += ` ORDER BY login_time DESC`;
+
+const result = await pool.query(query, values);
 
 res.json({
 status:"ok",
