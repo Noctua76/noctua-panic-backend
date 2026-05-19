@@ -237,7 +237,7 @@ role,
 login_time,
 last_seen,
 logout_time,
-is_active
+is_active,
 session_duration_seconds
 
 FROM admin_sessions
