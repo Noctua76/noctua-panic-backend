@@ -176,6 +176,113 @@ message:err.message
 }
 
 });
+
+// --------------------------------------------------
+// ADMIN LOGIN HISTORY
+// --------------------------------------------------
+
+app.get("/admin/sessions/history", async (req,res)=>{
+
+try{
+
+const result = await pool.query(
+`
+SELECT
+
+id,
+username,
+role,
+login_time,
+last_seen,
+logout_time,
+is_active
+
+FROM admin_sessions
+
+ORDER BY login_time DESC
+`
+);
+
+res.json({
+status:"ok",
+sessions:result.rows
+});
+
+}catch(err){
+
+res.status(500).json({
+status:"error",
+message:err.message
+});
+
+}
+
+});
+
+
+// --------------------------------------------------
+// ADMIN LOGIN EXPORT CSV
+// --------------------------------------------------
+
+app.get("/admin/sessions/export", async (req,res)=>{
+
+try{
+
+const result = await pool.query(
+`
+SELECT
+
+username,
+role,
+login_time,
+last_seen,
+logout_time,
+is_active
+
+FROM admin_sessions
+
+ORDER BY login_time DESC
+`
+);
+
+let csv =
+"username,role,login_time,last_seen,logout_time,is_active\n";
+
+result.rows.forEach(row=>{
+
+csv +=
+`${row.username},`+
+`${row.role},`+
+`${row.login_time},`+
+`${row.last_seen},`+
+`${row.logout_time || ""},`+
+`${row.is_active}\n`;
+
+});
+
+res.setHeader(
+"Content-Type",
+"text/csv"
+);
+
+res.setHeader(
+"Content-Disposition",
+"attachment; filename=admin_sessions.csv"
+);
+
+res.send(csv);
+
+}catch(err){
+
+res.status(500).json({
+status:"error",
+message:err.message
+});
+
+}
+
+});
+
 // ---------------------------------------------------------------------
 // GreekSMS API route
 // ---------------------------------------------------------------------
