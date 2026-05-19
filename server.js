@@ -178,6 +178,46 @@ message:err.message
 });
 
 // --------------------------------------------------
+// ADMIN LOGOUT
+// --------------------------------------------------
+
+app.post("/admin/logout", async (req,res)=>{
+
+try{
+
+const { username } = req.body;
+
+await pool.query(
+`
+UPDATE admin_sessions
+
+SET
+logout_time = NOW(),
+is_active = false,
+last_seen = NOW()
+
+WHERE username = $1
+AND is_active = true
+`,
+[username]
+);
+
+res.json({
+status:"ok"
+});
+
+}catch(err){
+
+res.status(500).json({
+status:"error",
+message:err.message
+});
+
+}
+
+});
+
+// --------------------------------------------------
 // ADMIN LOGIN HISTORY
 // --------------------------------------------------
 
