@@ -280,7 +280,8 @@ role,
 login_time,
 last_seen,
 logout_time,
-is_active
+is_active,
+session_duration_seconds
 
 FROM admin_sessions
 
@@ -289,7 +290,7 @@ ORDER BY login_time DESC
 );
 
 let csv =
-"username,role,login_time,last_seen,logout_time,is_active\n";
+"username,role,login_time,last_seen,logout_time,is_active,session_duration_seconds\n";
 
 result.rows.forEach(row=>{
 
@@ -299,7 +300,8 @@ csv +=
 `${row.login_time},`+
 `${row.last_seen},`+
 `${row.logout_time || ""},`+
-`${row.is_active}\n`;
+`${row.is_active}\n`;+
+`${row.session_duration_seconds || ""}\n`;
 
 });
 
