@@ -300,7 +300,7 @@ csv +=
 `${row.login_time},`+
 `${row.last_seen},`+
 `${row.logout_time || ""},`+
-`${row.is_active}\n`;+
+`${row.is_active},`+
 `${row.session_duration_seconds || ""}\n`;
 
 });
