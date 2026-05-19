@@ -111,14 +111,21 @@ ${message}
 app.get("/admin/active", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT
-        username,
-        role,
-        login_time,
-        last_seen
-      FROM admin_sessions
-      WHERE is_active = true
-      ORDER BY login_time DESC
+      SELECT DISTINCT ON (username)
+
+username,
+role,
+login_time,
+last_seen
+
+FROM admin_sessions
+
+WHERE is_active=true
+
+AND last_seen >
+NOW() - INTERVAL '90 seconds'
+
+ORDER BY username,last_seen DESC
     `);
 
     res.json({
@@ -133,7 +140,42 @@ app.get("/admin/active", async (req, res) => {
     });
   }
 });
+// --------------------------------------------------
+// ADMIN HEARTBEAT
+// --------------------------------------------------
 
+app.post("/admin/heartbeat", async (req, res) => {
+
+try{
+
+const { username } = req.body;
+
+await pool.query(
+`
+UPDATE admin_sessions
+
+SET last_seen=NOW()
+
+WHERE username=$1
+AND is_active=true
+`,
+[username]
+);
+
+res.json({
+status:"ok"
+});
+
+}catch(err){
+
+res.status(500).json({
+status:"error",
+message:err.message
+});
+
+}
+
+});
 // ---------------------------------------------------------------------
 // GreekSMS API route
 // ---------------------------------------------------------------------
@@ -271,24 +313,7 @@ app.post("/auth/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-    await pool.query(
-`
-INSERT INTO admin_sessions (
-  user_id,
-  username,
-  role,
-  login_time,
-  last_seen,
-  is_active
-)
-VALUES ($1,$2,$3,NOW(),NOW(),true)
-`,
-[
-  user.id,
-  user.username,
-  user.role
-]
-);
+    
 
     if (user.status !== "active") {
   return res.status(403).json({
@@ -307,6 +332,24 @@ const validPassword = await bcrypt.compare(
         message: "Invalid credentials"
       });
     }
+    await pool.query(
+`
+INSERT INTO admin_sessions (
+  user_id,
+  username,
+  role,
+  login_time,
+  last_seen,
+  is_active
+)
+VALUES ($1,$2,$3,NOW(),NOW(),true)
+`,
+[
+  user.id,
+  user.username,
+  user.role
+]
+);
 
     res.json({
       status: "ok",
