@@ -304,7 +304,9 @@ login_time,
 last_seen,
 logout_time,
 is_active,
-session_duration_seconds
+session_duration_seconds,
+
+(is_active = true AND last_seen > NOW() - INTERVAL '90 seconds') AS is_currently_online
 
 FROM admin_sessions
 
