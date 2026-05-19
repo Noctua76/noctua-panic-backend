@@ -104,6 +104,35 @@ ${message}
   }
 });
 
+// --------------------------------------------------
+// ACTIVE ADMINS
+// --------------------------------------------------
+
+app.get("/admin/active", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        username,
+        role,
+        login_time,
+        last_seen
+      FROM admin_sessions
+      WHERE is_active = true
+      ORDER BY login_time DESC
+    `);
+
+    res.json({
+      status: "ok",
+      admins: result.rows
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
 // ---------------------------------------------------------------------
 // GreekSMS API route
