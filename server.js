@@ -817,6 +817,74 @@ app.get("/guards/active", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------
+// ALL GUARDS
+// ----------------------------------------------------------
+app.get("/guards", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        g.id,
+        g.full_name,
+        g.username,
+        g.phone,
+        g.role,
+        g.site_id,
+        g.active,
+        s.name AS site_name,
+        s.location AS site_location
+      FROM guards g
+      LEFT JOIN sites s ON s.id = g.site_id
+      ORDER BY g.full_name ASC
+    `);
+
+    res.json({
+      status: "ok",
+      guards: result.rows
+    });
+
+  } catch (err) {
+    console.error("All guards error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// ALL SITES
+// ----------------------------------------------------------
+app.get("/sites", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        company_id,
+        name,
+        location,
+        status,
+        active_guard_id,
+        created_at
+      FROM sites
+      ORDER BY id ASC
+    `);
+
+    res.json({
+      status: "ok",
+      sites: result.rows
+    });
+
+  } catch (err) {
+    console.error("Sites error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 
 // ----------------------------------------------------------
 // Helper: Αποστολή SMS μέσω Vonage (κοινή λογική)
