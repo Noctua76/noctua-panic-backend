@@ -580,37 +580,74 @@ VALUES ($1,$2,$3,NOW(),NOW(),true)
 // ----------------------------------------------------------
 app.post("/guards/checkin", async (req, res) => {
   try {
-    const { guard_id, site_id } = req.body;
-    await pool.query(
-  `
-  DELETE FROM guard_shifts
-  WHERE guard_id = $1
-    AND check_out_time IS NULL
-  `,
-  [guard_id]
-);
+    const { username, site_id } = req.body;
 
-    const result = await pool.query(
+    if (!username || !site_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "username and site_id are required"
+      });
+    }
+
+    const guardResult = await pool.query(
+      `
+      SELECT *
+      FROM guards
+      WHERE username = $1
+        AND active = true
+      `,
+      [username]
+    );
+
+    if (guardResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Guard not found or inactive"
+      });
+    }
+
+    const guard = guardResult.rows[0];
+
+    await pool.query(
+      `
+      UPDATE guard_shifts
+      SET
+        check_out_time = NOW(),
+        status = 'auto_closed',
+        online = false
+      WHERE guard_ref = $1
+        AND check_out_time IS NULL
+      `,
+      [guard.id]
+    );
+
+    const shiftResult = await pool.query(
       `
       INSERT INTO guard_shifts (
         company_id,
         guard_id,
+        guard_ref,
         site_id,
         check_in_time,
+        last_seen,
+        online,
         status,
         created_at
       )
       VALUES (
         1,
         $1,
+        $1,
         $2,
         NOW(),
+        NOW(),
+        true,
         'on_duty',
         NOW()
       )
       RETURNING *
       `,
-      [guard_id, site_id]
+      [guard.id, site_id]
     );
 
     await pool.query(
@@ -619,17 +656,55 @@ app.post("/guards/checkin", async (req, res) => {
       SET active_guard_id = $1
       WHERE id = $2
       `,
-      [guard_id, site_id]
+      [guard.id, site_id]
     );
 
     res.json({
       status: "ok",
-      shift: result.rows[0]
+      guard,
+      shift: shiftResult.rows[0]
     });
 
   } catch (err) {
-    console.error(err);
+    console.error("Guard checkin error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
+
+// ----------------------------------------------------------
+// GUARD HEARTBEAT
+// ----------------------------------------------------------
+app.post("/guards/heartbeat", async (req, res) => {
+  try {
+    const { guard_id } = req.body;
+
+    if (!guard_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "guard_id is required"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE guard_shifts
+      SET
+        last_seen = NOW(),
+        online = true
+      WHERE guard_ref = $1
+        AND check_out_time IS NULL
+      `,
+      [guard_id]
+    );
+
+    res.json({ status: "ok" });
+
+  } catch (err) {
+    console.error("Guard heartbeat error:", err);
     res.status(500).json({
       status: "error",
       message: err.message
@@ -645,14 +720,22 @@ app.post("/guards/checkout", async (req, res) => {
   try {
     const { guard_id, site_id } = req.body;
 
+    if (!guard_id || !site_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "guard_id and site_id are required"
+      });
+    }
+
     await pool.query(
       `
       UPDATE guard_shifts
       SET
         check_out_time = NOW(),
-        status='completed'
-      WHERE
-        guard_id = $1
+        status = 'completed',
+        online = false,
+        last_seen = NOW()
+      WHERE guard_ref = $1
         AND site_id = $2
         AND check_out_time IS NULL
       `,
@@ -664,18 +747,18 @@ app.post("/guards/checkout", async (req, res) => {
       UPDATE sites
       SET active_guard_id = NULL
       WHERE id = $1
+        AND active_guard_id = $2
       `,
-      [site_id]
+      [site_id, guard_id]
     );
 
-    res.json({
-      status:"ok"
-    });
+    res.json({ status: "ok" });
 
   } catch (err) {
+    console.error("Guard checkout error:", err);
     res.status(500).json({
-      status:"error",
-      message:err.message
+      status: "error",
+      message: err.message
     });
   }
 });
@@ -684,29 +767,54 @@ app.post("/guards/checkout", async (req, res) => {
 // ----------------------------------------------------------
 // ACTIVE GUARDS
 // ----------------------------------------------------------
-app.get("/guards/active", async (req,res)=>{
+app.get("/guards/active", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        s.id AS site_id,
+        s.name AS site_name,
+        s.location AS site_location,
 
-const result = await pool.query(`
-SELECT
-s.id as site_id,
-s.name as site_name,
-u.id as guard_id,
-u.full_name,
-gs.check_in_time
+        g.id AS guard_id,
+        g.full_name,
+        g.username,
+        g.phone,
 
-FROM sites s
+        gs.check_in_time,
+        gs.last_seen,
+        gs.online,
+        gs.status,
 
-LEFT JOIN users u
-ON s.active_guard_id=u.id
+        (
+          gs.online = true
+          AND gs.last_seen > NOW() - INTERVAL '90 seconds'
+          AND gs.check_out_time IS NULL
+        ) AS is_currently_online
 
-LEFT JOIN guard_shifts gs
-ON gs.guard_id=u.id
+      FROM sites s
 
-WHERE gs.check_out_time IS NULL
-`);
+      LEFT JOIN guard_shifts gs
+        ON gs.site_id = s.id
+        AND gs.check_out_time IS NULL
 
-res.json(result.rows);
+      LEFT JOIN guards g
+        ON g.id = gs.guard_ref
 
+      ORDER BY s.id ASC
+    `);
+
+    res.json({
+      status: "ok",
+      guards: result.rows
+    });
+
+  } catch (err) {
+    console.error("Active guards error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
 });
 
 
