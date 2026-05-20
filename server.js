@@ -254,13 +254,13 @@ query += ` AND username = $${values.length}`;
 }
 
 if(from){
-values.push(from);
-query += ` AND login_time >= $${values.length}`;
+  values.push(from);
+  query += ` AND COALESCE(logout_time, last_seen, login_time) >= $${values.length}::date`;
 }
 
 if(to){
-values.push(to);
-query += ` AND login_time < ($${values.length}::date + INTERVAL '1 day')`;
+  values.push(to);
+  query += ` AND COALESCE(logout_time, last_seen, login_time) < ($${values.length}::date + INTERVAL '1 day')`;
 }
 
 if(active === "true" || active === "false"){
