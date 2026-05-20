@@ -885,6 +885,58 @@ app.get("/sites", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------
+// SYSTEM STATUS
+// ----------------------------------------------------------
+app.get("/system/status", async (req, res) => {
+  try {
+    const dbCheck = await pool.query("SELECT NOW() AS now");
+
+    const guardsCheck = await pool.query("SELECT COUNT(*)::int AS total FROM guards");
+    const sitesCheck = await pool.query("SELECT COUNT(*)::int AS total FROM sites");
+    const activeCheck = await pool.query(`
+      SELECT COUNT(*)::int AS total
+      FROM guard_shifts
+      WHERE check_out_time IS NULL
+        AND online = true
+        AND last_seen > NOW() - INTERVAL '90 seconds'
+    `);
+
+    res.json({
+      status: "ok",
+      backend: "online",
+      database: "connected",
+      timestamp: dbCheck.rows[0].now,
+      services: {
+        guards_api: {
+          status: "online",
+          total_guards: guardsCheck.rows[0].total
+        },
+        sites_api: {
+          status: "online",
+          total_sites: sitesCheck.rows[0].total
+        },
+        attendance_api: {
+          status: "online",
+          active_guards: activeCheck.rows[0].total
+        },
+        heartbeat: {
+          status: "active",
+          timeout_seconds: 90
+        }
+      }
+    });
+  } catch (err) {
+    console.error("System status error:", err);
+
+    res.status(500).json({
+      status: "error",
+      backend: "online",
+      database: "error",
+      message: err.message
+    });
+  }
+});
 
 // ----------------------------------------------------------
 // Helper: Αποστολή SMS μέσω Vonage (κοινή λογική)
