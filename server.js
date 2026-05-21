@@ -763,6 +763,37 @@ app.post("/guards/checkout", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------
+// AUTO CLOSE STALE GUARD SESSIONS
+// ----------------------------------------------------------
+async function autoCloseStaleGuardSessions() {
+  try {
+    await pool.query(`
+      WITH stale_sessions AS (
+        UPDATE guard_shifts
+        SET
+          check_out_time = NOW(),
+          status = 'abandoned',
+          online = false,
+          last_seen = NOW()
+        WHERE check_out_time IS NULL
+          AND online = true
+          AND last_seen < NOW() - INTERVAL '90 seconds'
+        RETURNING guard_ref, site_id
+      )
+      UPDATE sites s
+      SET active_guard_id = NULL
+      FROM stale_sessions ss
+      WHERE s.id = ss.site_id
+        AND s.active_guard_id = ss.guard_ref
+    `);
+  } catch (err) {
+    console.error("Auto close stale guard sessions error:", err);
+  }
+}
+
+setInterval(autoCloseStaleGuardSessions, 30000);
+
 
 // ----------------------------------------------------------
 // ACTIVE GUARDS
@@ -810,6 +841,56 @@ app.get("/guards/active", async (req, res) => {
 
   } catch (err) {
     console.error("Active guards error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// GUARD SHIFT HISTORY
+// ----------------------------------------------------------
+app.get("/guards/shifts/history", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        gs.id,
+        gs.company_id,
+        gs.guard_ref AS guard_id,
+        g.full_name,
+        g.username,
+        gs.site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+        gs.shift_start,
+        gs.shift_end,
+        gs.check_in_time,
+        gs.check_out_time,
+        gs.last_seen,
+        gs.online,
+        gs.status,
+        gs.created_at,
+
+        (
+          gs.online = true
+          AND gs.last_seen > NOW() - INTERVAL '90 seconds'
+          AND gs.check_out_time IS NULL
+        ) AS is_currently_online
+
+      FROM guard_shifts gs
+      LEFT JOIN guards g ON g.id = gs.guard_ref
+      LEFT JOIN sites s ON s.id = gs.site_id
+      ORDER BY gs.check_in_time DESC
+    `);
+
+    res.json({
+      status: "ok",
+      shifts: result.rows
+    });
+
+  } catch (err) {
+    console.error("Guard shift history error:", err);
     res.status(500).json({
       status: "error",
       message: err.message
