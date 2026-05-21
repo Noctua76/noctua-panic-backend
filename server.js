@@ -1287,7 +1287,7 @@ app.get("/incidents/site-monitoring", async (req, res) => {
         s.location AS site_location,
         s.status AS site_status,
 
-        COALESCE(gs.full_name, gs.username) AS guard_name,
+        COALESCE(gs.full_name, gs.username, 'No active guard') AS guard_name,
 
         i.id AS incident_id,
         i.incident_ref,
@@ -1317,6 +1317,8 @@ app.get("/incidents/site-monitoring", async (req, res) => {
   ORDER BY site_id, check_in_time DESC
 ) gs
 ON s.id = gs.site_id
+LEFT JOIN guards g
+ON s.active_guard_id = g.id
 
       LEFT JOIN LATERAL (
         SELECT *
