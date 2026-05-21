@@ -1278,6 +1278,91 @@ app.get("/incidents/live", async (req, res) => {
 
 });
 
+app.get("/incidents/site-monitoring", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        s.id AS site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+        s.status AS site_status,
+
+        COALESCE(g.full_name, g.username) AS guard_name,
+
+        i.id AS incident_id,
+        i.incident_ref,
+        i.status AS incident_status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+
+        CASE
+          WHEN i.id IS NULL THEN 'normal'
+          ELSE i.status
+        END AS display_status
+
+      FROM sites s
+
+      LEFT JOIN guards g
+        ON g.id = s.active_guard_id
+
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM incidents i
+        WHERE i.site_id = s.id
+          AND (
+            i.status IN ('active', 'in_progress')
+            OR (
+              i.status = 'resolved'
+              AND i.resolved_time > NOW() - INTERVAL '2 hours'
+            )
+          )
+        ORDER BY i.trigger_time DESC
+        LIMIT 1
+      ) i ON true
+
+      ORDER BY s.id ASC
+    `);
+
+    const cards = result.rows.map((row) => ({
+      siteId: row.site_id,
+      title: row.site_name,
+      site: row.site_name,
+      location: row.site_location,
+
+      guard: row.guard_name || "Waiting for guard check-in",
+
+      status: row.display_status || "normal",
+      priority: row.priority || "Normal",
+
+      incidentId: row.incident_ref || null,
+      triggerTime: row.trigger_time || null,
+      resolvedTime: row.resolved_time || null,
+
+      triggerStatus: row.incident_id ? "Received" : "Standby",
+      smsStatus: row.incident_id ? "Pending" : "Standby",
+      callStatus: row.incident_id ? "Pending" : "Standby",
+      aiStatus: row.incident_id ? "Pending" : "Standby",
+
+      aiSummary: row.ai_summary || null,
+      escalation: row.needs_support ? "Supervisor required" : "Standby",
+    }));
+
+    res.json({
+      status: "ok",
+      cards,
+    });
+  } catch (err) {
+    console.error("Site monitoring error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
 
 // ----------------------------------------------------------
 // START SERVER
