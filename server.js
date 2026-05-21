@@ -854,35 +854,44 @@ app.get("/guards/active", async (req, res) => {
 app.get("/guards/shifts/history", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT
-        gs.id,
-        gs.company_id,
-        gs.guard_ref AS guard_id,
-        g.full_name,
-        g.username,
-        gs.site_id,
-        s.name AS site_name,
-        s.location AS site_location,
-        gs.shift_start,
-        gs.shift_end,
-        gs.check_in_time,
-        gs.check_out_time,
-        gs.last_seen,
-        gs.online,
-        gs.status,
-        gs.created_at,
+  SELECT
+    gs.id,
+    gs.company_id,
+    gs.guard_ref AS guard_id,
 
-        (
-          gs.online = true
-          AND gs.last_seen > NOW() - INTERVAL '90 seconds'
-          AND gs.check_out_time IS NULL
-        ) AS is_currently_online
+    COALESCE(g.full_name, g.username) AS full_name,
 
-      FROM guard_shifts gs
-      LEFT JOIN guards g ON g.id = gs.guard_ref
-      LEFT JOIN sites s ON s.id = gs.site_id
-      ORDER BY gs.check_in_time DESC
-    `);
+    gs.site_id,
+    s.name AS site_name,
+    s.location AS site_location,
+
+    gs.shift_start,
+    gs.shift_end,
+
+    gs.check_in_time,
+    gs.check_out_time,
+
+    gs.last_seen,
+    gs.online,
+    gs.status,
+    gs.created_at,
+
+    (
+      gs.online = true
+      AND gs.check_out_time IS NULL
+      AND gs.last_seen > NOW() - INTERVAL '90 seconds'
+    ) AS is_currently_online
+
+  FROM guard_shifts gs
+
+  LEFT JOIN guards g
+    ON g.id = gs.guard_ref
+
+  LEFT JOIN sites s
+    ON s.id = gs.site_id
+
+  ORDER BY gs.created_at DESC
+`);
 
     res.json({
       status: "ok",
