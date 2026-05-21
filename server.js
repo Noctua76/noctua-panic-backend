@@ -1179,6 +1179,104 @@ function eventHook(req, res) {
 
 app.get('/webhooks/event', eventHook);
 app.post('/webhooks/event', eventHook);
+app.post("/incidents/create", async (req, res) => {
+  try {
+    const {
+      site_id,
+      guard_ref,
+      priority = "high",
+      ai_summary = "",
+      needs_support = false,
+    } = req.body;
+
+    const incidentRef =
+      `INC-${Date.now()}`;
+
+    const result = await pool.query(
+      `
+      INSERT INTO incidents (
+        incident_ref,
+        site_id,
+        guard_ref,
+        status,
+        priority,
+        ai_summary,
+        needs_support,
+        auto_reset_time
+      )
+      VALUES (
+        $1,$2,$3,
+        'active',
+        $4,$5,$6,
+        NOW() + INTERVAL '2 hours'
+      )
+      RETURNING *
+      `,
+      [
+        incidentRef,
+        site_id,
+        guard_ref,
+        priority,
+        ai_summary,
+        needs_support,
+      ]
+    );
+
+    res.json(result.rows[0]);
+
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      error: "incident create failed"
+    });
+  }
+});
+
+app.get("/incidents/live", async (req, res) => {
+
+  try {
+
+    const result = await pool.query(`
+      SELECT
+        i.id,
+        i.incident_ref,
+        i.status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+
+        s.name AS site_name,
+
+        COALESCE(
+          g.full_name,
+          g.username
+        ) AS guard_name
+
+      FROM incidents i
+
+      LEFT JOIN sites s
+      ON s.id = i.site_id
+
+      LEFT JOIN guards g
+      ON g.id = i.guard_ref
+
+      ORDER BY i.trigger_time DESC
+    `);
+
+    res.json(result.rows);
+
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      error: "live incidents failed"
+    });
+  }
+
+});
 
 
 // ----------------------------------------------------------
