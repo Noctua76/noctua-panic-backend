@@ -1306,12 +1306,14 @@ app.get("/incidents/site-monitoring", async (req, res) => {
       FROM sites s
 
       LEFT JOIN (
-  SELECT DISTINCT ON (site_id)
-    site_id,
-    full_name,
-    username,
-    check_in_time
-  FROM guard_shifts
+  SELECT DISTINCT ON (gs.site_id)
+gs.site_id,
+g.full_name,
+g.username,
+gs.check_in_time
+FROM guard_shifts gs
+LEFT JOIN guards g
+ON gs.guard_ref = g.id
   WHERE check_out_time IS NULL
     AND last_seen > NOW() - INTERVAL '90 seconds'
   ORDER BY site_id, check_in_time DESC
