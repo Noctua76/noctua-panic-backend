@@ -1287,7 +1287,7 @@ app.get("/incidents/site-monitoring", async (req, res) => {
         s.location AS site_location,
         s.status AS site_status,
 
-        COALESCE(g.full_name, g.username) AS guard_name,
+        COALESCE(gs.full_name, gs.username) AS guard_name,
 
         i.id AS incident_id,
         i.incident_ref,
@@ -1305,8 +1305,18 @@ app.get("/incidents/site-monitoring", async (req, res) => {
 
       FROM sites s
 
-      LEFT JOIN guards g
-        ON g.id = s.active_guard_id
+      LEFT JOIN (
+  SELECT DISTINCT ON (site_id)
+    site_id,
+    full_name,
+    username,
+    check_in_time
+  FROM guard_shifts
+  WHERE check_out_time IS NULL
+    AND last_seen > NOW() - INTERVAL '90 seconds'
+  ORDER BY site_id, check_in_time DESC
+) gs
+ON s.id = gs.site_id
 
       LEFT JOIN LATERAL (
         SELECT *
