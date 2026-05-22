@@ -1012,14 +1012,22 @@ app.get("/system/status", async (req, res) => {
         },
 
         sms_gateway: {
-          label: "SMS Gateway",
-          status: "unknown"
-        },
+  label: "SMS Gateway",
+  status:
+    process.env.VONAGE_API_KEY &&
+    process.env.VONAGE_API_SECRET
+      ? "operational"
+      : "offline"
+},
 
         voice_calls: {
-          label: "Voice Calls",
-          status: "unknown"
-        },
+  label: "Voice Calls",
+  status:
+    process.env.VONAGE_APPLICATION_ID &&
+    process.env.VONAGE_PRIVATE_KEY
+      ? "operational"
+      : "offline"
+},
 
         ai_intake: {
           label: "AI Intake",
