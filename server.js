@@ -1145,7 +1145,7 @@ async function sendVonageSms(to, text) {
   params.append('api_key', process.env.VONAGE_API_KEY);
   params.append('api_secret', process.env.VONAGE_API_SECRET);
   params.append('to', to);
-  params.append('from', process.env.VONAGE_FROM_NUMBER || '+12029334212');
+  params.append('from', process.env.VONAGE_SMS_FROM || 'AegisLink');
   params.append('text', text);
 
   const response = await fetch('https://rest.nexmo.com/sms/json', {
