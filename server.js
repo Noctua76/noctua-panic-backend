@@ -848,6 +848,46 @@ app.get("/guards/active", async (req, res) => {
   }
 });
 
+app.get("/dashboard/metrics", async (req, res) => {
+  try {
+
+    // Active guards
+    const guardsResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM guard_shifts
+      WHERE check_out_time IS NULL
+    `);
+
+    // Active incidents (προς το παρόν δεν υπάρχουν)
+    const incidentsResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM incidents
+      WHERE status = 'active'
+    `).catch(() => ({ rows: [{ count: 0 }] }));
+
+    // Alerts today
+    const alertsTodayResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM incidents
+      WHERE DATE(created_at) = CURRENT_DATE
+    `).catch(() => ({ rows: [{ count: 0 }] }));
+
+    res.json({
+      activeIncidents: incidentsResult.rows[0]?.count || 0,
+      alertsToday: alertsTodayResult.rows[0]?.count || 0,
+      responseTime: "0s",
+      guardsOnDuty: guardsResult.rows[0]?.count || 0,
+    });
+
+  } catch (err) {
+    console.error("Dashboard metrics error:", err);
+
+    res.status(500).json({
+      error: "Failed to load metrics"
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // GUARD SHIFT HISTORY
 // ----------------------------------------------------------
