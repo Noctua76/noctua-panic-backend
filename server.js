@@ -990,16 +990,39 @@ app.get("/sites", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        id,
-        company_id,
-        name,
-        location,
-        status,
-        active_guard_id,
-        created_at
-      FROM sites
-      ORDER BY id ASC
-    `);
+    s.id,
+    s.company_id,
+    s.name,
+    s.location,
+    s.status,
+    s.created_at,
+
+    g.full_name AS active_guard,
+
+    (
+      SELECT COUNT(*)
+      FROM guard_shifts gs2
+      WHERE gs2.site_id = s.id
+    )::int AS guards_assigned,
+
+    (
+      SELECT COUNT(*)
+      FROM guard_shifts gs3
+      WHERE gs3.site_id = s.id
+      AND gs3.check_out_time IS NULL
+    )::int AS on_duty
+
+  FROM sites s
+
+  LEFT JOIN guard_shifts gs
+  ON s.id = gs.site_id
+  AND gs.check_out_time IS NULL
+
+  LEFT JOIN guards g
+  ON gs.guard_ref = g.id
+
+  ORDER BY s.id ASC
+`);
 
     res.json({
       status: "ok",
