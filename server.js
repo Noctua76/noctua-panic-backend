@@ -984,6 +984,22 @@ app.get("/system/status", async (req, res) => {
 
   try {
 
+    let webAppStatus = "offline";
+
+try {
+  const webCheck = await fetch(
+    "https://noctua76.github.io/noctua-panic-webapp/health"
+  );
+
+  const webData = await webCheck.json();
+
+  if (webData.status === "ok") {
+    webAppStatus = "online";
+  }
+} catch {
+  webAppStatus = "offline";
+}
+
     const status = {
       checked_at: new Date().toISOString(),
       overall_status: "operational",
@@ -991,9 +1007,9 @@ app.get("/system/status", async (req, res) => {
       services: {
 
         web_app: {
-  label: "Web App",
-  status: "unknown"
-},
+         label: "Web App",
+         status: webAppStatus
+        },
 
         backend_api: {
           label: "Backend API",
