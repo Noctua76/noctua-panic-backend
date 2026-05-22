@@ -990,6 +990,11 @@ app.get("/system/status", async (req, res) => {
 
       services: {
 
+        web_app: {
+  label: "Web App",
+  status: "unknown"
+},
+
         backend_api: {
           label: "Backend API",
           status: "operational",
