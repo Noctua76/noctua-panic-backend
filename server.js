@@ -979,53 +979,133 @@ app.get("/sites", async (req, res) => {
 // SYSTEM STATUS
 // ----------------------------------------------------------
 app.get("/system/status", async (req, res) => {
+
+  const startedAt = Date.now();
+
   try {
-    const dbCheck = await pool.query("SELECT NOW() AS now");
 
-    const guardsCheck = await pool.query("SELECT COUNT(*)::int AS total FROM guards");
-    const sitesCheck = await pool.query("SELECT COUNT(*)::int AS total FROM sites");
-    const activeCheck = await pool.query(`
-      SELECT COUNT(*)::int AS total
-      FROM guard_shifts
-      WHERE check_out_time IS NULL
-        AND online = true
-        AND last_seen > NOW() - INTERVAL '90 seconds'
-    `);
+    const status = {
+      checked_at: new Date().toISOString(),
+      overall_status: "operational",
 
-    res.json({
-      status: "ok",
-      backend: "online",
-      database: "connected",
-      timestamp: dbCheck.rows[0].now,
       services: {
-        guards_api: {
-          status: "online",
-          total_guards: guardsCheck.rows[0].total
+
+        backend_api: {
+          label: "Backend API",
+          status: "operational",
+          message: "Backend responding"
         },
-        sites_api: {
-          status: "online",
-          total_sites: sitesCheck.rows[0].total
+
+        database: {
+          label: "Database",
+          status: "unknown"
         },
-        attendance_api: {
-          status: "online",
-          active_guards: activeCheck.rows[0].total
+
+        guard_sessions: {
+          label: "Guard Sessions",
+          status: "unknown"
         },
-        heartbeat: {
-          status: "active",
-          timeout_seconds: 90
+
+        incidents: {
+          label: "Incidents",
+          status: "unknown"
+        },
+
+        sms_gateway: {
+          label: "SMS Gateway",
+          status: "unknown"
+        },
+
+        voice_calls: {
+          label: "Voice Calls",
+          status: "unknown"
+        },
+
+        ai_intake: {
+          label: "AI Intake",
+          status: "unknown"
         }
+
       }
-    });
-  } catch (err) {
-    console.error("System status error:", err);
+
+    };
+
+    // DATABASE
+
+    const dbCheck =
+      await pool.query(
+        "SELECT NOW() AS server_time"
+      );
+
+    status.services.database = {
+      label: "Database",
+      status: "operational",
+      server_time:
+        dbCheck.rows[0].server_time
+    };
+
+    // ACTIVE GUARDS
+
+    const guards =
+      await pool.query(`
+SELECT COUNT(*)::int AS active_guards
+
+FROM guard_shifts
+
+WHERE check_out_time IS NULL
+
+AND last_seen >
+NOW() - INTERVAL '90 seconds'
+`);
+
+    status.services.guard_sessions = {
+      label: "Guard Sessions",
+      status: "operational",
+      active_guards:
+        guards.rows[0].active_guards
+    };
+
+    // INCIDENTS
+
+    const incidents =
+      await pool.query(`
+SELECT COUNT(*)::int AS active_incidents
+
+FROM incidents
+
+WHERE status IN (
+'active',
+'in_progress'
+)
+`);
+
+    status.services.incidents = {
+      label: "Incidents",
+      status: "operational",
+      active_incidents:
+        incidents.rows[0]
+        .active_incidents
+    };
+
+    status.response_time_ms =
+      Date.now() - startedAt;
+
+    res.json(status);
+
+  } catch(err){
+
+    console.error(
+      "System status error:",
+      err
+    );
 
     res.status(500).json({
-      status: "error",
-      backend: "online",
-      database: "error",
-      message: err.message
+      overall_status:"degraded",
+      message:err.message
     });
+
   }
+
 });
 
 // ----------------------------------------------------------
