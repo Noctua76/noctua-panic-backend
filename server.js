@@ -988,7 +988,7 @@ app.get("/system/status", async (req, res) => {
 
 try {
   const webCheck = await fetch(
-    "https://noctua76.github.io/noctua-panic-webapp/health"
+    "https://noctua76.github.io/noctua-panic-webapp/health.json"
   );
 
   const webData = await webCheck.json();
