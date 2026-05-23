@@ -1022,6 +1022,14 @@ app.get("/sites", async (req, res) => {
 
   LEFT JOIN guards g
   ON gs.guard_ref = g.id
+  GROUP BY
+  s.id,
+  s.company_id,
+  s.name,
+  s.location,
+  s.status,
+  s.created_at,
+  g.full_name
 
   ORDER BY s.id ASC
 `);
