@@ -1009,6 +1009,7 @@ app.get("/sites", async (req, res) => {
       SELECT COUNT(*)
       FROM guard_shifts gs3
       WHERE gs3.site_id = s.id
+      AND gs3.check_in_time IS NOT NULL
       AND gs3.check_out_time IS NULL
     )::int AS on_duty
 
@@ -1016,6 +1017,7 @@ app.get("/sites", async (req, res) => {
 
   LEFT JOIN guard_shifts gs
   ON s.id = gs.site_id
+  AND gs.check_in_time IS NOT NULL
   AND gs.check_out_time IS NULL
 
   LEFT JOIN guards g
