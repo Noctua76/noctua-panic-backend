@@ -1160,6 +1160,151 @@ app.get("/sites", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// ALERT HELPERS
+// ----------------------------------------------------------
+
+let lastAlertTestResult = null;
+
+function getAlertRecipients() {
+  const recipientsEnv =
+    process.env.ALERT_RECIPIENTS ||
+    process.env.ALERT_TARGET ||
+    "";
+
+  return recipientsEnv
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+// ----------------------------------------------------------
+// ALERT CONFIGURATION STATUS
+// ----------------------------------------------------------
+app.get("/settings/alert-configuration", async (req, res) => {
+  try {
+    const recipients = getAlertRecipients();
+
+    const smsConfigured = Boolean(
+      process.env.VONAGE_API_KEY &&
+      process.env.VONAGE_API_SECRET &&
+      process.env.VONAGE_SMS_FROM
+    );
+
+    const voiceConfigured = Boolean(
+      process.env.VONAGE_APPLICATION_ID &&
+      process.env.VONAGE_PRIVATE_KEY &&
+      process.env.VONAGE_FROM_NUMBER
+    );
+
+    res.json({
+      status: "ok",
+
+      sms: {
+        status: smsConfigured ? "online" : "error",
+        configured: smsConfigured,
+        recipients_count: recipients.length,
+      },
+
+      voice: {
+        status: voiceConfigured ? "online" : "error",
+        configured: voiceConfigured,
+        recipients_count: recipients.length,
+      },
+
+      escalation: {
+        status: recipients.length > 0 ? "online" : "error",
+        order: recipients.length > 0 ? "configured" : "not configured",
+      },
+
+      last_test: lastAlertTestResult,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// DASHBOARD TEST ALERT
+// ----------------------------------------------------------
+app.post("/alerts/test", async (req, res) => {
+  try {
+    const recipients = getAlertRecipients();
+
+    if (recipients.length === 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "No alert recipients configured",
+      });
+    }
+
+    const text =
+      `AEGIS LINK TEST ALERT\n` +
+      `Source: Dashboard Settings\n` +
+      `Time: ${new Date().toISOString()}`;
+
+    const smsResults = await Promise.allSettled(
+      recipients.map((to) => sendVonageSms(to, text))
+    );
+
+    let callResults = [];
+
+    try {
+      callResults = await startVoiceCalls(recipients);
+    } catch (callErr) {
+      callResults = [
+        {
+          status: "error",
+          message: callErr.message,
+        },
+      ];
+    }
+
+    const smsSent = smsResults.filter((r) => r.status === "fulfilled").length;
+    const smsFailed = smsResults.filter((r) => r.status === "rejected").length;
+
+    lastAlertTestResult = {
+      tested_at: new Date().toISOString(),
+
+      recipients_count: recipients.length,
+
+      sms: {
+        sent: smsSent,
+        failed: smsFailed,
+        status: smsFailed === 0 ? "online" : "error",
+      },
+
+      voice: {
+        attempted: recipients.length,
+        status:
+          Array.isArray(callResults) && callResults.length > 0
+            ? "online"
+            : "error",
+      },
+    };
+
+    res.json({
+      status: "ok",
+      message: "Test alert executed",
+      result: lastAlertTestResult,
+    });
+  } catch (err) {
+    lastAlertTestResult = {
+      tested_at: new Date().toISOString(),
+      status: "error",
+      message: err.message,
+    };
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+// ----------------------------------------------------------
 // SYSTEM STATUS
 // ----------------------------------------------------------
 app.get("/system/status", async (req, res) => {
