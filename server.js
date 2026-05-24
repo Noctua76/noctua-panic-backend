@@ -889,6 +889,117 @@ app.get("/dashboard/metrics", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// DASHBOARD INCIDENT TIMELINE
+// Shows active incident, recently resolved incident, or normal state
+// ----------------------------------------------------------
+app.get("/dashboard/incident-timeline", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        i.id,
+        i.incident_ref,
+        i.status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+
+        s.name AS site_name,
+        s.location AS site_location,
+
+        COALESCE(g.full_name, g.username) AS guard_name
+
+      FROM incidents i
+
+      LEFT JOIN sites s
+      ON s.id = i.site_id
+
+      LEFT JOIN guards g
+      ON g.id = i.guard_ref
+
+      WHERE
+        i.status IN ('active', 'in_progress')
+        OR (
+          i.status = 'resolved'
+          AND i.resolved_time > NOW() - INTERVAL '1 hour'
+        )
+
+      ORDER BY
+        CASE
+          WHEN i.status IN ('active', 'in_progress') THEN 1
+          WHEN i.status = 'resolved' THEN 2
+          ELSE 3
+        END,
+        i.trigger_time DESC
+
+      LIMIT 1
+    `);
+
+    if (result.rows.length === 0) {
+      return res.json({
+        status: "normal",
+        incidentRef: null,
+        location: "Normal",
+        alertTime: null,
+        guardName: null,
+
+        alertStatus: "normal",
+        callStatus: "normal",
+        smsStatus: "normal",
+        incidentStatus: "normal",
+
+        resolvedTime: null,
+        duration: null
+      });
+    }
+
+    const incident = result.rows[0];
+
+    let duration = null;
+
+    if (incident.trigger_time && incident.resolved_time) {
+      const start = new Date(incident.trigger_time);
+      const end = new Date(incident.resolved_time);
+      const seconds = Math.floor((end - start) / 1000);
+
+      const minutes = Math.floor(seconds / 60);
+      const remainingSeconds = seconds % 60;
+
+      duration = `${minutes}m ${remainingSeconds}s`;
+    }
+
+    const isResolved = incident.status === "resolved";
+
+    res.json({
+      status: isResolved ? "resolved_recent" : "active",
+
+      incidentRef: incident.incident_ref,
+      location: incident.site_name || incident.site_location || "Unknown site",
+      alertTime: incident.trigger_time,
+      guardName: incident.guard_name || "Unknown guard",
+
+      alertStatus: "triggered",
+      callStatus: isResolved ? "completed" : "in_progress",
+      smsStatus: isResolved ? "completed" : "in_progress",
+      incidentStatus: isResolved ? "resolved" : "active",
+
+      resolvedTime: incident.resolved_time,
+      duration
+    });
+
+  } catch (err) {
+    console.error("Dashboard incident timeline error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
 // GUARD SHIFT HISTORY
 // ----------------------------------------------------------
 app.get("/guards/shifts/history", async (req, res) => {
