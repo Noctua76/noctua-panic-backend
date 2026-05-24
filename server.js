@@ -1172,13 +1172,18 @@ app.get("/system/status", async (req, res) => {
 
 try {
   const webCheck = await fetch(
-    "https://noctua76.github.io/noctua-panic-webapp/health.json"
+    "https://noctua76.github.io/noctua-panic-webapp/health.json",
+    {
+      cache: "no-store"
+    }
   );
 
-  const webData = await webCheck.json();
+  if (webCheck.ok) {
+    const webData = await webCheck.json();
 
-  if (webData.status === "ok") {
-    webAppStatus = "online";
+    if (webData.status === "ok") {
+      webAppStatus = "online";
+    }
   }
 } catch {
   webAppStatus = "offline";
@@ -1220,24 +1225,41 @@ try {
   label: "SMS Gateway",
   status:
     process.env.VONAGE_API_KEY &&
-    process.env.VONAGE_API_SECRET
+    process.env.VONAGE_API_SECRET &&
+    process.env.VONAGE_SMS_FROM
       ? "operational"
-      : "offline"
+      : "offline",
+  configured:
+    Boolean(
+      process.env.VONAGE_API_KEY &&
+      process.env.VONAGE_API_SECRET &&
+      process.env.VONAGE_SMS_FROM
+    )
 },
 
         voice_calls: {
   label: "Voice Calls",
   status:
     process.env.VONAGE_APPLICATION_ID &&
-    process.env.VONAGE_PRIVATE_KEY
+    process.env.VONAGE_PRIVATE_KEY &&
+    process.env.VONAGE_FROM_NUMBER
       ? "operational"
-      : "offline"
+      : "offline",
+  configured:
+    Boolean(
+      process.env.VONAGE_APPLICATION_ID &&
+      process.env.VONAGE_PRIVATE_KEY &&
+      process.env.VONAGE_FROM_NUMBER
+    )
 },
 
         ai_intake: {
-          label: "AI Intake",
-          status: "unknown"
-        }
+  label: "AI Intake",
+  status: process.env.OPENAI_API_KEY
+    ? "operational"
+    : "offline",
+  configured: Boolean(process.env.OPENAI_API_KEY)
+}
 
       }
 
