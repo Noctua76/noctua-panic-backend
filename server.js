@@ -1267,6 +1267,30 @@ const lastTestResult = await pool.query(`
   }
 });
 
+app.get("/event-logs", async (req, res) => {
+  try {
+    await ensureAlertEventsTable();
+
+    const result = await pool.query(`
+      SELECT *
+      FROM alert_events
+      ORDER BY created_at DESC
+      LIMIT 50
+    `);
+
+    res.json({
+      status: "ok",
+      logs: result.rows,
+    });
+  } catch (err) {
+    console.error("Event logs error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // DASHBOARD TEST ALERT
 // ----------------------------------------------------------
