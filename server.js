@@ -1305,6 +1305,34 @@ app.post("/alerts/test", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// DASHBOARD SETTINGS CONFIG
+// ----------------------------------------------------------
+app.get("/settings/config", async (req, res) => {
+  res.json({
+    status: "ok",
+
+    incident_rules: {
+      timeline_reset: process.env.TIMELINE_RESET || "1 hour",
+      default_priority: process.env.DEFAULT_PRIORITY || "High",
+      ai_intake: process.env.AI_INTAKE_ENABLED === "true" ? "Enabled" : "Disabled",
+    },
+
+    guard_sessions: {
+      heartbeat: process.env.GUARD_HEARTBEAT || "30 sec",
+      offline_timeout: process.env.GUARD_OFFLINE_TIMEOUT || "90 sec",
+      auto_close: process.env.GUARD_AUTO_CLOSE === "true" ? "Enabled" : "Disabled",
+    },
+
+    notifications: {
+      desktop_alerts: process.env.DESKTOP_ALERTS_ENABLED === "true" ? "Enabled" : "Disabled",
+      sound_alerts: process.env.SOUND_ALERTS_ENABLED === "true" ? "Enabled" : "Disabled",
+      push_notifications: process.env.PUSH_NOTIFICATIONS_ENABLED === "true" ? "Enabled" : "Disabled",
+    },
+  });
+});
+
+
+// ----------------------------------------------------------
 // SYSTEM STATUS
 // ----------------------------------------------------------
 app.get("/system/status", async (req, res) => {
