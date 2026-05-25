@@ -1177,6 +1177,23 @@ function getAlertRecipients() {
     .filter(Boolean);
 }
 
+async function ensureAlertEventsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_events (
+      id SERIAL PRIMARY KEY,
+      event_type VARCHAR(50) NOT NULL,
+      source VARCHAR(100),
+      status VARCHAR(50),
+      recipients_count INTEGER DEFAULT 0,
+      sms_sent INTEGER DEFAULT 0,
+      sms_failed INTEGER DEFAULT 0,
+      voice_attempted INTEGER DEFAULT 0,
+      voice_status VARCHAR(50),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
 // ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
 // ----------------------------------------------------------
@@ -1195,6 +1212,16 @@ app.get("/settings/alert-configuration", async (req, res) => {
       process.env.VONAGE_PRIVATE_KEY &&
       process.env.VONAGE_FROM_NUMBER
     );
+
+    await ensureAlertEventsTable();
+
+const lastTestResult = await pool.query(`
+  SELECT *
+  FROM alert_events
+  WHERE event_type = 'test_alert'
+  ORDER BY created_at DESC
+  LIMIT 1
+`);
 
     res.json({
       status: "ok",
@@ -1216,7 +1243,21 @@ app.get("/settings/alert-configuration", async (req, res) => {
         order: recipients.length > 0 ? "configured" : "not configured",
       },
 
-      last_test: lastAlertTestResult,
+      last_test: lastTestResult.rows[0]
+  ? {
+      tested_at: lastTestResult.rows[0].created_at,
+      recipients_count: lastTestResult.rows[0].recipients_count,
+      sms: {
+        sent: lastTestResult.rows[0].sms_sent,
+        failed: lastTestResult.rows[0].sms_failed,
+        status: lastTestResult.rows[0].sms_failed === 0 ? "online" : "error",
+      },
+      voice: {
+        attempted: lastTestResult.rows[0].voice_attempted,
+        status: lastTestResult.rows[0].voice_status,
+      },
+    }
+  : null,
     });
   } catch (err) {
     res.status(500).json({
@@ -1284,6 +1325,34 @@ app.post("/alerts/test", async (req, res) => {
             : "error",
       },
     };
+
+    await ensureAlertEventsTable();
+
+await pool.query(
+  `
+  INSERT INTO alert_events (
+    event_type,
+    source,
+    status,
+    recipients_count,
+    sms_sent,
+    sms_failed,
+    voice_attempted,
+    voice_status
+  )
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+  `,
+  [
+    "test_alert",
+    "Dashboard Settings",
+    "completed",
+    recipients.length,
+    smsSent,
+    smsFailed,
+    recipients.length,
+    lastAlertTestResult.voice.status,
+  ]
+);
 
     res.json({
       status: "ok",
