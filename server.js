@@ -1485,7 +1485,17 @@ app.get("/event-logs", async (req, res) => {
 // ----------------------------------------------------------
 app.post("/alerts/test", async (req, res) => {
   try {
-    const recipients = getAlertRecipients();
+    const allRecipients = await getEffectiveAlertRecipients();
+
+const smsRecipients = allRecipients
+  .filter((r) => r.sms_enabled)
+  .map((r) => r.phone);
+
+const voiceRecipients = allRecipients
+  .filter((r) => r.voice_enabled)
+  .map((r) => r.phone);
+
+const recipients = allRecipients.map((r) => r.phone);
 
     if (recipients.length === 0) {
       return res.status(400).json({
@@ -1500,13 +1510,13 @@ app.post("/alerts/test", async (req, res) => {
       `Time: ${new Date().toISOString()}`;
 
     const smsResults = await Promise.allSettled(
-      recipients.map((to) => sendVonageSms(to, text))
+      smsRecipients.map((to) => sendVonageSms(to, text))
     );
 
     let callResults = [];
 
     try {
-      callResults = await startVoiceCalls(recipients);
+      callResults = await startVoiceCalls(voiceRecipients);
     } catch (callErr) {
       callResults = [
         {
