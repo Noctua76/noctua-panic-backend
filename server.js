@@ -1561,19 +1561,32 @@ const recipients = allRecipients.map((r) => r.phone);
 
     let callResults = [];
 
-    try {
-      const envVoiceRecipients = getAlertRecipients();
+try {
 
-callResults = await startVoiceCalls(envVoiceRecipients);
-    } catch (callErr) {
-  console.error("Test voice call failed:", callErr);
+console.log(
+"VOICE RECIPIENTS:",
+voiceRecipients
+);
 
-  callResults = [
-    {
-      status: "error",
-      message: callErr.message,
-    },
-  ];
+callResults =
+await startVoiceCalls(
+voiceRecipients
+);
+
+} catch (callErr) {
+
+console.error(
+"Test voice call failed:",
+callErr
+);
+
+callResults = [
+{
+status:"error",
+message:callErr.message
+}
+];
+
 }
 
     const smsSent = smsResults.filter((r) => r.status === "fulfilled").length;
