@@ -1160,6 +1160,24 @@ app.get("/sites", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// ALERT RECIPIENTS TABLE
+// ----------------------------------------------------------
+
+async function ensureAlertRecipientsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_recipients (
+      id SERIAL PRIMARY KEY,
+      full_name VARCHAR(255),
+      phone VARCHAR(50) NOT NULL,
+      sms_enabled BOOLEAN DEFAULT true,
+      voice_enabled BOOLEAN DEFAULT true,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
+// ----------------------------------------------------------
 // ALERT HELPERS
 // ----------------------------------------------------------
 
@@ -1175,6 +1193,45 @@ function getAlertRecipients() {
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+async function getAlertRecipientsFromDatabase() {
+  await ensureAlertRecipientsTable();
+
+  const result = await pool.query(`
+    SELECT
+      id,
+      full_name,
+      phone,
+      sms_enabled,
+      voice_enabled,
+      active
+    FROM alert_recipients
+    WHERE active = true
+    ORDER BY id ASC
+  `);
+
+  return result.rows;
+}
+
+async function getEffectiveAlertRecipients() {
+  const dbRecipients = await getAlertRecipientsFromDatabase();
+
+  if (dbRecipients.length > 0) {
+    return dbRecipients;
+  }
+
+  const envPhones = getAlertRecipients();
+
+  return envPhones.map((phone, index) => ({
+    id: `env-${index + 1}`,
+    full_name: "Railway recipient",
+    phone,
+    sms_enabled: true,
+    voice_enabled: true,
+    active: true,
+    source: "env"
+  }));
 }
 
 async function ensureAlertEventsTable() {
@@ -1193,6 +1250,138 @@ async function ensureAlertEventsTable() {
     );
   `);
 }
+
+// ----------------------------------------------------------
+// ALERT RECIPIENTS API
+// ----------------------------------------------------------
+
+app.get("/settings/alert-recipients", async (req,res)=>{
+
+try{
+
+const recipients =
+await getEffectiveAlertRecipients();
+
+res.json({
+status:"ok",
+recipients
+});
+
+}catch(err){
+
+console.error(
+"Alert recipients GET error:",
+err
+);
+
+res.status(500).json({
+status:"error",
+message:
+err.message || String(err)
+});
+
+}
+
+});
+
+
+app.post("/settings/alert-recipients", async (req,res)=>{
+
+try{
+
+await ensureAlertRecipientsTable();
+
+const {
+
+full_name,
+phone,
+sms_enabled=true,
+voice_enabled=true
+
+}=req.body;
+
+const result =
+await pool.query(
+`
+INSERT INTO alert_recipients(
+
+full_name,
+phone,
+sms_enabled,
+voice_enabled
+
+)
+
+VALUES(
+$1,$2,$3,$4
+)
+
+RETURNING *
+`,
+[
+full_name,
+phone,
+sms_enabled,
+voice_enabled
+]
+);
+
+res.json({
+status:"ok",
+recipient:
+result.rows[0]
+});
+
+}catch(err){
+
+res.status(500).json({
+status:"error",
+message:err.message
+});
+
+}
+
+});
+
+app.put(
+"/settings/alert-recipients/:id/toggle",
+async (req,res)=>{
+
+try{
+
+const { id } = req.params;
+
+const result =
+await pool.query(
+`
+UPDATE alert_recipients
+
+SET active =
+NOT active
+
+WHERE id=$1
+
+RETURNING *
+`,
+[id]
+);
+
+res.json({
+status:"ok",
+recipient:
+result.rows[0]
+});
+
+}catch(err){
+
+res.status(500).json({
+status:"error",
+message:err.message
+});
+
+}
+
+});
 
 // ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
