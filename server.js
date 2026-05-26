@@ -1531,7 +1531,9 @@ const recipients = allRecipients.map((r) => r.phone);
     let callResults = [];
 
     try {
-      callResults = await startVoiceCalls(voiceRecipients);
+      const envVoiceRecipients = getAlertRecipients();
+
+callResults = await startVoiceCalls(envVoiceRecipients);
     } catch (callErr) {
   console.error("Test voice call failed:", callErr);
 
