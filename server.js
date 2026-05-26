@@ -1533,13 +1533,15 @@ const recipients = allRecipients.map((r) => r.phone);
     try {
       callResults = await startVoiceCalls(voiceRecipients);
     } catch (callErr) {
-      callResults = [
-        {
-          status: "error",
-          message: callErr.message,
-        },
-      ];
-    }
+  console.error("Test voice call failed:", callErr);
+
+  callResults = [
+    {
+      status: "error",
+      message: callErr.message,
+    },
+  ];
+}
 
     const smsSent = smsResults.filter((r) => r.status === "fulfilled").length;
     const smsFailed = smsResults.filter((r) => r.status === "rejected").length;
@@ -1871,7 +1873,7 @@ async function startVoiceCalls(recipients) {
   const results = [];
   for (const to of recipients) {
     const r = await vonageVoice.voice.createOutboundCall({
-      to: [{ type: 'phone', number: to }],
+      to: [{ type: 'phone', number: to.replace("+", "") }],
       from: { type: 'phone', number: process.env.VONAGE_FROM_NUMBER },
       answer_url: [`${baseUrl}/webhooks/answer`],
       event_url:  [`${baseUrl}/webhooks/event`],
