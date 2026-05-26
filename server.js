@@ -1387,28 +1387,35 @@ recipient:
 result.rows[0]
 });
 
-app.delete("/settings/alert-recipients/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
+}catch(err){
 
-    await pool.query(
-      `
-      DELETE FROM alert_recipients
-      WHERE id = $1
-      `,
-      [id]
-    );
+res.status(500).json({
+status:"error",
+message:err.message
+});
 
-    res.json({
-      status: "ok"
-    });
+}
 
-  } catch (err) {
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
+});
+
+app.delete(
+"/settings/alert-recipients/:id",
+async (req,res)=>{
+
+try{
+
+const { id } = req.params;
+
+await pool.query(
+`
+DELETE FROM alert_recipients
+WHERE id=$1
+`,
+[id]
+);
+
+res.json({
+status:"ok"
 });
 
 }catch(err){
