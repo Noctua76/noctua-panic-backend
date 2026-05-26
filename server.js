@@ -1217,13 +1217,9 @@ async function getAlertRecipientsFromDatabase() {
 async function getEffectiveAlertRecipients() {
   const dbRecipients = await getAlertRecipientsFromDatabase();
 
-  if (dbRecipients.length > 0) {
-    return dbRecipients;
-  }
-
   const envPhones = getAlertRecipients();
 
-  return envPhones.map((phone, index) => ({
+  const envRecipients = envPhones.map((phone, index) => ({
     id: `env-${index + 1}`,
     full_name: "Railway recipient",
     phone,
@@ -1232,6 +1228,25 @@ async function getEffectiveAlertRecipients() {
     active: true,
     source: "env"
   }));
+
+  const combined = [...dbRecipients, ...envRecipients];
+
+  const uniqueByPhone = new Map();
+
+  combined.forEach((recipient) => {
+    if (!recipient.phone) return;
+
+    const normalizedPhone = recipient.phone.replace(/\s+/g, "");
+
+    if (!uniqueByPhone.has(normalizedPhone)) {
+      uniqueByPhone.set(normalizedPhone, {
+        ...recipient,
+        phone: normalizedPhone
+      });
+    }
+  });
+
+  return Array.from(uniqueByPhone.values());
 }
 
 async function ensureAlertEventsTable() {
