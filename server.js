@@ -1527,6 +1527,128 @@ app.get("/event-logs", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// ANALYTICS SUMMARY
+// ----------------------------------------------------------
+app.get("/analytics/summary", async (req, res) => {
+  try {
+    const siteId = 1;
+
+    const siteResult = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        location,
+        required_shifts
+      FROM sites
+      WHERE id = $1
+      `,
+      [siteId]
+    );
+
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Site not found"
+      });
+    }
+
+    const site = siteResult.rows[0];
+
+    const alertsResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS alerts_count
+      FROM alert_events
+      WHERE site_id = $1
+      `,
+      [siteId]
+    );
+
+    const guardsResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS assigned_guards
+      FROM guards
+      WHERE site_id = $1
+      AND active = true
+      `,
+      [siteId]
+    );
+
+    const alertsCount = alertsResult.rows[0].alerts_count;
+    const assignedGuards = guardsResult.rows[0].assigned_guards;
+    const requiredShifts = site.required_shifts;
+
+    let riskLevel = "No Data";
+
+    if (alertsCount > 0 && alertsCount <= 5) {
+      riskLevel = "Normal";
+    } else if (alertsCount >= 6 && alertsCount <= 10) {
+      riskLevel = "Medium";
+    } else if (alertsCount >= 11) {
+      riskLevel = "High";
+    }
+
+    let readinessRatio = null;
+    let readinessLevel = "No Data";
+
+    if (assignedGuards > 0 && requiredShifts > 0) {
+      readinessRatio = Number(
+        (assignedGuards / requiredShifts).toFixed(2)
+      );
+
+      if (readinessRatio >= 1.3) {
+        readinessLevel = "High";
+      } else if (readinessRatio >= 1) {
+        readinessLevel = "Medium";
+      } else {
+        readinessLevel = "Low";
+      }
+    }
+
+    res.json({
+      status: "ok",
+      updated_at: new Date().toISOString(),
+
+      site: {
+        id: site.id,
+        name: site.name,
+        location: site.location
+      },
+
+      alerts: {
+        count: alertsCount,
+        risk_level: riskLevel
+      },
+
+      readiness: {
+        assigned_guards: assignedGuards,
+        required_shifts: requiredShifts,
+        ratio: readinessRatio,
+        level: readinessLevel
+      },
+
+      fatigue: {
+        level: "No Data",
+        reason: "Guard shift history is not connected yet"
+      },
+
+      stability: {
+        score: "No Data",
+        reason: "Stability requires fatigue data"
+      }
+    });
+
+  } catch (err) {
+    console.error("Analytics summary error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
 // DASHBOARD TEST ALERT
 // ----------------------------------------------------------
 app.post("/alerts/test", async (req, res) => {
