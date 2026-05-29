@@ -575,6 +575,113 @@ VALUES ($1,$2,$3,NOW(),NOW(),true)
     });
   }
 });
+
+// ----------------------------------------------------------
+// GUARD LOGIN
+// ----------------------------------------------------------
+app.post("/guard/login", async (req, res) => {
+  try {
+    const { username, password, device_info } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        status: "error",
+        message: "username and password are required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM guards
+      WHERE username = $1
+        AND active = true
+      `,
+      [username]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid credentials"
+      });
+    }
+
+    const guard = result.rows[0];
+
+    let validPassword = false;
+
+    if (guard.password_hash && guard.password_hash.startsWith("$2")) {
+      validPassword = await bcrypt.compare(password, guard.password_hash);
+    } else {
+      validPassword = password === guard.password_hash;
+    }
+
+    if (!validPassword) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid credentials"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE guard_sessions
+      SET
+        logout_time = NOW(),
+        status = 'auto_closed',
+        last_heartbeat = NOW()
+      WHERE guard_id = $1
+        AND logout_time IS NULL
+      `,
+      [guard.id]
+    );
+
+    const sessionResult = await pool.query(
+      `
+      INSERT INTO guard_sessions (
+        guard_id,
+        site_id,
+        login_time,
+        last_heartbeat,
+        status,
+        device_info,
+        ip_address,
+        created_at
+      )
+      VALUES ($1,$2,NOW(),NOW(),'online',$3,$4,NOW())
+      RETURNING *
+      `,
+      [
+        guard.id,
+        guard.site_id,
+        device_info || null,
+        req.ip || null
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Guard login successful",
+      guard: {
+        id: guard.id,
+        full_name: guard.full_name,
+        username: guard.username,
+        phone: guard.phone,
+        role: guard.role,
+        site_id: guard.site_id
+      },
+      session: sessionResult.rows[0]
+    });
+
+  } catch (err) {
+    console.error("Guard login error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 // ----------------------------------------------------------
 // GUARD CHECK IN
 // ----------------------------------------------------------
