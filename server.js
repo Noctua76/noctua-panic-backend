@@ -1058,10 +1058,10 @@ app.get("/dashboard/metrics", async (req, res) => {
 
     // Active guards
     const guardsResult = await pool.query(`
-      SELECT COUNT(*)::int AS count
-      FROM guard_shifts
-      WHERE check_out_time IS NULL
-    `);
+  SELECT COUNT(*)::int AS count
+  FROM guard_sessions
+  WHERE logout_time IS NULL
+`);
 
     // Active incidents (προς το παρόν δεν υπάρχουν)
     const incidentsResult = await pool.query(`
