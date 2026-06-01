@@ -997,6 +997,7 @@ setInterval(autoCloseStaleGuardSessions, 30000);
 // ----------------------------------------------------------
 app.get("/guards/active", async (req, res) => {
   try {
+
     const result = await pool.query(`
       SELECT
         s.id AS site_id,
@@ -1008,25 +1009,23 @@ app.get("/guards/active", async (req, res) => {
         g.username,
         g.phone,
 
-        gs.check_in_time,
-        gs.last_seen,
-        gs.online,
+        gs.login_time,
+        gs.last_heartbeat,
         gs.status,
 
         (
-          gs.online = true
-          AND gs.last_seen > NOW() - INTERVAL '90 seconds'
-          AND gs.check_out_time IS NULL
+          gs.logout_time IS NULL
+          AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
         ) AS is_currently_online
 
       FROM sites s
 
-      LEFT JOIN guard_shifts gs
+      LEFT JOIN guard_sessions gs
         ON gs.site_id = s.id
-        AND gs.check_out_time IS NULL
+        AND gs.logout_time IS NULL
 
       LEFT JOIN guards g
-        ON g.id = gs.guard_ref
+        ON g.id = gs.guard_id
 
       ORDER BY s.id ASC
     `);
@@ -1037,11 +1036,14 @@ app.get("/guards/active", async (req, res) => {
     });
 
   } catch (err) {
+
     console.error("Active guards error:", err);
+
     res.status(500).json({
       status: "error",
       message: err.message
     });
+
   }
 });
 
