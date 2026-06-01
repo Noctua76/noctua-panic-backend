@@ -1306,49 +1306,45 @@ app.get("/sites", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-    s.id,
-    s.company_id,
-    s.name,
-    s.location,
-    s.status,
-    s.created_at,
+        s.id,
+        s.company_id,
+        s.name,
+        s.location,
+        s.status,
+        s.created_at,
 
-    g.full_name AS active_guard,
+        active_guard.full_name AS active_guard,
 
-    (
-      SELECT COUNT(*)
-      FROM guard_shifts gs2
-      WHERE gs2.site_id = s.id
-    )::int AS guards_assigned,
+        (
+          SELECT COUNT(*)
+          FROM guards g2
+          WHERE g2.site_id = s.id
+            AND g2.active = true
+        )::int AS guards_assigned,
 
-    (
-      SELECT COUNT(*)
-      FROM guard_shifts gs3
-      WHERE gs3.site_id = s.id
-      AND gs3.check_in_time IS NOT NULL
-      AND gs3.check_out_time IS NULL
-    )::int AS on_duty
+        (
+          SELECT COUNT(*)
+          FROM guard_sessions gs3
+          WHERE gs3.site_id = s.id
+            AND gs3.logout_time IS NULL
+        )::int AS on_duty
 
-  FROM sites s
+      FROM sites s
 
-  LEFT JOIN guard_shifts gs
-  ON s.id = gs.site_id
-  AND gs.check_in_time IS NOT NULL
-  AND gs.check_out_time IS NULL
+      LEFT JOIN LATERAL (
+        SELECT
+          g.full_name
+        FROM guard_sessions gs
+        LEFT JOIN guards g
+          ON g.id = gs.guard_id
+        WHERE gs.site_id = s.id
+          AND gs.logout_time IS NULL
+        ORDER BY gs.login_time DESC
+        LIMIT 1
+      ) active_guard ON true
 
-  LEFT JOIN guards g
-  ON gs.guard_ref = g.id
-  GROUP BY
-  s.id,
-  s.company_id,
-  s.name,
-  s.location,
-  s.status,
-  s.created_at,
-  g.full_name
-
-  ORDER BY s.id ASC
-`);
+      ORDER BY s.id ASC
+    `);
 
     res.json({
       status: "ok",
