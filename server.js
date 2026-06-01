@@ -1010,7 +1010,9 @@ app.get("/guards/active", async (req, res) => {
         g.phone,
 
         gs.login_time,
+        gs.login_time AS check_in_time,
         gs.last_heartbeat,
+        gs.last_heartbeat AS last_seen,
         gs.status,
 
         (
