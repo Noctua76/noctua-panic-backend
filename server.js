@@ -1213,40 +1213,45 @@ app.get("/guards/shifts/history", async (req, res) => {
   SELECT
     gs.id,
     gs.company_id,
-    gs.guard_ref AS guard_id,
+    gs.guard_id,
 
-    COALESCE(g.full_name, g.username) AS full_name,
+    COALESCE(g.full_name, g.username, 'Unknown Guard') AS full_name,
 
     gs.site_id,
     s.name AS site_name,
     s.location AS site_location,
 
-    gs.shift_start,
-    gs.shift_end,
+    NULL AS shift_start,
+    NULL AS shift_end,
 
-    gs.check_in_time,
-    gs.check_out_time,
+    gs.login_time AS check_in_time,
+    gs.logout_time AS check_out_time,
 
     gs.last_seen,
-    gs.online,
-    gs.status,
-    gs.created_at,
+    (gs.logout_time IS NULL) AS online,
+
+    CASE
+      WHEN gs.logout_time IS NULL THEN 'active'
+      WHEN gs.logout_reason = 'auto_closed' THEN 'abandoned'
+      ELSE 'completed'
+    END AS status,
+
+    gs.login_time AS created_at,
 
     (
-      gs.online = true
-      AND gs.check_out_time IS NULL
+      gs.logout_time IS NULL
       AND gs.last_seen > NOW() - INTERVAL '90 seconds'
     ) AS is_currently_online
 
-  FROM guard_shifts gs
+  FROM guard_sessions gs
 
   LEFT JOIN guards g
-    ON g.id = gs.guard_ref
+    ON g.id = gs.guard_id
 
   LEFT JOIN sites s
     ON s.id = gs.site_id
 
-  ORDER BY gs.created_at DESC
+  ORDER BY gs.login_time DESC
 `);
 
     res.json({
