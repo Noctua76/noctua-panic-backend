@@ -1212,7 +1212,7 @@ app.get("/guards/shifts/history", async (req, res) => {
     const result = await pool.query(`
   SELECT
     gs.id,
-    gs.company_id,
+    NULL AS company_id,
     gs.guard_id,
 
     COALESCE(g.full_name, g.username, 'Unknown Guard') AS full_name,
@@ -1227,12 +1227,13 @@ app.get("/guards/shifts/history", async (req, res) => {
     gs.login_time AS check_in_time,
     gs.logout_time AS check_out_time,
 
-    gs.last_seen,
+    gs.last_heartbeat AS last_seen,
+
     (gs.logout_time IS NULL) AS online,
 
     CASE
       WHEN gs.logout_time IS NULL THEN 'active'
-      WHEN gs.logout_reason = 'auto_closed' THEN 'abandoned'
+      WHEN gs.status = 'auto_closed' THEN 'abandoned'
       ELSE 'completed'
     END AS status,
 
@@ -1240,7 +1241,7 @@ app.get("/guards/shifts/history", async (req, res) => {
 
     (
       gs.logout_time IS NULL
-      AND gs.last_seen > NOW() - INTERVAL '90 seconds'
+      AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
     ) AS is_currently_online
 
   FROM guard_sessions gs
