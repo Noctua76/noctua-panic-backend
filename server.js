@@ -682,6 +682,96 @@ app.post("/guard/login", async (req, res) => {
     });
   }
 });
+
+// ----------------------------------------------------------
+// GUARD LOGOUT
+// ----------------------------------------------------------
+app.post("/guard/logout", async (req, res) => {
+  try {
+    const { guard_id, session_id } = req.body;
+
+    if (!guard_id || !session_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "guard_id and session_id are required"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE guard_sessions
+      SET
+        logout_time = NOW(),
+        status = 'logged_out',
+        last_heartbeat = NOW()
+      WHERE id = $1
+        AND guard_id = $2
+        AND logout_time IS NULL
+      `,
+      [session_id, guard_id]
+    );
+
+    res.json({ status: "ok" });
+
+  } catch (err) {
+    console.error("Guard logout error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// GUARD SESSION HEARTBEAT
+// ----------------------------------------------------------
+app.post("/guard/heartbeat", async (req, res) => {
+  try {
+    const { guard_id, session_id } = req.body;
+
+    if (!guard_id || !session_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "guard_id and session_id are required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE guard_sessions
+      SET
+        last_heartbeat = NOW(),
+        status = 'online'
+      WHERE id = $1
+        AND guard_id = $2
+        AND logout_time IS NULL
+      RETURNING *
+      `,
+      [session_id, guard_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Active session not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      session: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error("Guard heartbeat error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // GUARD CHECK IN
 // ----------------------------------------------------------
