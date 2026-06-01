@@ -2471,20 +2471,20 @@ app.get("/incidents/site-monitoring", async (req, res) => {
 
       FROM sites s
 
-      LEFT JOIN (
-  SELECT DISTINCT ON (gs.site_id)
-gs.site_id,
-g.full_name,
-g.username,
-gs.check_in_time
-FROM guard_shifts gs
-LEFT JOIN guards g
-ON gs.guard_ref = g.id
-  WHERE check_out_time IS NULL
-    AND last_seen > NOW() - INTERVAL '90 seconds'
-  ORDER BY site_id, check_in_time DESC
-) gs
-ON s.id = gs.site_id
+      LEFT JOIN LATERAL (
+  SELECT
+    gs.site_id,
+    g.full_name,
+    g.username,
+    gs.login_time
+  FROM guard_sessions gs
+  LEFT JOIN guards g
+    ON g.id = gs.guard_id
+  WHERE gs.site_id = s.id
+    AND gs.logout_time IS NULL
+  ORDER BY gs.login_time DESC
+  LIMIT 1
+) gs ON true
 
       LEFT JOIN LATERAL (
         SELECT *
