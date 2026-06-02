@@ -2309,21 +2309,21 @@ app.post('/alert', async (req, res) => {
         created_at
       )
       SELECT
-        $1,
-        s.company_id,
-        $2,
-        $3,
-        'active',
-        'High',
-        $4,
-        NULL,
-        $4::timestamptz + INTERVAL '2 hours',
-        $5,
-        true,
-        NOW()
-      FROM sites s
-      WHERE s.id = $2
-      RETURNING *
+  $1,
+  s.company_id,
+  $2::int,
+  $3::int,
+  'active',
+  'High',
+  $4::timestamptz,
+  NULL,
+  $4::timestamptz + INTERVAL '2 hours',
+  $5,
+  true,
+  NOW()
+FROM sites s
+WHERE s.id = $2::int
+RETURNING *
       `,
       [
         incidentRef,
