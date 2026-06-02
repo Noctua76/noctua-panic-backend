@@ -2317,7 +2317,7 @@ app.post('/alert', async (req, res) => {
   'High',
   $4::timestamptz,
   NULL,
-  $4::timestamptz + INTERVAL '2 hours',
+  $4::timestamptz + INTERVAL '2 minutes',
   $5,
   true,
   NOW()
