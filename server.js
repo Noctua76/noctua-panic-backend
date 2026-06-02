@@ -2498,6 +2498,17 @@ app.get("/incidents/live", async (req, res) => {
 
 app.get("/incidents/site-monitoring", async (req, res) => {
   try {
+    await pool.query(`
+  UPDATE incidents
+  SET
+    status = 'resolved',
+    resolved_time = NOW()
+  WHERE status IN ('active', 'in_progress')
+    AND auto_reset_time IS NOT NULL
+    AND auto_reset_time <= NOW()
+    AND resolved_time IS NULL
+`);
+
     const result = await pool.query(`
       SELECT
         s.id AS site_id,
@@ -2543,12 +2554,18 @@ app.get("/incidents/site-monitoring", async (req, res) => {
         FROM incidents i
         WHERE i.site_id = s.id
           AND (
-            i.status IN ('active', 'in_progress')
-            OR (
-              i.status = 'resolved'
-              AND i.resolved_time > NOW() - INTERVAL '2 hours'
-            )
-          )
+  (
+    i.status IN ('active', 'in_progress')
+    AND (
+      i.auto_reset_time IS NULL
+      OR i.auto_reset_time > NOW()
+    )
+  )
+  OR (
+    i.status = 'resolved'
+    AND i.resolved_time > NOW() - INTERVAL '2 hours'
+  )
+)
         ORDER BY i.trigger_time DESC
         LIMIT 1
       ) i ON true
