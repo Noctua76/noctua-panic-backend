@@ -2346,6 +2346,36 @@ RETURNING *
       console.error('Voice call failed (non-blocking):', callErr);
     }
 
+    await ensureAlertEventsTable();
+
+await pool.query(
+  `
+  INSERT INTO alert_events (
+    event_type,
+    source,
+    status,
+    recipients_count,
+    sms_sent,
+    sms_failed,
+    voice_attempted,
+    voice_status
+  )
+  VALUES (
+    $1,$2,$3,$4,$5,$6,$7,$8
+  )
+  `,
+  [
+    "WEBAPP_ALERT",
+    source || "webapp",
+    "completed",
+    recipients.length,
+    results.length,
+    0,
+    recipients.length,
+    "online"
+  ]
+);
+
     return res.json({
       status: 'ok',
       message: 'Alert received, incident created, SMS sent and voice calls started',
