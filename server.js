@@ -2265,7 +2265,6 @@ app.post('/alert', async (req, res) => {
 
   const { siteId, guardId, triggeredAt, source } = req.body || {};
 
-  // Παίρνουμε τους παραλήπτες από το env
   const recipientsEnv =
     process.env.ALERT_RECIPIENTS || process.env.ALERT_TARGET || '';
 
@@ -2282,39 +2281,86 @@ app.post('/alert', async (req, res) => {
     });
   }
 
+  const alertTime = triggeredAt || new Date().toISOString();
+  const incidentRef = `INC-${Date.now()}`;
+
   const text =
     `NOCTUA PANIC ALERT\n` +
     `Site: ${siteId || 'N/A'}\n` +
     `Guard: ${guardId || 'N/A'}\n` +
     `Source: ${source || 'noctua-panic-webapp'}\n` +
-    `Time: ${triggeredAt || new Date().toISOString()}`;
+    `Time: ${alertTime}`;
 
   try {
-    // Στέλνουμε SMS σε όλους τους παραλήπτες παράλληλα
-const results = await Promise.all(
-  recipients.map(to => sendVonageSms(to, text))
-);
+    const incidentResult = await pool.query(
+      `
+      INSERT INTO incidents (
+        incident_ref,
+        company_id,
+        site_id,
+        guard_ref,
+        status,
+        priority,
+        trigger_time,
+        resolved_time,
+        auto_reset_time,
+        ai_summary,
+        needs_support,
+        created_at
+      )
+      SELECT
+        $1,
+        s.company_id,
+        $2,
+        $3,
+        'active',
+        'High',
+        $4,
+        NULL,
+        $4::timestamptz + INTERVAL '2 hours',
+        $5,
+        true,
+        NOW()
+      FROM sites s
+      WHERE s.id = $2
+      RETURNING *
+      `,
+      [
+        incidentRef,
+        siteId || 1,
+        guardId || null,
+        alertTime,
+        'Panic alert triggered from web app.'
+      ]
+    );
 
-// Ξεκινάμε και κλήσεις (χωρίς να επηρεάζει τα SMS αν αποτύχουν)
-let callResults = [];
-try {
-  callResults = await startVoiceCalls(recipients);
-} catch (callErr) {
-  console.error('Voice call failed (non-blocking):', callErr);
-}
+    const results = await Promise.all(
+      recipients.map(to => sendVonageSms(to, text))
+    );
 
-return res.json({
-  status: 'ok',
-  message: 'Alert received & SMS sent',
-  recipients,
-  smsResults: results,
-  callResults
-});
+    let callResults = [];
+
+    try {
+      callResults = await startVoiceCalls(recipients);
+    } catch (callErr) {
+      console.error('Voice call failed (non-blocking):', callErr);
+    }
+
+    return res.json({
+      status: 'ok',
+      message: 'Alert received, incident created, SMS sent and voice calls started',
+      incident: incidentResult.rows[0],
+      recipients,
+      smsResults: results,
+      callResults
+    });
+
   } catch (err) {
-    console.error('Error sending panic SMS from /alert:', err);
+    console.error('Error processing panic alert from /alert:', err);
+
     return res.status(500).json({
       status: 'error',
-      message: 'Alert received but SMS failed',
+      message: 'Alert received but processing failed',
       error: err.message
     });
   }
