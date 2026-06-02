@@ -2550,20 +2550,17 @@ app.get("/incidents/site-monitoring", async (req, res) => {
 ) gs ON true
 
       LEFT JOIN LATERAL (
-        SELECT *
-        FROM incidents i
-        WHERE i.site_id = s.id
-          AND (
-  (
-    i.status IN ('active', 'in_progress')
+  SELECT *
+  FROM incidents i
+  WHERE i.site_id = s.id
+    AND i.status IN ('active', 'in_progress')
     AND (
       i.auto_reset_time IS NULL
       OR i.auto_reset_time > NOW()
     )
-  )
-          ORDER BY i.trigger_time DESC
-        LIMIT 1
-      ) i ON true
+  ORDER BY i.trigger_time DESC
+  LIMIT 1
+) i ON true
 
       ORDER BY s.id ASC
     `);
