@@ -2561,12 +2561,7 @@ app.get("/incidents/site-monitoring", async (req, res) => {
       OR i.auto_reset_time > NOW()
     )
   )
-  OR (
-    i.status = 'resolved'
-    AND i.resolved_time > NOW() - INTERVAL '2 hours'
-  )
-)
-        ORDER BY i.trigger_time DESC
+          ORDER BY i.trigger_time DESC
         LIMIT 1
       ) i ON true
 
