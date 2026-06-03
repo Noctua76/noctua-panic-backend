@@ -2556,6 +2556,11 @@ app.get("/incidents/site-monitoring", async (req, res) => {
         i.resolved_time,
         i.ai_summary,
         i.needs_support,
+        ae.status AS alert_event_status,
+        ae.sms_sent,
+        ae.sms_failed,
+        ae.voice_attempted,
+        ae.voice_status,
 
         CASE
           WHEN i.id IS NULL THEN 'normal'
@@ -2591,6 +2596,14 @@ app.get("/incidents/site-monitoring", async (req, res) => {
   ORDER BY i.trigger_time DESC
   LIMIT 1
 ) i ON true
+       LEFT JOIN LATERAL (
+  SELECT *
+  FROM alert_events ae
+  WHERE ae.event_type = 'WEBAPP_ALERT'
+    AND ae.source = 'aegis-link-webapp'
+  ORDER BY ae.created_at DESC
+  LIMIT 1
+) ae ON true
 
       ORDER BY s.id ASC
     `);
@@ -2617,19 +2630,21 @@ app.get("/incidents/site-monitoring", async (req, res) => {
   : "Ready",
 
 smsStatus: row.incident_id
-  ? row.display_status === "resolved"
-    ? "Delivered"
+  ? Number(row.sms_sent) > 0
+    ? "Sent"
+    : Number(row.sms_failed) > 0
+    ? "Failed"
     : "Sending"
   : "Ready",
 
 callStatus: row.incident_id
-  ? row.display_status === "resolved"
+  ? row.voice_status === "online" || Number(row.voice_attempted) > 0
     ? "Completed"
     : "Dialing"
   : "Ready",
 
 aiStatus: row.incident_id
-  ? row.display_status === "resolved"
+  ? row.alert_event_status === "completed"
     ? "Completed"
     : "Processing"
   : "Ready",
