@@ -2530,13 +2530,11 @@ app.get("/incidents/site-monitoring", async (req, res) => {
   try {
     await pool.query(`
   UPDATE incidents
-  SET
-    status = 'resolved',
-    resolved_time = NOW()
-  WHERE status IN ('active', 'in_progress')
-    AND auto_reset_time IS NOT NULL
-    AND auto_reset_time <= NOW()
-    AND resolved_time IS NULL
+SET
+  status = 'in_progress'
+WHERE status = 'active'
+  AND auto_reset_time IS NOT NULL
+  AND auto_reset_time <= NOW()
 `);
 
     const result = await pool.query(`
@@ -2588,10 +2586,15 @@ app.get("/incidents/site-monitoring", async (req, res) => {
   SELECT *
   FROM incidents i
   WHERE i.site_id = s.id
-    AND i.status IN ('active', 'in_progress')
     AND (
-      i.auto_reset_time IS NULL
-      OR i.auto_reset_time > NOW()
+      (
+        i.status = 'active'
+        AND (
+          i.auto_reset_time IS NULL
+          OR i.auto_reset_time > NOW()
+        )
+      )
+      OR i.status = 'in_progress'
     )
   ORDER BY i.trigger_time DESC
   LIMIT 1
