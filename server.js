@@ -2763,6 +2763,96 @@ app.post("/incidents/:id/resolve", async (req, res) => {
   }
 });
 
+app.get("/incidents/resolved", async (req, res) => {
+  try {
+    const { date, site_id } = req.query;
+
+    const values = [];
+    let query = `
+      SELECT
+        i.id,
+        i.incident_ref,
+        i.status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+
+        s.id AS site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+
+        COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name,
+
+        ira.supervisor_notified,
+        ira.supervisor_name,
+        ira.supervisor_notes,
+        ira.guard_contacted,
+        ira.guard_contacted_name,
+        ira.guard_notes,
+        ira.residence_contacted,
+        ira.residence_contacted_name,
+        ira.residence_notes,
+        ira.admin_notes,
+        ira.approved_by,
+        ira.approved_at
+
+      FROM incidents i
+
+      LEFT JOIN sites s
+        ON s.id = i.site_id
+
+      LEFT JOIN guards g
+        ON g.id = i.guard_ref
+
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM incident_resolution_actions ira
+        WHERE ira.incident_id = i.id
+        ORDER BY ira.approved_at DESC
+        LIMIT 1
+      ) ira ON true
+
+      WHERE i.status = 'resolved'
+    `;
+
+    if (date) {
+      values.push(date);
+      query += `
+        AND DATE(i.resolved_time) = $${values.length}::date
+      `;
+    }
+
+    if (site_id) {
+      values.push(site_id);
+      query += `
+        AND i.site_id = $${values.length}
+      `;
+    }
+
+    query += `
+      ORDER BY i.resolved_time DESC
+      LIMIT 10
+    `;
+
+    const result = await pool.query(query, values);
+
+    res.json({
+      status: "ok",
+      incidents: result.rows,
+    });
+
+  } catch (err) {
+    console.error("Resolved incidents error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // START SERVER
 // ----------------------------------------------------------
