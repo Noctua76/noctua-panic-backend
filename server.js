@@ -2623,6 +2623,7 @@ WHERE status = 'active'
       priority: row.priority || "Normal",
 
       incidentId: row.incident_ref || null,
+      incidentDbId: row.incident_id || null,
       triggerTime: row.trigger_time || null,
       resolvedTime: row.resolved_time || null,
 
@@ -2662,6 +2663,98 @@ aiStatus: row.incident_id
     });
   } catch (err) {
     console.error("Site monitoring error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+app.post("/incidents/:id/resolve", async (req, res) => {
+  try {
+    const incidentId = req.params.id;
+
+    const {
+      supervisor_notified,
+      supervisor_name,
+      supervisor_notes,
+
+      guard_contacted,
+      guard_contacted_name,
+      guard_notes,
+
+      residence_contacted,
+      residence_contacted_name,
+      residence_notes,
+
+      admin_notes,
+      approved_by,
+    } = req.body;
+
+    await pool.query(
+      `
+      INSERT INTO incident_resolution_actions (
+        incident_id,
+        supervisor_notified,
+        supervisor_name,
+        supervisor_notes,
+        guard_contacted,
+        guard_contacted_name,
+        guard_notes,
+        residence_contacted,
+        residence_contacted_name,
+        residence_notes,
+        admin_notes,
+        approved_by,
+        approved_at
+      )
+      VALUES (
+        $1,$2,$3,$4,
+        $5,$6,$7,
+        $8,$9,$10,
+        $11,$12,
+        NOW()
+      )
+      `,
+      [
+        incidentId,
+
+        supervisor_notified,
+        supervisor_name,
+        supervisor_notes,
+
+        guard_contacted,
+        guard_contacted_name,
+        guard_notes,
+
+        residence_contacted,
+        residence_contacted_name,
+        residence_notes,
+
+        admin_notes,
+        approved_by,
+      ]
+    );
+
+    await pool.query(
+      `
+      UPDATE incidents
+      SET
+        status = 'resolved',
+        resolved_time = NOW()
+      WHERE id = $1
+      `,
+      [incidentId]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Incident resolved",
+    });
+
+  } catch (err) {
+    console.error(err);
 
     res.status(500).json({
       status: "error",
