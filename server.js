@@ -2610,10 +2610,29 @@ app.get("/incidents/site-monitoring", async (req, res) => {
       triggerTime: row.trigger_time || null,
       resolvedTime: row.resolved_time || null,
 
-      triggerStatus: row.incident_id ? "Received" : "Standby",
-      smsStatus: row.incident_id ? "Pending" : "Standby",
-      callStatus: row.incident_id ? "Pending" : "Standby",
-      aiStatus: row.incident_id ? "Pending" : "Standby",
+      triggerStatus: row.incident_id
+  ? row.display_status === "resolved"
+    ? "Completed"
+    : "Received"
+  : "Ready",
+
+smsStatus: row.incident_id
+  ? row.display_status === "resolved"
+    ? "Delivered"
+    : "Sending"
+  : "Ready",
+
+callStatus: row.incident_id
+  ? row.display_status === "resolved"
+    ? "Completed"
+    : "Dialing"
+  : "Ready",
+
+aiStatus: row.incident_id
+  ? row.display_status === "resolved"
+    ? "Completed"
+    : "Processing"
+  : "Ready",
 
       aiSummary: row.ai_summary || null,
       escalation: row.needs_support ? "Supervisor required" : "Standby",
