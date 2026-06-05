@@ -61,7 +61,14 @@ async function processIncidentLog(message) {
 // ----------------------------------------------------------
 app.post('/incident-log', async (req, res) => {
   try {
-    const { guardId, siteId, timestamp, message } = req.body;
+    const {
+  guardId,
+  siteId,
+  sessionId,
+  timestamp,
+  message,
+  incidentAnswers
+} = req.body;
 
     if (!message) {
       return res
@@ -76,6 +83,59 @@ app.post('/incident-log', async (req, res) => {
       timestamp,
       message
     });
+
+    if (incidentAnswers && typeof incidentAnswers === "object") {
+  await ensureIncidentGuardResponsesTable();
+
+  const incidentResult = await pool.query(
+    `
+    SELECT id
+    FROM incidents
+    WHERE guard_ref = $1
+      AND site_id = $2
+      AND status IN ('active', 'in_progress')
+    ORDER BY trigger_time DESC
+    LIMIT 1
+    `,
+    [guardId, siteId]
+  );
+
+  const incidentId =
+    incidentResult.rows[0]?.id || null;
+
+  const questionLabels = {
+    incident_type: "Τι είδους περιστατικό ήταν;",
+    location: "Πού ακριβώς εντοπίστηκε;",
+    actions_taken: "Ολοκλήρωσες τις απαιτούμενες ενέργειες; Τι έκανες;"
+  };
+
+  for (const [questionKey, answer] of Object.entries(incidentAnswers)) {
+    await pool.query(
+      `
+      INSERT INTO incident_guard_responses (
+        incident_id,
+        guard_id,
+        site_id,
+        session_id,
+        question_key,
+        question_text,
+        answer,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+      `,
+      [
+        incidentId,
+        guardId || null,
+        siteId || null,
+        sessionId || null,
+        questionKey,
+        questionLabels[questionKey] || questionKey,
+        answer || ""
+      ]
+    );
+  }
+}
 
     // 2) Περνάμε το log στον Assistant για περίληψη / δομημένη καταγραφή
     const assistantLog = await processIncidentLog(
@@ -1468,6 +1528,22 @@ async function ensureAlertEventsTable() {
       sms_failed INTEGER DEFAULT 0,
       voice_attempted INTEGER DEFAULT 0,
       voice_status VARCHAR(50),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
+async function ensureIncidentGuardResponsesTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS incident_guard_responses (
+      id SERIAL PRIMARY KEY,
+      incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
+      guard_id INTEGER,
+      site_id INTEGER,
+      session_id INTEGER,
+      question_key VARCHAR(100),
+      question_text TEXT,
+      answer TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
