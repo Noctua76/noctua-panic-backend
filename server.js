@@ -2747,6 +2747,49 @@ aiStatus: row.incident_id
   }
 });
 
+app.get("/incidents/:id/guard-responses", async (req, res) => {
+  try {
+    await ensureIncidentGuardResponsesTable();
+
+    const incidentId = req.params.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        incident_id,
+        guard_id,
+        site_id,
+        session_id,
+        question_key,
+        question_text,
+        answer,
+        created_at
+      FROM incident_guard_responses
+      WHERE incident_id = $1
+      ORDER BY created_at ASC
+      `,
+      [incidentId]
+    );
+
+    res.json({
+      status: "ok",
+      responses: result.rows,
+      guard_notes: result.rows
+        .map((row) => `${row.question_text}\n${row.answer}`)
+        .join("\n\n")
+    });
+
+  } catch (err) {
+    console.error("Guard responses error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 app.post("/incidents/:id/resolve", async (req, res) => {
   try {
     const incidentId = req.params.id;
