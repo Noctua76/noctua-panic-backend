@@ -2972,6 +2972,263 @@ app.get("/incidents/resolved", async (req, res) => {
   }
 });
 
+function formatDuration(ms) {
+  if (!ms || ms < 0) return "N/A";
+
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+
+  return `${minutes}m ${seconds}s`;
+}
+
+function formatReportTime(value) {
+  if (!value) return null;
+
+  return new Date(value).toLocaleString("el-GR", {
+    timeZone: "Europe/Athens",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+app.get("/incidents/:id/report", async (req, res) => {
+  try {
+    const incidentId = req.params.id;
+
+    const incidentResult = await pool.query(
+      `
+      SELECT
+        i.id,
+        i.incident_ref,
+        i.status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+        s.name AS site_name,
+        s.location AS site_location,
+        COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name
+      FROM incidents i
+      LEFT JOIN sites s ON s.id = i.site_id
+      LEFT JOIN guards g ON g.id = i.guard_ref
+      WHERE i.id = $1
+      `,
+      [incidentId]
+    );
+
+    if (incidentResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Incident not found",
+      });
+    }
+
+    const incident = incidentResult.rows[0];
+
+    const guardResponsesResult = await pool.query(
+      `
+      SELECT
+        question_key,
+        question_text,
+        answer,
+        created_at
+      FROM incident_guard_responses
+      WHERE incident_id = $1
+      ORDER BY created_at ASC
+      `,
+      [incidentId]
+    );
+
+    const resolutionResult = await pool.query(
+      `
+      SELECT
+        supervisor_name,
+        supervisor_notes,
+        guard_contacted_name,
+        guard_notes,
+        residence_contacted_name,
+        residence_notes,
+        admin_notes,
+        approved_by,
+        approved_at
+      FROM incident_resolution_actions
+      WHERE incident_id = $1
+      ORDER BY approved_at DESC
+      LIMIT 1
+      `,
+      [incidentId]
+    );
+
+    const alertEventsResult = await pool.query(
+      `
+      SELECT
+        event_type,
+        source,
+        status,
+        sms_sent,
+        sms_failed,
+        voice_attempted,
+        voice_status,
+        created_at
+      FROM alert_events
+      WHERE created_at >= $1 - INTERVAL '5 minutes'
+        AND created_at <= COALESCE($2, NOW()) + INTERVAL '5 minutes'
+      ORDER BY created_at ASC
+      `,
+      [incident.trigger_time, incident.resolved_time]
+    );
+
+    const guardResponses = guardResponsesResult.rows;
+    const resolution = resolutionResult.rows[0] || null;
+    const alertEvents = alertEventsResult.rows;
+
+    const durationMs =
+      incident.trigger_time && incident.resolved_time
+        ? new Date(incident.resolved_time) - new Date(incident.trigger_time)
+        : null;
+
+    const timeline = [];
+
+    if (incident.trigger_time) {
+      timeline.push({
+        event: "Panic Triggered",
+        timestamp: incident.trigger_time,
+        display_time: formatReportTime(incident.trigger_time),
+      });
+    }
+
+    const smsEvent = alertEvents.find(
+      (event) => Number(event.sms_sent) > 0 || Number(event.sms_failed) > 0
+    );
+
+    if (smsEvent) {
+      timeline.push({
+        event: Number(smsEvent.sms_sent) > 0 ? "SMS Sent" : "SMS Failed",
+        timestamp: smsEvent.created_at,
+        display_time: formatReportTime(smsEvent.created_at),
+      });
+    }
+
+    const voiceEvent = alertEvents.find(
+      (event) => Number(event.voice_attempted) > 0 || event.voice_status
+    );
+
+    if (voiceEvent) {
+      timeline.push({
+        event: "Voice Call Initiated",
+        timestamp: voiceEvent.created_at,
+        display_time: formatReportTime(voiceEvent.created_at),
+      });
+
+      if (voiceEvent.voice_status) {
+        timeline.push({
+          event: `Voice Call ${voiceEvent.voice_status}`,
+          timestamp: voiceEvent.created_at,
+          display_time: formatReportTime(voiceEvent.created_at),
+        });
+      }
+    }
+
+    if (guardResponses.length > 0) {
+      const lastResponse = guardResponses[guardResponses.length - 1];
+
+      timeline.push({
+        event: "Guard Questions Completed",
+        timestamp: lastResponse.created_at,
+        display_time: formatReportTime(lastResponse.created_at),
+      });
+    }
+
+    if (resolution?.approved_at) {
+      timeline.push({
+        event: "Investigation Completed",
+        timestamp: resolution.approved_at,
+        display_time: formatReportTime(resolution.approved_at),
+      });
+    }
+
+    if (incident.resolved_time) {
+      timeline.push({
+        event: "Incident Resolved",
+        timestamp: incident.resolved_time,
+        display_time: formatReportTime(incident.resolved_time),
+      });
+    }
+
+    timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    res.json({
+      status: "ok",
+      report_title: "Aegis Link Security Incident Report",
+      report_id: `RPT-${incident.incident_ref || incident.id}`,
+      generated_at: new Date().toISOString(),
+      generated_at_display: formatReportTime(new Date()),
+
+      incident: {
+        id: incident.id,
+        incident_ref: incident.incident_ref,
+        status: incident.status,
+        priority: incident.priority,
+        site: incident.site_name,
+        site_location: incident.site_location,
+        guard: incident.guard_name,
+        trigger_time: incident.trigger_time,
+        trigger_time_display: formatReportTime(incident.trigger_time),
+        resolved_time: incident.resolved_time,
+        resolved_time_display: formatReportTime(incident.resolved_time),
+        duration_seconds: durationMs ? Math.floor(durationMs / 1000) : null,
+        duration_display: formatDuration(durationMs),
+        ai_summary: incident.ai_summary,
+        needs_support: incident.needs_support,
+      },
+
+      timeline,
+
+      guard_responses: guardResponses.map((row) => ({
+        question_key: row.question_key,
+        question_text: row.question_text,
+        answer: row.answer,
+        created_at: row.created_at,
+        created_at_display: formatReportTime(row.created_at),
+      })),
+
+      investigation: resolution
+        ? {
+            supervisor_name: resolution.supervisor_name,
+            supervisor_notes: resolution.supervisor_notes,
+            guard_contact_name: resolution.guard_contacted_name,
+            guard_notes: resolution.guard_notes,
+            residence_contact_name: resolution.residence_contacted_name,
+            residence_notes: resolution.residence_notes,
+            admin_notes: resolution.admin_notes,
+            approved_by: resolution.approved_by,
+            approved_at: resolution.approved_at,
+            approved_at_display: formatReportTime(resolution.approved_at),
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("Incident report error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to generate incident report",
+      error: err.message,
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // START SERVER
 // ----------------------------------------------------------
