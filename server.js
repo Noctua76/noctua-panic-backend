@@ -3071,23 +3071,23 @@ app.get("/incidents/:id/report", async (req, res) => {
     );
 
     const alertEventsResult = await pool.query(
-      `
-      SELECT
-        event_type,
-        source,
-        status,
-        sms_sent,
-        sms_failed,
-        voice_attempted,
-        voice_status,
-        created_at
-      FROM alert_events
-      WHERE created_at >= $1 - INTERVAL '5 minutes'
-        AND created_at <= COALESCE($2, NOW()) + INTERVAL '5 minutes'
-      ORDER BY created_at ASC
-      `,
-      [incident.trigger_time, incident.resolved_time]
-    );
+  `
+  SELECT
+    event_type,
+    source,
+    status,
+    sms_sent,
+    sms_failed,
+    voice_attempted,
+    voice_status,
+    created_at
+  FROM alert_events
+  WHERE created_at >= ($1::timestamp - INTERVAL '5 minutes')
+    AND created_at <= (COALESCE($2::timestamp, NOW()) + INTERVAL '5 minutes')
+  ORDER BY created_at ASC
+  `,
+  [incident.trigger_time, incident.resolved_time]
+);
 
     const guardResponses = guardResponsesResult.rows;
     const resolution = resolutionResult.rows[0] || null;
