@@ -2555,6 +2555,23 @@ async function eventHook(req, res) {
     const callStatus = payload.status || "unknown";
     const callUuid = payload.uuid || payload.conversation_uuid || null;
 
+    const incidentLookup = await pool.query(
+      `
+      SELECT
+        incident_id,
+        site_id,
+        guard_id
+      FROM alert_events
+      WHERE provider_call_uuid = $1
+        AND event_type = 'VOICE_CALL_SUBMITTED'
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [callUuid]
+    );
+
+    const incidentInfo = incidentLookup.rows[0] || {};
+
     console.log("VONAGE VOICE EVENT:", {
       method: req.method,
       query: req.query,
@@ -2569,18 +2586,26 @@ async function eventHook(req, res) {
         event_type,
         source,
         status,
+        incident_id,
+        site_id,
+        guard_id,
         voice_attempted,
         voice_status,
         provider,
         provider_call_uuid,
         event_payload
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       `,
       [
         "VOICE_WEBHOOK",
         "vonage",
         callStatus,
+
+        incidentInfo.incident_id || null,
+        incidentInfo.site_id || null,
+        incidentInfo.guard_id || null,
+
         1,
         callStatus,
         "vonage",
