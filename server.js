@@ -3589,7 +3589,34 @@ if (incident.resolved_time) {
   });
 }
 
-    timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    timeline.sort((a, b) => {
+  const order = {
+    "Alert Triggered": 1,
+    "SMS Sent": 2,
+    "SMS Failed": 3,
+    "Voice Call Submitted": 4,
+    "Voice Call Started": 5,
+    "Voice Call Ringing": 6,
+    "Voice Call Answered": 7,
+    "Voice Call Completed": 8,
+    "Guard Questions Completed": 9,
+    "Investigation Completed": 10,
+    "Incident Resolved": 11
+  };
+
+  const getOrder = (item) => {
+    if (item.event?.startsWith("SMS Sent")) return order["SMS Sent"];
+    if (item.event?.startsWith("SMS Failed")) return order["SMS Failed"];
+    if (item.event?.startsWith("Voice Call Submitted")) return order["Voice Call Submitted"];
+    if (item.event?.startsWith("Voice Call Completed")) return order["Voice Call Completed"];
+    return order[item.event] || 99;
+  };
+
+  return (
+    getOrder(a) - getOrder(b) ||
+    new Date(a.timestamp) - new Date(b.timestamp)
+  );
+});
 
     res.json({
       status: "ok",
