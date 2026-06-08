@@ -1237,67 +1237,133 @@ app.get("/dashboard/incident-timeline", async (req, res) => {
 
     const rawEvents = eventsResult.rows;
 
-    const events = rawEvents.map((event) => {
-      let label = event.event_type;
-      let type = "system";
-      let detail = event.status || "-";
+    const events = [];
 
-      if (event.event_type === "WEBAPP_ALERT") {
-        label = "Alert Triggered";
-        type = "alert";
-        detail = "Panic alert received from web app";
-      }
+rawEvents.forEach((event) => {
+  if (event.event_type === "WEBAPP_ALERT") {
+    events.push({
+      id: `${event.id}-alert`,
+      type: "alert",
+      label: "Alert Triggered",
+      detail: "Panic alert received from web app",
+      eventType: event.event_type,
+      status: event.status,
+      time: event.created_at,
+      provider: event.provider,
+      recipientPhone: event.recipient_phone,
+      providerCallUuid: event.provider_call_uuid
+    });
 
-      if (event.event_type === "VOICE_CALL_SUBMITTED") {
-        label = "Call Submitted";
-        type = "call";
-        detail = event.recipient_phone
-          ? `Call submitted to ${event.recipient_phone}`
-          : "Voice call submitted to Vonage";
-      }
-
-      if (event.event_type === "VOICE_WEBHOOK") {
-        type = "call";
-
-        if (event.status === "ringing") {
-          label = "Call Ringing";
-          detail = "Phone is ringing";
-        } else if (event.status === "started") {
-          label = "Call Started";
-          detail = "Voice call started";
-        } else if (event.status === "answered") {
-          label = "Call Answered";
-          detail = "Voice call answered";
-        } else if (event.status === "completed") {
-          label = "Call Completed";
-
-          const duration =
-            event.event_payload?.duration ||
-            event.event_payload?.duration_ms ||
-            null;
-
-          detail = duration
-            ? `Voice call completed · Duration: ${duration} sec`
-            : "Voice call completed";
-        } else {
-          label = `Call ${event.status || "Event"}`;
-          detail = event.voice_status || event.status || "Voice webhook received";
-        }
-      }
-
-      return {
-        id: event.id,
-        type,
-        label,
-        detail,
-        eventType: event.event_type,
-        status: event.status,
+    if (Number(event.sms_sent) > 0) {
+      events.push({
+        id: `${event.id}-sms-sent`,
+        type: "sms",
+        label: "SMS Sent",
+        detail: `${event.sms_sent} SMS notification(s) sent`,
+        eventType: "SMS_SENT",
+        status: "completed",
         time: event.created_at,
         provider: event.provider,
         recipientPhone: event.recipient_phone,
         providerCallUuid: event.provider_call_uuid
-      };
+      });
+    }
+
+    if (Number(event.sms_failed) > 0) {
+      events.push({
+        id: `${event.id}-sms-failed`,
+        type: "sms",
+        label: "SMS Failed",
+        detail: `${event.sms_failed} SMS notification(s) failed`,
+        eventType: "SMS_FAILED",
+        status: "failed",
+        time: event.created_at,
+        provider: event.provider,
+        recipientPhone: event.recipient_phone,
+        providerCallUuid: event.provider_call_uuid
+      });
+    }
+
+    return;
+  }
+
+  if (event.event_type === "VOICE_CALL_SUBMITTED") {
+    events.push({
+      id: event.id,
+      type: "call",
+      label: "Call Submitted",
+      detail: event.recipient_phone
+        ? `Call submitted to ${event.recipient_phone}`
+        : "Voice call submitted to Vonage",
+      eventType: event.event_type,
+      status: event.status,
+      time: event.created_at,
+      provider: event.provider,
+      recipientPhone: event.recipient_phone,
+      providerCallUuid: event.provider_call_uuid
     });
+
+    return;
+  }
+
+  if (event.event_type === "VOICE_WEBHOOK") {
+    let label = `Call ${event.status || "Event"}`;
+    let detail = event.voice_status || event.status || "Voice webhook received";
+
+    if (event.status === "ringing") {
+      label = "Call Ringing";
+      detail = "Phone is ringing";
+    } else if (event.status === "started") {
+      label = "Call Started";
+      detail = "Voice call started";
+    } else if (event.status === "answered") {
+      label = "Call Answered";
+      detail = "Voice call answered";
+    } else if (event.status === "completed") {
+      label = "Call Completed";
+
+      const duration =
+        event.event_payload?.duration ||
+        event.event_payload?.duration_ms ||
+        null;
+
+      detail = duration
+        ? `Voice call completed · Duration: ${duration} sec`
+        : "Voice call completed";
+    }
+
+    events.push({
+      id: event.id,
+      type: "call",
+      label,
+      detail,
+      eventType: event.event_type,
+      status: event.status,
+      time: event.created_at,
+      provider: event.provider,
+      recipientPhone: event.recipient_phone,
+      providerCallUuid: event.provider_call_uuid
+    });
+  }
+});
+
+events.sort((a, b) => {
+  const order = {
+    "Alert Triggered": 1,
+    "SMS Sent": 2,
+    "SMS Failed": 3,
+    "Call Submitted": 4,
+    "Call Started": 5,
+    "Call Ringing": 6,
+    "Call Answered": 7,
+    "Call Completed": 8
+  };
+
+  return (
+    (order[a.label] || 99) - (order[b.label] || 99) ||
+    new Date(a.time) - new Date(b.time)
+  );
+});
 
     const hasCallCompleted = rawEvents.some(
       (event) =>
