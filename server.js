@@ -2948,6 +2948,10 @@ WHERE status = 'active'
         ae.sms_failed,
         ae.voice_attempted,
         ae.voice_status,
+        ae.has_call_submitted,
+ae.has_call_ringing,
+ae.has_call_answered,
+ae.has_call_completed,
 
         CASE
           WHEN i.id IS NULL THEN 'normal'
