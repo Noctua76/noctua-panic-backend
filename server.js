@@ -1138,10 +1138,43 @@ app.get("/dashboard/metrics", async (req, res) => {
       WHERE DATE(created_at) = CURRENT_DATE
     `).catch(() => ({ rows: [{ count: 0 }] }));
 
+    const responseTimeResult = await pool.query(`
+  SELECT
+    trigger_time,
+    resolved_time,
+    EXTRACT(EPOCH FROM (resolved_time - trigger_time))::int AS duration_seconds
+  FROM incidents
+  WHERE status = 'resolved'
+    AND trigger_time IS NOT NULL
+    AND resolved_time IS NOT NULL
+  ORDER BY resolved_time DESC
+  LIMIT 1
+`).catch(() => ({
+  rows: [{ duration_seconds: null }]
+}));
+
+let responseTime = "0s";
+
+const durationSeconds =
+  responseTimeResult.rows[0]?.duration_seconds;
+
+if (durationSeconds !== null && durationSeconds !== undefined) {
+  const hours = Math.floor(durationSeconds / 3600);
+  const minutes = Math.floor((durationSeconds % 3600) / 60);
+  const seconds = durationSeconds % 60;
+
+  responseTime =
+    hours > 0
+      ? `${hours}h ${minutes}m ${seconds}s`
+      : minutes > 0
+      ? `${minutes}m ${seconds}s`
+      : `${seconds}s`;
+}
+
     res.json({
       activeIncidents: incidentsResult.rows[0]?.count || 0,
       alertsToday: alertsTodayResult.rows[0]?.count || 0,
-      responseTime: "0s",
+      responseTime,
       guardsOnDuty: guardsResult.rows[0]?.count || 0,
     });
 
