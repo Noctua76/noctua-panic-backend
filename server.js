@@ -3459,6 +3459,7 @@ app.get("/incidents/:id/report", async (req, res) => {
     const alertEventsResult = await pool.query(
   `
   SELECT
+    id,
     event_type,
     source,
     status,
@@ -3466,13 +3467,16 @@ app.get("/incidents/:id/report", async (req, res) => {
     sms_failed,
     voice_attempted,
     voice_status,
+    recipient_phone,
+    provider,
+    provider_call_uuid,
+    event_payload,
     created_at
   FROM alert_events
-  WHERE created_at >= ($1::timestamp - INTERVAL '5 minutes')
-    AND created_at <= (COALESCE($2::timestamp, NOW()) + INTERVAL '5 minutes')
-  ORDER BY created_at ASC
+  WHERE incident_id = $1
+  ORDER BY created_at ASC, id ASC
   `,
-  [incident.trigger_time, incident.resolved_time]
+  [incidentId]
 );
 
     const guardResponses = guardResponsesResult.rows;
@@ -3486,71 +3490,104 @@ app.get("/incidents/:id/report", async (req, res) => {
 
     const timeline = [];
 
-    if (incident.trigger_time) {
+alertEvents.forEach((event) => {
+  if (event.event_type === "WEBAPP_ALERT") {
+    timeline.push({
+      event: "Alert Triggered",
+      timestamp: event.created_at,
+      display_time: formatReportTime(event.created_at),
+    });
+
+    if (Number(event.sms_sent) > 0) {
       timeline.push({
-        event: "Panic Triggered",
-        timestamp: incident.trigger_time,
-        display_time: formatReportTime(incident.trigger_time),
+        event: `SMS Sent (${event.sms_sent})`,
+        timestamp: event.created_at,
+        display_time: formatReportTime(event.created_at),
       });
     }
 
-    const smsEvent = alertEvents.find(
-      (event) => Number(event.sms_sent) > 0 || Number(event.sms_failed) > 0
-    );
-
-    if (smsEvent) {
+    if (Number(event.sms_failed) > 0) {
       timeline.push({
-        event: Number(smsEvent.sms_sent) > 0 ? "SMS Sent" : "SMS Failed",
-        timestamp: smsEvent.created_at,
-        display_time: formatReportTime(smsEvent.created_at),
+        event: `SMS Failed (${event.sms_failed})`,
+        timestamp: event.created_at,
+        display_time: formatReportTime(event.created_at),
       });
     }
 
-    const voiceEvent = alertEvents.find(
-      (event) => Number(event.voice_attempted) > 0 || event.voice_status
-    );
+    return;
+  }
 
-    if (voiceEvent) {
-      timeline.push({
-        event: "Voice Call Initiated",
-        timestamp: voiceEvent.created_at,
-        display_time: formatReportTime(voiceEvent.created_at),
-      });
+  if (event.event_type === "VOICE_CALL_SUBMITTED") {
+    timeline.push({
+      event: event.recipient_phone
+        ? `Voice Call Submitted (${event.recipient_phone})`
+        : "Voice Call Submitted",
+      timestamp: event.created_at,
+      display_time: formatReportTime(event.created_at),
+    });
 
-      if (voiceEvent.voice_status) {
-        timeline.push({
-          event: `Voice Call ${voiceEvent.voice_status}`,
-          timestamp: voiceEvent.created_at,
-          display_time: formatReportTime(voiceEvent.created_at),
-        });
-      }
+    return;
+  }
+
+  if (event.event_type === "VOICE_WEBHOOK") {
+    let label = `Voice Call ${event.status || "Event"}`;
+
+    if (event.status === "started") {
+      label = "Voice Call Started";
     }
 
-    if (guardResponses.length > 0) {
-      const lastResponse = guardResponses[guardResponses.length - 1];
-
-      timeline.push({
-        event: "Guard Questions Completed",
-        timestamp: lastResponse.created_at,
-        display_time: formatReportTime(lastResponse.created_at),
-      });
+    if (event.status === "ringing") {
+      label = "Voice Call Ringing";
     }
 
-    if (resolution?.approved_at) {
-      timeline.push({
-        event: "Investigation Completed",
-        timestamp: resolution.approved_at,
-        display_time: formatReportTime(resolution.approved_at),
-      });
+    if (event.status === "answered") {
+      label = "Voice Call Answered";
     }
 
-    if (incident.resolved_time) {
-      timeline.push({
-        event: "Incident Resolved",
-        timestamp: incident.resolved_time,
-        display_time: formatReportTime(incident.resolved_time),
-      });
+    if (event.status === "completed") {
+      const duration =
+        event.event_payload?.duration ||
+        event.event_payload?.duration_ms ||
+        null;
+
+      label = duration
+        ? `Voice Call Completed (${duration} sec)`
+        : "Voice Call Completed";
     }
+
+    timeline.push({
+      event: label,
+      timestamp: event.created_at,
+      display_time: formatReportTime(event.created_at),
+    });
+  }
+});
+
+if (guardResponses.length > 0) {
+  const lastResponse = guardResponses[guardResponses.length - 1];
+
+  timeline.push({
+    event: "Guard Questions Completed",
+    timestamp: lastResponse.created_at,
+    display_time: formatReportTime(lastResponse.created_at),
+  });
+}
+
+if (resolution?.approved_at) {
+  timeline.push({
+    event: "Investigation Completed",
+    timestamp: resolution.approved_at,
+    display_time: formatReportTime(resolution.approved_at),
+  });
+}
+
+if (incident.resolved_time) {
+  timeline.push({
+    event: "Incident Resolved",
+    timestamp: incident.resolved_time,
+    display_time: formatReportTime(incident.resolved_time),
+  });
+}
 
     timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
