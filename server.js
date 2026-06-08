@@ -2506,13 +2506,51 @@ function answerNcco(req, res) {
 app.get('/webhooks/answer', answerNcco);
 app.post('/webhooks/answer', answerNcco);
 
-function eventHook(req, res) {
-  console.log("VONAGE VOICE EVENT:", {
-    method: req.method,
-    query: req.query,
-    body: req.body
-  });
-  return res.status(200).send('ok');
+async function eventHook(req, res) {
+  try {
+    const payload = req.body || {};
+    const callStatus = payload.status || "unknown";
+    const callUuid = payload.uuid || payload.conversation_uuid || null;
+
+    console.log("VONAGE VOICE EVENT:", {
+      method: req.method,
+      query: req.query,
+      body: payload
+    });
+
+    await ensureAlertEventsTable();
+
+    await pool.query(
+      `
+      INSERT INTO alert_events (
+        event_type,
+        source,
+        status,
+        voice_attempted,
+        voice_status,
+        provider,
+        provider_call_uuid,
+        event_payload
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `,
+      [
+        "VOICE_WEBHOOK",
+        "vonage",
+        callStatus,
+        1,
+        callStatus,
+        "vonage",
+        callUuid,
+        payload
+      ]
+    );
+
+    return res.status(200).send("ok");
+  } catch (err) {
+    console.error("Vonage voice webhook error:", err);
+    return res.status(200).send("ok");
+  }
 }
 
 app.get('/webhooks/event', eventHook);
