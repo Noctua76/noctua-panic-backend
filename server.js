@@ -2989,10 +2989,43 @@ WHERE status = 'active'
   LIMIT 1
 ) i ON true
        LEFT JOIN LATERAL (
-  SELECT *
+  SELECT
+    ae.*,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_CALL_SUBMITTED'
+    ) AS has_call_submitted,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_WEBHOOK'
+        AND e.status = 'ringing'
+    ) AS has_call_ringing,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_WEBHOOK'
+        AND e.status = 'answered'
+    ) AS has_call_answered,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_WEBHOOK'
+        AND e.status = 'completed'
+    ) AS has_call_completed
+
   FROM alert_events ae
   WHERE ae.event_type = 'WEBAPP_ALERT'
-    AND ae.source = 'aegis-link-webapp'
+    AND ae.incident_id = i.id
   ORDER BY ae.created_at DESC
   LIMIT 1
 ) ae ON true
@@ -3031,9 +3064,15 @@ smsStatus: row.incident_id
   : "Ready",
 
 callStatus: row.incident_id
-  ? row.voice_status === "online" || Number(row.voice_attempted) > 0
+  ? row.has_call_completed
     ? "Completed"
-    : "Dialing"
+    : row.has_call_answered
+    ? "Answered"
+    : row.has_call_ringing
+    ? "Ringing"
+    : row.has_call_submitted
+    ? "Dialing"
+    : "Pending"
   : "Ready",
 
 aiStatus: row.incident_id
