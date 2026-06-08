@@ -5,6 +5,7 @@ const morgan = require('morgan');
 const { Vonage } = require('@vonage/server-sdk');
 const pool = require("./db");
 const bcrypt = require("bcrypt");
+const puppeteer = require("puppeteer");
 
 const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -3224,6 +3225,303 @@ app.get("/incidents/:id/report", async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Failed to generate incident report",
+      error: err.message,
+    });
+  }
+});
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return "-";
+
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+app.get("/incidents/:id/report/pdf", async (req, res) => {
+  let browser;
+
+  try {
+    const incidentId = req.params.id;
+
+    const reportResponse = await fetch(
+      `${req.protocol}://${req.get("host")}/incidents/${incidentId}/report`
+    );
+
+    const data = await reportResponse.json();
+
+    if (data.status !== "ok") {
+      return res.status(404).json({
+        status: "error",
+        message: "Report data not found",
+      });
+    }
+
+    const timelineHtml = data.timeline
+      .map(
+        (item) => `
+          <tr>
+            <td>${escapeHtml(item.display_time)}</td>
+            <td>${escapeHtml(
+              item.event === "Voice Call online"
+                ? "Voice Call Completed"
+                : item.event
+            )}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const responsesHtml = data.guard_responses
+      .map(
+        (item) => `
+          <div style="margin-bottom:12px">
+            <strong>${escapeHtml(item.question_text)}</strong><br/>
+            ${escapeHtml(item.answer)}
+          </div>
+        `
+      )
+      .join("");
+
+    const html = `
+      <html>
+        <head>
+          <title>${escapeHtml(data.report_title)}</title>
+          <style>
+            @page { margin: 16mm; }
+
+            body {
+              font-family: Arial, sans-serif;
+              color: #111;
+              margin: 0;
+              padding: 28px 34px;
+              box-sizing: border-box;
+            }
+
+            .report-header {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              border-bottom: 3px solid #111827;
+              padding-bottom: 18px;
+              margin-bottom: 28px;
+            }
+
+            .brand-title h1 {
+              margin: 0;
+              font-size: 28px;
+              letter-spacing: 1px;
+            }
+
+            .brand-title p {
+              margin: 4px 0 0;
+              color: #555;
+              font-size: 14px;
+            }
+
+            .report-meta {
+              text-align: right;
+              font-size: 13px;
+              color: #444;
+            }
+
+            .summary-grid {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: 10px 28px;
+              margin-bottom: 28px;
+            }
+
+            .summary-item {
+              border-bottom: 1px solid #eee;
+              padding-bottom: 8px;
+            }
+
+            .label {
+              display: block;
+              font-size: 11px;
+              text-transform: uppercase;
+              color: #666;
+              letter-spacing: .6px;
+              margin-bottom: 3px;
+            }
+
+            .value {
+              font-size: 15px;
+              font-weight: 600;
+            }
+
+            h2 {
+              margin-top: 30px;
+              border-bottom: 1px solid #ddd;
+              padding-bottom: 8px;
+              font-size: 18px;
+            }
+
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              margin-top: 10px;
+            }
+
+            td {
+              border-bottom: 1px solid #eee;
+              padding: 9px 8px;
+              font-size: 14px;
+              vertical-align: top;
+            }
+
+            .notes {
+              white-space: pre-line;
+              line-height: 1.5;
+            }
+
+            .footer {
+              margin-top: 36px;
+              padding-top: 14px;
+              border-top: 1px solid #ddd;
+              font-size: 12px;
+              color: #555;
+              display: flex;
+              justify-content: space-between;
+            }
+          </style>
+        </head>
+
+        <body>
+          <div class="report-header">
+            <div class="brand-title">
+              <h1>AEGIS LINK</h1>
+              <p>Security Operations Platform</p>
+            </div>
+
+            <div class="report-meta">
+              <strong>Security Incident Report</strong><br/>
+              Report ID: ${escapeHtml(data.report_id)}<br/>
+              Generated: ${escapeHtml(data.generated_at_display)}<br/>
+              Generated By: System
+            </div>
+          </div>
+
+          <div class="summary-grid">
+            <div class="summary-item">
+              <span class="label">Incident Ref</span>
+              <span class="value">${escapeHtml(data.incident.incident_ref)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Duration</span>
+              <span class="value">${escapeHtml(data.incident.duration_display)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Site</span>
+              <span class="value">${escapeHtml(data.incident.site)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Guard</span>
+              <span class="value">${escapeHtml(data.incident.guard)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Status</span>
+              <span class="value">${escapeHtml(data.incident.status)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Priority</span>
+              <span class="value">${escapeHtml(data.incident.priority)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Triggered</span>
+              <span class="value">${escapeHtml(data.incident.trigger_time_display)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Resolved</span>
+              <span class="value">${escapeHtml(data.incident.resolved_time_display)}</span>
+            </div>
+          </div>
+
+          <h2>Incident Timeline</h2>
+          <table>${timelineHtml}</table>
+
+          <h2>Guard Responses</h2>
+          ${responsesHtml}
+
+          <h2>Investigation Notes</h2>
+
+          <p><strong>Supervisor:</strong> ${escapeHtml(data.investigation?.supervisor_name)}</p>
+
+          <p><strong>Supervisor Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.supervisor_notes)}</span>
+          </p>
+
+          <p><strong>Guard Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.guard_notes)}</span>
+          </p>
+
+          <p><strong>Residence Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.residence_notes)}</span>
+          </p>
+
+          <p><strong>Admin Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.admin_notes)}</span>
+          </p>
+
+          <h2>Resolution Summary</h2>
+
+          <p><strong>Approved By:</strong> ${escapeHtml(data.investigation?.approved_by)}</p>
+          <p><strong>Approved At:</strong> ${escapeHtml(data.investigation?.approved_at_display)}</p>
+
+          <div class="footer">
+            <span>Aegis Link Security Operations Platform</span>
+            <span>Generated Automatically</span>
+          </div>
+        </body>
+      </html>
+    `;
+
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const page = await browser.newPage();
+
+    await page.setContent(html, {
+      waitUntil: "networkidle0",
+    });
+
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+    });
+
+    await browser.close();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${data.report_id}.pdf"`
+    );
+
+    res.send(pdfBuffer);
+  } catch (err) {
+    if (browser) {
+      await browser.close();
+    }
+
+    console.error("Incident PDF report error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to generate PDF report",
       error: err.message,
     });
   }
