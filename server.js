@@ -3048,6 +3048,10 @@ WHERE status = 'active'
       incidentDbId: row.incident_id || null,
       triggerTime: row.trigger_time || null,
       resolvedTime: row.resolved_time || null,
+      debugCallSubmitted: row.has_call_submitted || false,
+debugCallRinging: row.has_call_ringing || false,
+debugCallAnswered: row.has_call_answered || false,
+debugCallCompleted: row.has_call_completed || false,
 
       triggerStatus: row.incident_id
   ? row.display_status === "resolved"
