@@ -2411,6 +2411,8 @@ RETURNING *
       ]
     );
 
+    const incident = incidentResult.rows[0];
+
     const results = await Promise.all(
       recipients.map(to => sendVonageSms(to, text))
     );
@@ -2431,25 +2433,36 @@ await pool.query(
     event_type,
     source,
     status,
+    incident_id,
+    site_id,
+    guard_id,
     recipients_count,
     sms_sent,
     sms_failed,
     voice_attempted,
-    voice_status
+    voice_status,
+    provider
   )
   VALUES (
-    $1,$2,$3,$4,$5,$6,$7,$8
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
   )
   `,
   [
     "WEBAPP_ALERT",
     source || "webapp",
-    "completed",
+    "submitted",
+
+    incident.id,
+    siteId || 1,
+    guardId || null,
+
     recipients.length,
     results.length,
     0,
     recipients.length,
-    "online"
+    "submitted",
+
+    "vonage"
   ]
 );
 
