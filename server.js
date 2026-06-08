@@ -1156,11 +1156,13 @@ app.get("/dashboard/metrics", async (req, res) => {
 
 // ----------------------------------------------------------
 // DASHBOARD INCIDENT TIMELINE
-// Shows active incident, recently resolved incident, or normal state
+// Uses real alert_events for the latest active / recent incident
 // ----------------------------------------------------------
 app.get("/dashboard/incident-timeline", async (req, res) => {
   try {
-    const result = await pool.query(`
+    await ensureAlertEventsTable();
+
+    const incidentResult = await pool.query(`
       SELECT
         i.id,
         i.incident_ref,
@@ -1168,29 +1170,18 @@ app.get("/dashboard/incident-timeline", async (req, res) => {
         i.priority,
         i.trigger_time,
         i.resolved_time,
-        i.ai_summary,
-        i.needs_support,
-
         s.name AS site_name,
         s.location AS site_location,
-
-        COALESCE(g.full_name, g.username) AS guard_name
-
+        COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name
       FROM incidents i
-
-      LEFT JOIN sites s
-      ON s.id = i.site_id
-
-      LEFT JOIN guards g
-      ON g.id = i.guard_ref
-
+      LEFT JOIN sites s ON s.id = i.site_id
+      LEFT JOIN guards g ON g.id = i.guard_ref
       WHERE
         i.status IN ('active', 'in_progress')
         OR (
           i.status = 'resolved'
           AND i.resolved_time > NOW() - INTERVAL '1 hour'
         )
-
       ORDER BY
         CASE
           WHEN i.status IN ('active', 'in_progress') THEN 1
@@ -1198,29 +1189,164 @@ app.get("/dashboard/incident-timeline", async (req, res) => {
           ELSE 3
         END,
         i.trigger_time DESC
-
       LIMIT 1
     `);
 
-    if (result.rows.length === 0) {
+    if (incidentResult.rows.length === 0) {
       return res.json({
         status: "normal",
         incidentRef: null,
         location: "Normal",
         alertTime: null,
         guardName: null,
-
         alertStatus: "normal",
         callStatus: "normal",
         smsStatus: "normal",
         incidentStatus: "normal",
-
         resolvedTime: null,
-        duration: null
+        duration: null,
+        events: []
       });
     }
 
-    const incident = result.rows[0];
+    const incident = incidentResult.rows[0];
+
+    const eventsResult = await pool.query(
+      `
+      SELECT
+        id,
+        event_type,
+        source,
+        status,
+        sms_sent,
+        sms_failed,
+        voice_attempted,
+        voice_status,
+        recipient_phone,
+        provider,
+        provider_message_id,
+        provider_call_uuid,
+        event_payload,
+        created_at
+      FROM alert_events
+      WHERE incident_id = $1
+      ORDER BY created_at ASC, id ASC
+      `,
+      [incident.id]
+    );
+
+    const rawEvents = eventsResult.rows;
+
+    const events = rawEvents.map((event) => {
+      let label = event.event_type;
+      let type = "system";
+      let detail = event.status || "-";
+
+      if (event.event_type === "WEBAPP_ALERT") {
+        label = "Alert Triggered";
+        type = "alert";
+        detail = "Panic alert received from web app";
+      }
+
+      if (event.event_type === "VOICE_CALL_SUBMITTED") {
+        label = "Call Submitted";
+        type = "call";
+        detail = event.recipient_phone
+          ? `Call submitted to ${event.recipient_phone}`
+          : "Voice call submitted to Vonage";
+      }
+
+      if (event.event_type === "VOICE_WEBHOOK") {
+        type = "call";
+
+        if (event.status === "ringing") {
+          label = "Call Ringing";
+          detail = "Phone is ringing";
+        } else if (event.status === "started") {
+          label = "Call Started";
+          detail = "Voice call started";
+        } else if (event.status === "answered") {
+          label = "Call Answered";
+          detail = "Voice call answered";
+        } else if (event.status === "completed") {
+          label = "Call Completed";
+
+          const duration =
+            event.event_payload?.duration ||
+            event.event_payload?.duration_ms ||
+            null;
+
+          detail = duration
+            ? `Voice call completed · Duration: ${duration} sec`
+            : "Voice call completed";
+        } else {
+          label = `Call ${event.status || "Event"}`;
+          detail = event.voice_status || event.status || "Voice webhook received";
+        }
+      }
+
+      return {
+        id: event.id,
+        type,
+        label,
+        detail,
+        eventType: event.event_type,
+        status: event.status,
+        time: event.created_at,
+        provider: event.provider,
+        recipientPhone: event.recipient_phone,
+        providerCallUuid: event.provider_call_uuid
+      };
+    });
+
+    const hasCallCompleted = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "completed"
+    );
+
+    const hasCallAnswered = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "answered"
+    );
+
+    const hasCallStarted = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "started"
+    );
+
+    const hasCallRinging = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "ringing"
+    );
+
+    const hasCallSubmitted = rawEvents.some(
+      (event) => event.event_type === "VOICE_CALL_SUBMITTED"
+    );
+
+    const webAlertEvent = rawEvents.find(
+      (event) => event.event_type === "WEBAPP_ALERT"
+    );
+
+    const smsSent =
+      webAlertEvent && Number(webAlertEvent.sms_sent) > 0;
+
+    let callStatus = "normal";
+
+    if (hasCallCompleted) {
+      callStatus = "completed";
+    } else if (hasCallAnswered) {
+      callStatus = "answered";
+    } else if (hasCallStarted) {
+      callStatus = "started";
+    } else if (hasCallRinging) {
+      callStatus = "ringing";
+    } else if (hasCallSubmitted) {
+      callStatus = "submitted";
+    }
 
     let duration = null;
 
@@ -1228,7 +1354,6 @@ app.get("/dashboard/incident-timeline", async (req, res) => {
       const start = new Date(incident.trigger_time);
       const end = new Date(incident.resolved_time);
       const seconds = Math.floor((end - start) / 1000);
-
       const minutes = Math.floor(seconds / 60);
       const remainingSeconds = seconds % 60;
 
@@ -1237,23 +1362,25 @@ app.get("/dashboard/incident-timeline", async (req, res) => {
 
     const isResolved = incident.status === "resolved";
 
-    res.json({
+    return res.json({
       status: isResolved ? "resolved_recent" : "active",
 
+      incidentId: incident.id,
       incidentRef: incident.incident_ref,
       location: incident.site_name || incident.site_location || "Unknown site",
       alertTime: incident.trigger_time,
       guardName: incident.guard_name || "Unknown guard",
 
-      alertStatus: "triggered",
-      callStatus: isResolved ? "completed" : "in_progress",
-      smsStatus: isResolved ? "completed" : "in_progress",
-      incidentStatus: isResolved ? "resolved" : "active",
+      alertStatus: webAlertEvent ? "triggered" : "normal",
+      callStatus,
+      smsStatus: smsSent ? "completed" : "normal",
+      incidentStatus: isResolved ? "resolved" : incident.status,
 
       resolvedTime: incident.resolved_time,
-      duration
-    });
+      duration,
 
+      events
+    });
   } catch (err) {
     console.error("Dashboard incident timeline error:", err);
 
