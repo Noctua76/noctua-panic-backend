@@ -1940,6 +1940,195 @@ message:err.message
 });
 
 // ----------------------------------------------------------
+// SETTINGS - SITES MANAGEMENT
+// ----------------------------------------------------------
+
+app.get("/settings/sites", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        company_id,
+        name,
+        location,
+        status,
+        required_shifts,
+        created_at
+      FROM sites
+      ORDER BY id ASC
+    `);
+
+    res.json({
+      status: "ok",
+      sites: result.rows
+    });
+  } catch (err) {
+    console.error("Settings sites GET error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/settings/sites", async (req, res) => {
+  try {
+    const {
+      name,
+      location,
+      required_shifts = 1
+    } = req.body;
+
+    if (!name) {
+      return res.status(400).json({
+        status: "error",
+        message: "Site name is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO sites (
+        company_id,
+        name,
+        location,
+        status,
+        required_shifts,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,NOW())
+      RETURNING *
+      `,
+      [
+        1,
+        name,
+        location || "",
+        "normal",
+        required_shifts
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      site: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings site POST error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// SETTINGS - GUARDS MANAGEMENT
+// ----------------------------------------------------------
+
+app.get("/settings/guards", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        g.id,
+        g.full_name,
+        g.username,
+        g.phone,
+        g.role,
+        g.site_id,
+        g.active,
+        g.created_at,
+        s.name AS site_name
+      FROM guards g
+      LEFT JOIN sites s
+        ON s.id = g.site_id
+      ORDER BY g.id ASC
+    `);
+
+    res.json({
+      status: "ok",
+      guards: result.rows
+    });
+  } catch (err) {
+    console.error("Settings guards GET error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/settings/guards", async (req, res) => {
+  try {
+    const {
+      full_name,
+      username,
+      phone,
+      password,
+      role = "guard",
+      site_id
+    } = req.body;
+
+    if (!full_name || !username || !password || !site_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "full_name, username, password and site_id are required"
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `
+      INSERT INTO guards (
+        full_name,
+        username,
+        phone,
+        role,
+        site_id,
+        active,
+        password_hash,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,true,$6,NOW())
+      RETURNING
+        id,
+        full_name,
+        username,
+        phone,
+        role,
+        site_id,
+        active,
+        created_at
+      `,
+      [
+        full_name,
+        username,
+        phone || "",
+        role,
+        site_id,
+        passwordHash
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      guard: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings guard POST error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
 // ----------------------------------------------------------
 app.get("/settings/alert-configuration", async (req, res) => {
