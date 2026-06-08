@@ -2024,6 +2024,46 @@ app.post("/settings/sites", async (req, res) => {
 });
 
 
+app.put("/settings/sites/:id/toggle-active", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE sites
+      SET status =
+        CASE
+          WHEN status = 'active' THEN 'inactive'
+          ELSE 'active'
+        END
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Site not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      site: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Site toggle error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
 // ----------------------------------------------------------
 // SETTINGS - GUARDS MANAGEMENT
 // ----------------------------------------------------------
