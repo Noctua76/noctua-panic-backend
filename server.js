@@ -1077,11 +1077,13 @@ app.get("/guards/active", async (req, res) => {
         gs.status,
 
         (
-  gs.logout_time IS NULL
+  gs.id IS NOT NULL
+  AND gs.logout_time IS NULL
 ) AS is_currently_online,
 
 (
-  gs.logout_time IS NULL
+  gs.id IS NOT NULL
+  AND gs.logout_time IS NULL
   AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
 ) AS has_recent_heartbeat
 
