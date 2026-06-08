@@ -2319,19 +2319,58 @@ app.post('/test-sms', async (req, res) => {
   }
 });
 
-async function startVoiceCalls(recipients) {
+async function startVoiceCalls(recipients, context = {}) {
   const baseUrl = 'https://noctua-panic-backend-production.up.railway.app';
 
   const results = [];
   for (const to of recipients) {
     const r = await vonageVoice.voice.createOutboundCall({
-      to: [{ type: 'phone', number: to.replace("+", "") }],
-      from: { type: 'phone', number: process.env.VONAGE_FROM_NUMBER },
-      answer_url: [`${baseUrl}/webhooks/answer`],
-      event_url:  [`${baseUrl}/webhooks/event`],
-      event_method: 'POST'   // 👈 ΜΠΑΙΝΕΙ ΕΔΩ
-    });
-    results.push({ to, response: r });
+  to: [{ type: 'phone', number: to.replace("+", "") }],
+  from: { type: 'phone', number: process.env.VONAGE_FROM_NUMBER },
+  answer_url: [`${baseUrl}/webhooks/answer`],
+  event_url:  [`${baseUrl}/webhooks/event`],
+  event_method: 'POST'
+});
+
+const callUuid = r.uuid || r.call_uuid || null;
+
+await ensureAlertEventsTable();
+
+await pool.query(
+  `
+  INSERT INTO alert_events (
+    event_type,
+    source,
+    status,
+    incident_id,
+    site_id,
+    guard_id,
+    recipient_phone,
+    voice_attempted,
+    voice_status,
+    provider,
+    provider_call_uuid,
+    event_payload
+  )
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+  `,
+  [
+    "VOICE_CALL_SUBMITTED",
+    "vonage",
+    "submitted",
+    context.incidentId || null,
+    context.siteId || null,
+    context.guardId || null,
+    to,
+    1,
+    "submitted",
+    "vonage",
+    callUuid,
+    r
+  ]
+);
+
+results.push({ to, response: r });
   }
   return results;
 }
@@ -2420,7 +2459,11 @@ RETURNING *
     let callResults = [];
 
     try {
-      callResults = await startVoiceCalls(recipients);
+      callResults = await startVoiceCalls(recipients, {
+  incidentId: incident.id,
+  siteId: siteId || 1,
+  guardId: guardId || null
+});
     } catch (callErr) {
       console.error('Voice call failed (non-blocking):', callErr);
     }
