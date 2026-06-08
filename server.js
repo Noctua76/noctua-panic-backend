@@ -2128,6 +2128,152 @@ app.post("/settings/guards", async (req, res) => {
   }
 });
 
+app.put("/settings/guards/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { full_name, username, phone, role, site_id, active } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE guards
+      SET
+        full_name = COALESCE($1, full_name),
+        username = COALESCE($2, username),
+        phone = COALESCE($3, phone),
+        role = COALESCE($4, role),
+        site_id = COALESCE($5, site_id),
+        active = COALESCE($6, active)
+      WHERE id = $7
+      RETURNING
+        id,
+        full_name,
+        username,
+        phone,
+        role,
+        site_id,
+        active,
+        created_at
+      `,
+      [
+        full_name || null,
+        username || null,
+        phone || null,
+        role || null,
+        site_id || null,
+        typeof active === "boolean" ? active : null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Guard not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      guard: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings guard PUT error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.put("/settings/guards/:id/toggle-active", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE guards
+      SET active = NOT active
+      WHERE id = $1
+      RETURNING
+        id,
+        full_name,
+        username,
+        phone,
+        role,
+        site_id,
+        active,
+        created_at
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Guard not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      guard: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings guard toggle error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.put("/settings/guards/:id/reset-password", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+
+    if (!password) {
+      return res.status(400).json({
+        status: "error",
+        message: "Password is required"
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `
+      UPDATE guards
+      SET password_hash = $1
+      WHERE id = $2
+      RETURNING id, full_name, username
+      `,
+      [passwordHash, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Guard not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      guard: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings guard reset password error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
 // ----------------------------------------------------------
