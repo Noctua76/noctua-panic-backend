@@ -1625,7 +1625,7 @@ app.get("/sites", async (req, res) => {
         )::int AS on_duty
 
       FROM sites s
-
+      
       LEFT JOIN LATERAL (
         SELECT
           g.full_name
@@ -1637,6 +1637,8 @@ app.get("/sites", async (req, res) => {
         ORDER BY gs.login_time DESC
         LIMIT 1
       ) active_guard ON true
+
+      WHERE s.status <> 'archived'
 
       ORDER BY s.id ASC
     `);
@@ -2006,7 +2008,7 @@ app.post("/settings/sites", async (req, res) => {
         1,
         name,
         location || "",
-        "normal",
+        "active",
         required_shifts
       ]
     );
@@ -2025,6 +2027,51 @@ app.post("/settings/sites", async (req, res) => {
   }
 });
 
+app.put("/settings/sites/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, location, required_shifts, status } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE sites
+      SET
+        name = COALESCE($1, name),
+        location = COALESCE($2, location),
+        required_shifts = COALESCE($3, required_shifts),
+        status = COALESCE($4, status)
+      WHERE id = $5
+      RETURNING *
+      `,
+      [
+        name || null,
+        location || null,
+        required_shifts || null,
+        status || null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Site not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      site: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings site PUT error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
 app.put("/settings/sites/:id/toggle-active", async (req, res) => {
   try {
@@ -2065,6 +2112,40 @@ app.put("/settings/sites/:id/toggle-active", async (req, res) => {
   }
 });
 
+app.put("/settings/sites/:id/archive", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE sites
+      SET status = 'archived'
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Site not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      site: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Settings site archive error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
 
 // ----------------------------------------------------------
 // SETTINGS - GUARDS MANAGEMENT
