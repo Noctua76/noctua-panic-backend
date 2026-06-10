@@ -1957,6 +1957,16 @@ app.get("/settings/sites", async (req, res) => {
         location,
         status,
         required_shifts,
+        full_address,
+site_phone,
+shift_schedule,
+residence_contact_name,
+residence_contact_phone,
+supervisor_contact_name,
+supervisor_contact_phone,
+operational_notes,
+sop_text,
+sop_file_url,
         created_at
       FROM sites
       ORDER BY id ASC
@@ -2030,7 +2040,23 @@ app.post("/settings/sites", async (req, res) => {
 app.put("/settings/sites/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, location, required_shifts, status } = req.body;
+
+    const {
+      name,
+      location,
+      required_shifts,
+      status,
+      full_address,
+      site_phone,
+      shift_schedule,
+      residence_contact_name,
+      residence_contact_phone,
+      supervisor_contact_name,
+      supervisor_contact_phone,
+      operational_notes,
+      sop_text,
+      sop_file_url
+    } = req.body;
 
     const result = await pool.query(
       `
@@ -2039,8 +2065,18 @@ app.put("/settings/sites/:id", async (req, res) => {
         name = COALESCE($1, name),
         location = COALESCE($2, location),
         required_shifts = COALESCE($3, required_shifts),
-        status = COALESCE($4, status)
-      WHERE id = $5
+        status = COALESCE($4, status),
+        full_address = COALESCE($5, full_address),
+        site_phone = COALESCE($6, site_phone),
+        shift_schedule = COALESCE($7, shift_schedule),
+        residence_contact_name = COALESCE($8, residence_contact_name),
+        residence_contact_phone = COALESCE($9, residence_contact_phone),
+        supervisor_contact_name = COALESCE($10, supervisor_contact_name),
+        supervisor_contact_phone = COALESCE($11, supervisor_contact_phone),
+        operational_notes = COALESCE($12, operational_notes),
+        sop_text = COALESCE($13, sop_text),
+        sop_file_url = COALESCE($14, sop_file_url)
+      WHERE id = $15
       RETURNING *
       `,
       [
@@ -2048,6 +2084,16 @@ app.put("/settings/sites/:id", async (req, res) => {
         location || null,
         required_shifts || null,
         status || null,
+        full_address || null,
+        site_phone || null,
+        shift_schedule || null,
+        residence_contact_name || null,
+        residence_contact_phone || null,
+        supervisor_contact_name || null,
+        supervisor_contact_phone || null,
+        operational_notes || null,
+        sop_text || null,
+        sop_file_url || null,
         id
       ]
     );
