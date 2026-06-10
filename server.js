@@ -1958,6 +1958,8 @@ app.get("/settings/sites", async (req, res) => {
         status,
         required_shifts,
         full_address,
+        coverage_type,
+shift_rules,
 site_phone,
 shift_schedule,
 residence_contact_name,
@@ -2055,7 +2057,9 @@ app.put("/settings/sites/:id", async (req, res) => {
       supervisor_contact_phone,
       operational_notes,
       sop_text,
-      sop_file_url
+      sop_file_url,
+      coverage_type,
+      shift_rules
     } = req.body;
 
     const result = await pool.query(
@@ -2075,8 +2079,10 @@ app.put("/settings/sites/:id", async (req, res) => {
         supervisor_contact_phone = COALESCE($11, supervisor_contact_phone),
         operational_notes = COALESCE($12, operational_notes),
         sop_text = COALESCE($13, sop_text),
-        sop_file_url = COALESCE($14, sop_file_url)
-      WHERE id = $15
+        sop_file_url = COALESCE($14, sop_file_url),
+        coverage_type = COALESCE($15, coverage_type),
+        shift_rules = COALESCE($16, shift_rules)
+      WHERE id = $17
       RETURNING *
       `,
       [
@@ -2094,6 +2100,8 @@ app.put("/settings/sites/:id", async (req, res) => {
         operational_notes || null,
         sop_text || null,
         sop_file_url || null,
+        coverage_type || null,
+        shift_rules || null,
         id
       ]
     );
@@ -3917,6 +3925,28 @@ app.post("/setup/sites-profile-upgrade", async (req, res) => {
     });
   } catch (err) {
     console.error("Sites profile upgrade error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/setup/sites-shift-rules-upgrade", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE sites
+      ADD COLUMN IF NOT EXISTS coverage_type VARCHAR(50) DEFAULT '24_7',
+      ADD COLUMN IF NOT EXISTS shift_rules JSONB
+    `);
+
+    res.json({
+      status: "ok",
+      message: "Site shift rules fields added"
+    });
+  } catch (err) {
+    console.error("Site shift rules upgrade error:", err);
 
     res.status(500).json({
       status: "error",
