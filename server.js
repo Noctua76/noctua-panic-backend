@@ -1969,6 +1969,9 @@ supervisor_contact_phone,
 operational_notes,
 sop_text,
 sop_file_url,
+sop_title,
+sop_version,
+sop_updated_at,
 general_notes,
 access_instructions,
 patrol_instructions,
@@ -2063,6 +2066,8 @@ app.put("/settings/sites/:id", async (req, res) => {
       operational_notes,
       sop_text,
       sop_file_url,
+      sop_title,
+sop_version,
       coverage_type,
       shift_rules,
       general_notes,
@@ -2089,15 +2094,22 @@ app.put("/settings/sites/:id", async (req, res) => {
         supervisor_contact_phone = COALESCE($11, supervisor_contact_phone),
         operational_notes = COALESCE($12, operational_notes),
         sop_text = COALESCE($13, sop_text),
-        sop_file_url = COALESCE($14, sop_file_url),
-        coverage_type = COALESCE($15, coverage_type),
-        shift_rules = COALESCE($16, shift_rules),
-        general_notes = COALESCE($17, general_notes),
-        access_instructions = COALESCE($18, access_instructions),
-        patrol_instructions = COALESCE($19, patrol_instructions),
-        emergency_instructions = COALESCE($20, emergency_instructions),
-        special_warnings = COALESCE($21, special_warnings)
-      WHERE id = $22
+sop_file_url = COALESCE($14, sop_file_url),
+sop_title = COALESCE($15, sop_title),
+sop_version = COALESCE($16, sop_version),
+sop_updated_at = CASE
+  WHEN $13 IS NOT NULL OR $14 IS NOT NULL OR $15 IS NOT NULL OR $16 IS NOT NULL
+  THEN NOW()
+  ELSE sop_updated_at
+END,
+coverage_type = COALESCE($17, coverage_type),
+shift_rules = COALESCE($18, shift_rules),
+general_notes = COALESCE($19, general_notes),
+access_instructions = COALESCE($20, access_instructions),
+patrol_instructions = COALESCE($21, patrol_instructions),
+emergency_instructions = COALESCE($22, emergency_instructions),
+special_warnings = COALESCE($23, special_warnings)
+WHERE id = $24
       RETURNING *
       `,
       [
@@ -2114,15 +2126,17 @@ app.put("/settings/sites/:id", async (req, res) => {
         supervisor_contact_phone || null,
         operational_notes || null,
         sop_text || null,
-        sop_file_url || null,
-        coverage_type || null,
-        shift_rules || null,
-        general_notes || null,
-        access_instructions || null,
-        patrol_instructions || null,
-        emergency_instructions || null,
-        special_warnings || null,
-        id
+sop_file_url || null,
+sop_title || null,
+sop_version || null,
+coverage_type || null,
+shift_rules || null,
+general_notes || null,
+access_instructions || null,
+patrol_instructions || null,
+emergency_instructions || null,
+special_warnings || null,
+id
       ]
     );
 
