@@ -1969,6 +1969,11 @@ supervisor_contact_phone,
 operational_notes,
 sop_text,
 sop_file_url,
+general_notes,
+access_instructions,
+patrol_instructions,
+emergency_instructions,
+special_warnings,
         created_at
       FROM sites
       ORDER BY id ASC
@@ -2059,7 +2064,12 @@ app.put("/settings/sites/:id", async (req, res) => {
       sop_text,
       sop_file_url,
       coverage_type,
-      shift_rules
+      shift_rules,
+      general_notes,
+      access_instructions,
+      patrol_instructions,
+      emergency_instructions,
+      special_warnings
     } = req.body;
 
     const result = await pool.query(
@@ -2081,8 +2091,13 @@ app.put("/settings/sites/:id", async (req, res) => {
         sop_text = COALESCE($13, sop_text),
         sop_file_url = COALESCE($14, sop_file_url),
         coverage_type = COALESCE($15, coverage_type),
-        shift_rules = COALESCE($16, shift_rules)
-      WHERE id = $17
+        shift_rules = COALESCE($16, shift_rules),
+        general_notes = COALESCE($17, general_notes),
+        access_instructions = COALESCE($18, access_instructions),
+        patrol_instructions = COALESCE($19, patrol_instructions),
+        emergency_instructions = COALESCE($20, emergency_instructions),
+        special_warnings = COALESCE($21, special_warnings)
+      WHERE id = $22
       RETURNING *
       `,
       [
@@ -2102,6 +2117,11 @@ app.put("/settings/sites/:id", async (req, res) => {
         sop_file_url || null,
         coverage_type || null,
         shift_rules || null,
+        general_notes || null,
+        access_instructions || null,
+        patrol_instructions || null,
+        emergency_instructions || null,
+        special_warnings || null,
         id
       ]
     );
@@ -3947,6 +3967,31 @@ app.post("/setup/sites-shift-rules-upgrade", async (req, res) => {
     });
   } catch (err) {
     console.error("Site shift rules upgrade error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/setup/sites-operational-notes-upgrade", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE sites
+      ADD COLUMN IF NOT EXISTS general_notes TEXT,
+      ADD COLUMN IF NOT EXISTS access_instructions TEXT,
+      ADD COLUMN IF NOT EXISTS patrol_instructions TEXT,
+      ADD COLUMN IF NOT EXISTS emergency_instructions TEXT,
+      ADD COLUMN IF NOT EXISTS special_warnings TEXT
+    `);
+
+    res.json({
+      status: "ok",
+      message: "Site operational notes fields added"
+    });
+  } catch (err) {
+    console.error("Site operational notes upgrade error:", err);
 
     res.status(500).json({
       status: "error",
