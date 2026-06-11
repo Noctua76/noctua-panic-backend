@@ -6,6 +6,8 @@ const { Vonage } = require('@vonage/server-sdk');
 const pool = require("./db");
 const bcrypt = require("bcrypt");
 const puppeteer = require("puppeteer");
+const multer = require("multer");
+const { createClient } = require("@supabase/supabase-js");
 
 const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -18,6 +20,17 @@ const vonageVoice = new Vonage({
 
 
 const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+  },
+});
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));

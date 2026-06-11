@@ -11,6 +11,7 @@
     "node": "20.x"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.108.1",
     "@vonage/server-sdk": "^3.0.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
@@ -19,6 +20,7 @@
     "express-validator": "^7.3.2",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.1",
+    "multer": "^2.1.1",
     "openai": "^6.9.1",
     "pg": "^8.20.0",
     "puppeteer": "^25.1.0"
