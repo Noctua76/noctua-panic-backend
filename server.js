@@ -1654,6 +1654,29 @@ app.get("/sites", async (req, res) => {
       ELSE 'Active'
     END AS coverage_status
 
+    ,
+CASE
+  WHEN s.status <> 'active' THEN 'Inactive'
+  WHEN (
+    SELECT COUNT(*)
+    FROM guard_sessions gs3
+    WHERE gs3.site_id = s.id
+      AND gs3.logout_time IS NULL
+  ) > 0 THEN 'Covered'
+  ELSE 'No Guard'
+END AS status_label,
+
+CASE
+  WHEN s.status <> 'active' THEN 'inactive'
+  WHEN (
+    SELECT COUNT(*)
+    FROM guard_sessions gs3
+    WHERE gs3.site_id = s.id
+      AND gs3.logout_time IS NULL
+  ) > 0 THEN 'normal'
+  ELSE 'no-guard'
+END AS status_class
+
   FROM sites s
   
   LEFT JOIN LATERAL (
