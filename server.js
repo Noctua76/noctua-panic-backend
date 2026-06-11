@@ -3731,7 +3731,10 @@ END AS display_status
       site: row.site_name,
       location: row.site_location,
 
-      guard: row.guard_name || "Waiting for guard check-in",
+      guard:
+  row.display_status === "inactive"
+    ? "Guarding suspended"
+    : row.guard_name || "Waiting for guard check-in",
 
       status: row.display_status || "normal",
       priority: row.priority || "Normal",
