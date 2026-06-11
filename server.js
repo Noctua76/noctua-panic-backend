@@ -1619,48 +1619,59 @@ app.get("/guards", async (req, res) => {
 app.get("/sites", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT
-        s.id,
-        s.company_id,
-        s.name,
-        s.location,
-        s.status,
-        s.created_at,
+  SELECT
+    s.id,
+    s.company_id,
+    s.name,
+    s.location,
+    s.status,
+    s.created_at,
 
-        active_guard.full_name AS active_guard,
+    CASE
+      WHEN s.status <> 'active' THEN 'Guarding suspended'
+      ELSE COALESCE(active_guard.full_name, 'No active guard')
+    END AS active_guard,
 
-        (
-          SELECT COUNT(*)
-          FROM guards g2
-          WHERE g2.site_id = s.id
-            AND g2.active = true
-        )::int AS guards_assigned,
+    (
+      SELECT COUNT(*)
+      FROM guards g2
+      WHERE g2.site_id = s.id
+        AND g2.active = true
+    )::int AS guards_assigned,
 
-        (
-          SELECT COUNT(*)
-          FROM guard_sessions gs3
-          WHERE gs3.site_id = s.id
-            AND gs3.logout_time IS NULL
-        )::int AS on_duty
+    CASE
+      WHEN s.status <> 'active' THEN 0
+      ELSE (
+        SELECT COUNT(*)
+        FROM guard_sessions gs3
+        WHERE gs3.site_id = s.id
+          AND gs3.logout_time IS NULL
+      )::int
+    END AS on_duty,
 
-      FROM sites s
-      
-      LEFT JOIN LATERAL (
-        SELECT
-          g.full_name
-        FROM guard_sessions gs
-        LEFT JOIN guards g
-          ON g.id = gs.guard_id
-        WHERE gs.site_id = s.id
-          AND gs.logout_time IS NULL
-        ORDER BY gs.login_time DESC
-        LIMIT 1
-      ) active_guard ON true
+    CASE
+      WHEN s.status <> 'active' THEN 'Suspended'
+      ELSE 'Active'
+    END AS coverage_status
 
-      WHERE s.status <> 'archived'
+  FROM sites s
+  
+  LEFT JOIN LATERAL (
+    SELECT
+      g.full_name
+    FROM guard_sessions gs
+    LEFT JOIN guards g
+      ON g.id = gs.guard_id
+    WHERE gs.site_id = s.id
+      AND gs.logout_time IS NULL
+    ORDER BY gs.login_time DESC
+    LIMIT 1
+  ) active_guard ON true
 
-      ORDER BY s.id ASC
-    `);
+  WHERE s.status <> 'archived'
+
+  ORDER BY s.id ASC
+`);
 
     res.json({
       status: "ok",
