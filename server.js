@@ -3641,9 +3641,10 @@ ae.has_call_answered,
 ae.has_call_completed,
 
         CASE
-          WHEN i.id IS NULL THEN 'normal'
-          ELSE i.status
-        END AS display_status
+  WHEN s.status <> 'active' THEN 'inactive'
+  WHEN i.id IS NULL THEN 'normal'
+  ELSE i.status
+END AS display_status
 
       FROM sites s
 
