@@ -8,6 +8,7 @@ const bcrypt = require("bcrypt");
 const puppeteer = require("puppeteer");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
+const WebSocket = require("ws");
 
 const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -29,7 +30,12 @@ const upload = multer({
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    realtime: {
+      transport: WebSocket,
+    },
+  }
 );
 app.use(cors());
 app.use(express.json());

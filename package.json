@@ -23,7 +23,8 @@
     "multer": "^2.1.1",
     "openai": "^6.9.1",
     "pg": "^8.20.0",
-    "puppeteer": "^25.1.0"
+    "puppeteer": "^25.1.0",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
