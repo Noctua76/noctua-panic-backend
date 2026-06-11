@@ -2174,6 +2174,95 @@ id
   }
 });
 
+app.post(
+  "/settings/sites/:id/sop/upload",
+  upload.single("sop_file"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!req.file) {
+        return res.status(400).json({
+          status: "error",
+          message: "No SOP file uploaded",
+        });
+      }
+
+      if (req.file.mimetype !== "application/pdf") {
+        return res.status(400).json({
+          status: "error",
+          message: "Only PDF files are allowed",
+        });
+      }
+
+      const bucket =
+        process.env.SUPABASE_SOP_BUCKET || "aegis-sop-files";
+
+      const safeOriginalName = req.file.originalname
+        .replace(/\s+/g, "-")
+        .replace(/[^a-zA-Z0-9._-]/g, "");
+
+      const filePath = `sites/site-${id}/sop-${Date.now()}-${safeOriginalName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(bucket)
+        .upload(filePath, req.file.buffer, {
+          contentType: "application/pdf",
+          upsert: true,
+        });
+
+      if (uploadError) {
+        console.error("Supabase SOP upload error:", uploadError);
+
+        return res.status(500).json({
+          status: "error",
+          message: "Failed to upload SOP file",
+          error: uploadError.message,
+        });
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from(bucket)
+        .getPublicUrl(filePath);
+
+      const publicUrl = publicUrlData.publicUrl;
+
+      const result = await pool.query(
+        `
+        UPDATE sites
+        SET
+          sop_file_url = $1,
+          sop_updated_at = NOW()
+        WHERE id = $2
+        RETURNING *
+        `,
+        [publicUrl, id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      res.json({
+        status: "ok",
+        message: "SOP file uploaded",
+        site: result.rows[0],
+        sop_file_url: publicUrl,
+      });
+    } catch (err) {
+      console.error("SOP upload endpoint error:", err);
+
+      res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
 app.put("/settings/sites/:id/toggle-active", async (req, res) => {
   try {
     const { id } = req.params;
