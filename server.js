@@ -2303,6 +2303,73 @@ app.post(
   }
 );
 
+app.post(
+  "/settings/sites/:id/documents/:slot/upload",
+  upload.single("site_document"),
+  async (req, res) => {
+    try {
+      const siteId = req.params.id;
+      const slot = Number(req.params.slot);
+
+      if (![1, 2].includes(slot)) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid document slot",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          status: "error",
+          message: "No document file uploaded",
+        });
+      }
+
+      const fileExt = req.file.originalname.split(".").pop();
+      const fileName = `sites/site-${siteId}/documents/document-${slot}-${Date.now()}.${fileExt}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("aegis-sop-files")
+        .upload(fileName, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: true,
+        });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const { data } = supabase.storage
+        .from("aegis-sop-files")
+        .getPublicUrl(fileName);
+
+      const columnName = `document_${slot}_url`;
+
+      await pool.query(
+        `
+        UPDATE sites
+        SET ${columnName} = $1
+        WHERE id = $2
+        `,
+        [data.publicUrl, siteId]
+      );
+
+      res.json({
+        status: "ok",
+        slot,
+        document_url: data.publicUrl,
+      });
+    } catch (err) {
+      console.error("Site document upload error:", err);
+
+      res.status(500).json({
+        status: "error",
+        message: "Site document upload failed",
+      });
+    }
+  }
+);
+
 app.put("/settings/sites/:id/toggle-active", async (req, res) => {
   try {
     const { id } = req.params;
