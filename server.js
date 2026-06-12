@@ -4968,20 +4968,21 @@ app.get("/setup/guard-location-upgrade", async (req, res) => {
 app.post("/guard/location", async (req, res) => {
   try {
     const {
-      guard_id,
-      latitude,
-      longitude,
-      accuracy,
-      speed,
-      battery
-    } = req.body;
+  guard_id,
+  session_id,
+  latitude,
+  longitude,
+  accuracy,
+  speed,
+  battery
+} = req.body;
 
-    if (!guard_id || !latitude || !longitude) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id, latitude and longitude are required"
-      });
-    }
+    if (!guard_id || !session_id || !latitude || !longitude) {
+  return res.status(400).json({
+    status: "error",
+    message: "guard_id, session_id, latitude and longitude are required"
+  });
+}
 
     await pool.query(
       `
@@ -4994,16 +4995,18 @@ app.post("/guard/location", async (req, res) => {
         last_battery_level = $5,
         last_location_at = NOW()
       WHERE guard_id = $6
-        AND logout_time IS NULL
+  AND id = $7
+  AND logout_time IS NULL
       `,
       [
-        latitude,
-        longitude,
-        accuracy || null,
-        speed || null,
-        battery || null,
-        guard_id
-      ]
+  latitude,
+  longitude,
+  accuracy || null,
+  speed || null,
+  battery || null,
+  guard_id,
+  session_id
+]
     );
 
     res.json({
