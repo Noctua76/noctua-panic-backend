@@ -1612,6 +1612,77 @@ app.get("/guards", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------
+// UPDATE GUARD PROFILE
+// ----------------------------------------------------------
+app.put("/guards/:id/profile", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      full_name,
+      username,
+      mobile_phone,
+      landline_phone,
+      tax_id,
+      home_address,
+      education_level,
+      foreign_languages,
+      security_experience_range,
+      guard_notes,
+      site_id,
+      assignment_status,
+    } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE guards
+      SET
+        full_name = $1,
+        username = $2,
+        mobile_phone = $3,
+        landline_phone = $4,
+        tax_id = $5,
+        home_address = $6,
+        education_level = $7,
+        foreign_languages = $8,
+        security_experience_range = $9,
+        guard_notes = $10,
+        site_id = $11,
+        assignment_status = $12
+      WHERE id = $13
+      RETURNING *
+      `,
+      [
+        full_name,
+        username,
+        mobile_phone,
+        landline_phone,
+        tax_id,
+        home_address,
+        education_level,
+        foreign_languages,
+        security_experience_range,
+        guard_notes,
+        site_id,
+        assignment_status,
+        id,
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      guard: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Guard profile update error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
 
 // ----------------------------------------------------------
 // ALL SITES
