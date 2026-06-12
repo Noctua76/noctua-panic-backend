@@ -5037,7 +5037,8 @@ app.get("/guards/live-locations", async (req, res) => {
         gs.last_longitude,
         gs.last_location_accuracy,
         gs.last_location_at,
-        gs.last_battery_level
+        gs.last_battery_level,
+        gs.last_location_address
       FROM guard_sessions gs
       JOIN guards g
         ON g.id = gs.guard_id
