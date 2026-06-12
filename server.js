@@ -5020,39 +5020,38 @@ app.post("/guard/location", async (req, res) => {
   }
 });
 
-app.get("/guard/location-test/:guardId", async (req, res) => {
+app.get("/guards/live-locations", async (req, res) => {
   try {
-    const { guardId } = req.params;
-
-    const result = await pool.query(
-      `
+    const result = await pool.query(`
       SELECT
-        id,
-        guard_id,
-        logout_time,
-        last_latitude,
-        last_longitude,
-        last_location_accuracy,
-        last_location_at,
-        last_speed,
-        last_battery_level
-      FROM guard_sessions
-      WHERE guard_id = $1
-      ORDER BY id DESC
-      LIMIT 5
-      `,
-      [guardId]
-    );
+        g.id,
+        g.full_name,
+        g.site_id,
+        s.name AS site_name,
+        gs.last_latitude,
+        gs.last_longitude,
+        gs.last_location_accuracy,
+        gs.last_location_at,
+        gs.last_battery_level
+      FROM guard_sessions gs
+      JOIN guards g
+        ON g.id = gs.guard_id
+      LEFT JOIN sites s
+        ON s.id = g.site_id
+      WHERE gs.logout_time IS NULL
+      ORDER BY g.full_name ASC
+    `);
 
     res.json({
       status: "ok",
-      sessions: result.rows
+      locations: result.rows
     });
   } catch (err) {
-    console.error("Location test failed:", err);
+    console.error("Live locations failed:", err);
+
     res.status(500).json({
       status: "error",
-      message: "Location test failed"
+      message: "Failed to load live locations"
     });
   }
 });
