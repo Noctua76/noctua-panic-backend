@@ -2532,21 +2532,31 @@ app.put("/settings/sites/:id/archive", async (req, res) => {
 app.get("/settings/guards", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT
-        g.id,
-        g.full_name,
-        g.username,
-        g.phone,
-        g.role,
-        g.site_id,
-        g.active,
-        g.created_at,
-        s.name AS site_name
-      FROM guards g
-      LEFT JOIN sites s
-        ON s.id = g.site_id
-      ORDER BY g.id ASC
-    `);
+  SELECT
+    g.id,
+    g.full_name,
+    g.username,
+    g.phone,
+    g.role,
+    g.site_id,
+    g.active,
+    g.created_at,
+    g.mobile_phone,
+    g.landline_phone,
+    g.tax_id,
+    g.home_address,
+    g.education_level,
+    g.foreign_languages,
+    g.security_experience_range,
+    g.guard_notes,
+    g.assignment_status,
+    g.employment_status,
+    s.name AS site_name
+  FROM guards g
+  LEFT JOIN sites s
+    ON s.id = g.site_id
+  ORDER BY g.id ASC
+`);
 
     res.json({
       status: "ok",
