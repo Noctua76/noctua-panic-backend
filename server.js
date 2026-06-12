@@ -5037,7 +5037,7 @@ try {
   [
     latitude,
     longitude,
-    accuracy || null,
+    accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
     speed || null,
     battery || null,
     locationAddress,
