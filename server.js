@@ -5009,7 +5009,14 @@ app.post("/guard/location", async (req, res) => {
   });
 }
 
-const locationAddress = await reverseGeocode(latitude, longitude);
+let locationAddress = null;
+
+try {
+  locationAddress = await reverseGeocode(latitude, longitude);
+} catch (geoErr) {
+  console.error("Reverse geocoding skipped:", geoErr);
+  locationAddress = null;
+}
 
     await pool.query(
   `
@@ -5046,9 +5053,10 @@ const locationAddress = await reverseGeocode(latitude, longitude);
     console.error("Guard location update failed:", err);
 
     res.status(500).json({
-      status: "error",
-      message: "Location update failed"
-    });
+  status: "error",
+  message: "Location update failed",
+  detail: err.message
+});
   }
 });
 
