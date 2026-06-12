@@ -5067,13 +5067,13 @@ app.get("/guards/live-locations", async (req, res) => {
   gs.last_location_at,
   gs.last_battery_level,
   gs.last_location_address
-      FROM guard_sessions gs
-      JOIN guards g
-        ON g.id = gs.guard_id
-      LEFT JOIN sites s
-        ON s.id = g.site_id
-      WHERE gs.logout_time IS NULL
-      ORDER BY g.full_name ASC
+FROM guard_sessions gs
+JOIN guards g
+  ON g.id = gs.guard_id
+LEFT JOIN sites s
+  ON s.id = g.site_id
+WHERE gs.logout_time IS NULL
+ORDER BY g.full_name ASC
     `);
 
     res.json({
