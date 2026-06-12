@@ -1707,6 +1707,9 @@ app.get("/sites", async (req, res) => {
     s.location,
     s.status,
     s.created_at,
+    s.site_phone,
+s.full_address,
+s.coverage_type
 
     CASE
       WHEN s.status <> 'active' THEN 'Guarding suspended'
