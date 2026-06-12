@@ -5056,16 +5056,17 @@ app.get("/guards/live-locations", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        g.id,
-        g.full_name,
-        g.site_id,
-        s.name AS site_name,
-        gs.last_latitude,
-        gs.last_longitude,
-        gs.last_location_accuracy,
-        gs.last_location_at,
-        gs.last_battery_level,
-        gs.last_location_address
+  gs.id AS session_id,
+  g.id,
+  g.full_name,
+  g.site_id,
+  s.name AS site_name,
+  gs.last_latitude,
+  gs.last_longitude,
+  gs.last_location_accuracy,
+  gs.last_location_at,
+  gs.last_battery_level,
+  gs.last_location_address
       FROM guard_sessions gs
       JOIN guards g
         ON g.id = gs.guard_id
