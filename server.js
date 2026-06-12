@@ -1584,18 +1584,27 @@ app.get("/guards", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        g.id,
-        g.full_name,
-        g.username,
-        g.phone,
-        g.role,
-        g.site_id,
-        g.active,
-        s.name AS site_name,
-        s.location AS site_location
-      FROM guards g
-      LEFT JOIN sites s ON s.id = g.site_id
-      ORDER BY g.full_name ASC
+  g.id,
+  g.full_name,
+  g.username,
+  g.phone,
+  g.mobile_phone,
+  g.landline_phone,
+  g.tax_id,
+  g.home_address,
+  g.education_level,
+  g.foreign_languages,
+  g.security_experience_range,
+  g.guard_notes,
+  g.assignment_status,
+  g.role,
+  g.site_id,
+  g.active,
+  s.name AS site_name,
+  s.location AS site_location
+FROM guards g
+LEFT JOIN sites s ON s.id = g.site_id
+ORDER BY g.full_name ASC
     `);
 
     res.json({
