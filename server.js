@@ -1085,9 +1085,10 @@ app.get("/guards/active", async (req, res) => {
         s.location AS site_location,
 
         g.id AS guard_id,
-        g.full_name,
-        g.username,
-        g.phone,
+g.full_name,
+g.username,
+g.phone,
+g.mobile_phone,
 
         gs.login_time,
         gs.login_time AS check_in_time,
