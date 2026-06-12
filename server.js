@@ -5020,6 +5020,43 @@ app.post("/guard/location", async (req, res) => {
   }
 });
 
+app.get("/guard/location-test/:guardId", async (req, res) => {
+  try {
+    const { guardId } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        guard_id,
+        logout_time,
+        last_latitude,
+        last_longitude,
+        last_location_accuracy,
+        last_location_at,
+        last_speed,
+        last_battery_level
+      FROM guard_sessions
+      WHERE guard_id = $1
+      ORDER BY id DESC
+      LIMIT 5
+      `,
+      [guardId]
+    );
+
+    res.json({
+      status: "ok",
+      sessions: result.rows
+    });
+  } catch (err) {
+    console.error("Location test failed:", err);
+    res.status(500).json({
+      status: "error",
+      message: "Location test failed"
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // START SERVER
 // ----------------------------------------------------------
