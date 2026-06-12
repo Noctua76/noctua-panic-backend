@@ -4969,21 +4969,33 @@ app.get("/setup/guard-location-upgrade", async (req, res) => {
 
 async function reverseGeocode(latitude, longitude) {
   try {
-    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}&accept-language=el`;
+    const url =
+      `https://nominatim.openstreetmap.org/reverse?format=jsonv2` +
+      `&lat=${latitude}` +
+      `&lon=${longitude}` +
+      `&zoom=18` +
+      `&addressdetails=1` +
+      `&accept-language=el`;
 
     const response = await fetch(url, {
       headers: {
-        "User-Agent": "AegisLinkSecurityOperations/1.0"
+        "User-Agent": "AegisLinkSecurityOperations/1.0 (contact: admin@aegislink.app)",
+        "Accept": "application/json"
       }
     });
 
     if (!response.ok) {
+      console.error("Reverse geocoding HTTP error:", response.status);
       return null;
     }
 
     const data = await response.json();
 
-    return data.display_name || null;
+    if (data.display_name) {
+      return data.display_name;
+    }
+
+    return null;
   } catch (err) {
     console.error("Reverse geocoding failed:", err);
     return null;
