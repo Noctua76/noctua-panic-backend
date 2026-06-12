@@ -4991,6 +4991,7 @@ async function reverseGeocode(latitude, longitude) {
 }
 
 app.post("/guard/location", async (req, res) => {
+  console.log("GPS REQUEST BODY:", req.body);
   try {
     const {
   guard_id,
