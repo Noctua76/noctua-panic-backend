@@ -4950,6 +4950,7 @@ app.get("/setup/guard-location-upgrade", async (req, res) => {
       ADD COLUMN IF NOT EXISTS last_location_at TIMESTAMP,
       ADD COLUMN IF NOT EXISTS last_speed DECIMAL(8,2),
       ADD COLUMN IF NOT EXISTS last_battery_level INTEGER;
+      ADD COLUMN IF NOT EXISTS last_location_address TEXT;
     `);
 
     res.json({
