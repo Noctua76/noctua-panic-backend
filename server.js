@@ -1597,6 +1597,7 @@ app.get("/guards", async (req, res) => {
   g.security_experience_range,
   g.guard_notes,
   g.assignment_status,
+  g.employment_status,
   g.role,
   g.site_id,
   g.active,
