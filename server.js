@@ -4967,6 +4967,29 @@ app.get("/setup/guard-location-upgrade", async (req, res) => {
   }
 });
 
+async function reverseGeocode(latitude, longitude) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}&accept-language=el`;
+
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "AegisLinkSecurityOperations/1.0"
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = await response.json();
+
+    return data.display_name || null;
+  } catch (err) {
+    console.error("Reverse geocoding failed:", err);
+    return null;
+  }
+}
+
 app.post("/guard/location", async (req, res) => {
   try {
     const {
@@ -4986,30 +5009,34 @@ app.post("/guard/location", async (req, res) => {
   });
 }
 
+const locationAddress = await reverseGeocode(latitude, longitude);
+
     await pool.query(
-      `
-      UPDATE guard_sessions
-      SET
-        last_latitude = $1,
-        last_longitude = $2,
-        last_location_accuracy = $3,
-        last_speed = $4,
-        last_battery_level = $5,
-        last_location_at = NOW()
-      WHERE guard_id = $6
-  AND id = $7
-  AND logout_time IS NULL
-      `,
-      [
-  latitude,
-  longitude,
-  accuracy || null,
-  speed || null,
-  battery || null,
-  guard_id,
-  session_id
-]
-    );
+  `
+  UPDATE guard_sessions
+  SET
+    last_latitude = $1,
+    last_longitude = $2,
+    last_location_accuracy = $3,
+    last_speed = $4,
+    last_battery_level = $5,
+    last_location_address = $6,
+    last_location_at = NOW()
+  WHERE guard_id = $7
+    AND id = $8
+    AND logout_time IS NULL
+  `,
+  [
+    latitude,
+    longitude,
+    accuracy || null,
+    speed || null,
+    battery || null,
+    locationAddress,
+    guard_id,
+    session_id
+  ]
+);
 
     res.json({
       status: "ok",
