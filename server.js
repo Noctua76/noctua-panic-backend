@@ -5040,7 +5040,7 @@ try {
     accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
     speed || null,
     battery || null,
-    locationAddress,
+    locationAddress || `${latitude}, ${longitude}`,
     guard_id,
     session_id
   ]
