@@ -5013,6 +5013,8 @@ async function reverseGeocode(latitude, longitude) {
     const streetWithNumber = [road, houseNumber].filter(Boolean).join(" ");
     const shortAddress = [streetWithNumber, area].filter(Boolean).join(", ");
 
+    console.log("NOMINATIM ADDRESS:", data.address);
+console.log("SHORT ADDRESS:", shortAddress);    
     if (shortAddress) {
       return shortAddress;
     }
