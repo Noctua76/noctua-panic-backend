@@ -3455,7 +3455,17 @@ results.push({ to, response: r });
 app.post('/alert', async (req, res) => {
   console.log('ALERT ENDPOINT HIT:', req.body);
 
-  const { siteId, guardId, triggeredAt, source } = req.body || {};
+  const {
+  siteId,
+  guardId,
+  triggeredAt,
+  source,
+  latitude,
+  longitude,
+  accuracy,
+  battery,
+  locationAddress
+} = req.body || {};
 
   const recipientsEnv =
     process.env.ALERT_RECIPIENTS || process.env.ALERT_TARGET || '';
@@ -3485,46 +3495,64 @@ app.post('/alert', async (req, res) => {
 
   try {
     const incidentResult = await pool.query(
-      `
-      INSERT INTO incidents (
-        incident_ref,
-        company_id,
-        site_id,
-        guard_ref,
-        status,
-        priority,
-        trigger_time,
-        resolved_time,
-        auto_reset_time,
-        ai_summary,
-        needs_support,
-        created_at
-      )
-      SELECT
-  $1,
-  s.company_id,
-  $2::int,
-  $3::int,
-  'active',
-  'High',
-  $4::timestamptz,
-  NULL,
-  $4::timestamptz + INTERVAL '2 minutes',
-  $5,
-  true,
-  NOW()
-FROM sites s
-WHERE s.id = $2::int
-RETURNING *
-      `,
-      [
-        incidentRef,
-        siteId || 1,
-        guardId || null,
-        alertTime,
-        'Panic alert triggered from web app.'
-      ]
-    );
+  `
+  INSERT INTO incidents (
+    incident_ref,
+    company_id,
+    site_id,
+    guard_ref,
+    status,
+    priority,
+    trigger_time,
+    resolved_time,
+    auto_reset_time,
+    ai_summary,
+    needs_support,
+    incident_latitude,
+    incident_longitude,
+    incident_accuracy,
+    incident_battery_level,
+    incident_address,
+    incident_location_timestamp,
+    created_at
+  )
+  SELECT
+    $1,
+    s.company_id,
+    $2::int,
+    $3::int,
+    'active',
+    'High',
+    $4::timestamptz,
+    NULL,
+    $4::timestamptz + INTERVAL '2 minutes',
+    $5,
+    true,
+    $6,
+    $7,
+    $8,
+    $9,
+    $10,
+    $11::timestamptz,
+    NOW()
+  FROM sites s
+  WHERE s.id = $2::int
+  RETURNING *
+  `,
+  [
+    incidentRef,
+    siteId || 1,
+    guardId || null,
+    alertTime,
+    'Panic alert triggered from web app.',
+    latitude || null,
+    longitude || null,
+    accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
+    battery !== null && battery !== undefined ? Math.round(Number(battery)) : null,
+    locationAddress || null,
+    triggeredAt || alertTime
+  ]
+);
 
     const incident = incidentResult.rows[0];
 
