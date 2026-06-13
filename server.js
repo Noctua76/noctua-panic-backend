@@ -4991,6 +4991,32 @@ async function reverseGeocode(latitude, longitude) {
 
     const data = await response.json();
 
+    const road =
+      data.address?.road ||
+      data.address?.pedestrian ||
+      data.address?.footway ||
+      data.address?.path ||
+      "";
+
+    const houseNumber = data.address?.house_number || "";
+
+    const area =
+      data.address?.suburb ||
+      data.address?.neighbourhood ||
+      data.address?.quarter ||
+      data.address?.village ||
+      data.address?.town ||
+      data.address?.city ||
+      data.address?.municipality ||
+      "";
+
+    const streetWithNumber = [road, houseNumber].filter(Boolean).join(" ");
+    const shortAddress = [streetWithNumber, area].filter(Boolean).join(", ");
+
+    if (shortAddress) {
+      return shortAddress;
+    }
+
     if (data.display_name) {
       return data.display_name;
     }
