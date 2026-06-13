@@ -4973,7 +4973,7 @@ async function reverseGeocode(latitude, longitude) {
       `https://nominatim.openstreetmap.org/reverse?format=jsonv2` +
       `&lat=${latitude}` +
       `&lon=${longitude}` +
-      `&zoom=18` +
+      `&zoom=19` +
       `&addressdetails=1` +
       `&accept-language=el`;
 
