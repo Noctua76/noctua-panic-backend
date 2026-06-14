@@ -3864,6 +3864,12 @@ WHERE status = 'active'
         i.resolved_time,
         i.ai_summary,
         i.needs_support,
+        i.incident_latitude,
+i.incident_longitude,
+i.incident_accuracy,
+i.incident_battery_level,
+i.incident_address,
+i.incident_location_timestamp,
         ae.status AS alert_event_status,
         ae.sms_sent,
         ae.sms_failed,
@@ -3977,6 +3983,12 @@ END AS display_status
       incidentDbId: row.incident_id || null,
       triggerTime: row.trigger_time || null,
       resolvedTime: row.resolved_time || null,
+      incidentLatitude: row.incident_latitude || null,
+incidentLongitude: row.incident_longitude || null,
+incidentAccuracy: row.incident_accuracy || null,
+incidentBatteryLevel: row.incident_battery_level || null,
+incidentAddress: row.incident_address || null,
+incidentLocationTimestamp: row.incident_location_timestamp || null,
       
       triggerStatus: row.incident_id
   ? row.display_status === "resolved"
