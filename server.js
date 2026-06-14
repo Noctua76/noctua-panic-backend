@@ -5042,11 +5042,12 @@ async function reverseGeocode(latitude, longitude) {
       `&accept-language=el`;
 
     const response = await fetch(url, {
-      headers: {
-        "User-Agent": "AegisLinkSecurityOperations/1.0 (contact: admin@aegislink.app)",
-        "Accept": "application/json"
-      }
-    });
+  headers: {
+    "User-Agent": "AegisLinkSecurityOperations/1.0",
+    "Accept": "application/json",
+    "Accept-Language": "el-GR,el;q=0.9,en;q=0.8"
+  }
+});
 
     if (!response.ok) {
       console.error("Reverse geocoding HTTP error:", response.status);
@@ -5144,7 +5145,7 @@ try {
     accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
     speed || null,
     battery || null,
-    locationAddress || `${latitude}, ${longitude}`,
+    locationAddress || null,
     guard_id,
     session_id
   ]
