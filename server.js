@@ -4188,6 +4188,12 @@ app.get("/incidents/resolved", async (req, res) => {
         i.resolved_time,
         i.ai_summary,
         i.needs_support,
+        i.incident_latitude,
+i.incident_longitude,
+i.incident_accuracy,
+i.incident_battery_level,
+i.incident_address,
+i.incident_location_timestamp,
 
         s.id AS site_id,
         s.name AS site_name,
