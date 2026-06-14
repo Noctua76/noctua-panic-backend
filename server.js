@@ -5141,6 +5141,29 @@ app.get("/setup/patrol-system", async (req, res) => {
       );
     `);
 
+    await pool.query(`
+  CREATE TABLE IF NOT EXISTS patrol_schedules (
+    id SERIAL PRIMARY KEY,
+
+    site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+    patrol_point_id INTEGER REFERENCES patrol_points(id) ON DELETE CASCADE,
+
+    schedule_type VARCHAR(50) NOT NULL DEFAULT 'recurring',
+
+    interval_hours INTEGER,
+    start_time TIME,
+    end_time TIME,
+
+    scheduled_date DATE,
+    scheduled_time TIME,
+
+    reminder_minutes_before INTEGER DEFAULT 5,
+
+    active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW()
+  );
+`);
+
     res.json({
       status: "ok",
       message: "QR Patrol system tables ready"
