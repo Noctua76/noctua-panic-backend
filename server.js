@@ -5108,6 +5108,53 @@ app.get("/setup/incident-location-upgrade", async (req, res) => {
   }
 });
 
+app.get("/setup/patrol-system", async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS patrol_points (
+        id SERIAL PRIMARY KEY,
+        site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+        point_name VARCHAR(255) NOT NULL,
+        point_description TEXT,
+        qr_token UUID DEFAULT gen_random_uuid() UNIQUE NOT NULL,
+        expected_interval_minutes INTEGER,
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS patrol_scans (
+        id SERIAL PRIMARY KEY,
+        patrol_point_id INTEGER REFERENCES patrol_points(id) ON DELETE SET NULL,
+        site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+        guard_id INTEGER REFERENCES guards(id) ON DELETE SET NULL,
+        session_id INTEGER,
+
+        latitude DECIMAL(10,8),
+        longitude DECIMAL(11,8),
+        accuracy INTEGER,
+        battery_level INTEGER,
+        address TEXT,
+
+        scanned_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    res.json({
+      status: "ok",
+      message: "QR Patrol system tables ready"
+    });
+  } catch (err) {
+    console.error("QR Patrol setup failed:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 async function reverseGeocode(latitude, longitude) {
   try {
     const url =
