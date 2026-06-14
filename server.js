@@ -3549,7 +3549,11 @@ app.post('/alert', async (req, res) => {
     longitude || null,
     accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
     battery !== null && battery !== undefined ? Math.round(Number(battery)) : null,
-    locationAddress || null,
+    locationAddress || (
+  latitude && longitude
+    ? await reverseGeocode(latitude, longitude)
+    : null
+),
     triggeredAt || alertTime
   ]
 );
