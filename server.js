@@ -4420,6 +4420,13 @@ app.get("/incidents/:id/report", async (req, res) => {
         i.resolved_time,
         i.ai_summary,
         i.needs_support,
+        i.needs_support,
+i.incident_latitude,
+i.incident_longitude,
+i.incident_accuracy,
+i.incident_battery_level,
+i.incident_address,
+i.incident_location_timestamp,
         s.name AS site_name,
         s.location AS site_location,
         COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name
@@ -4659,6 +4666,15 @@ if (incident.resolved_time) {
         duration_display: formatDuration(durationMs),
         ai_summary: incident.ai_summary,
         needs_support: incident.needs_support,
+        incident_latitude: incident.incident_latitude,
+incident_longitude: incident.incident_longitude,
+incident_accuracy: incident.incident_accuracy,
+incident_battery_level: incident.incident_battery_level,
+incident_address: incident.incident_address,
+incident_location_timestamp: incident.incident_location_timestamp,
+incident_location_timestamp_display: formatReportTime(
+  incident.incident_location_timestamp
+),
       },
 
       timeline,
