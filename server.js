@@ -5055,6 +5055,7 @@ async function reverseGeocode(latitude, longitude) {
     }
 
     const data = await response.json();
+    console.log("NOMINATIM RAW RESPONSE:", JSON.stringify(data, null, 2));
 
     const road =
       data.address?.road ||
