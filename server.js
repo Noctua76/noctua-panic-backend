@@ -5394,13 +5394,12 @@ app.get("/patrols/sites/:siteId/details", async (req, res) => {
     const pointsResult = await pool.query(
       `
       SELECT
-        id,
-        point_name,
-        description,
-        qr_token,
-        active,
-        created_at
-      FROM patrol_points
+  id,
+  point_name,
+  qr_token,
+  active,
+  created_at
+FROM patrol_points
       WHERE site_id = $1
       ORDER BY id ASC
       `,
