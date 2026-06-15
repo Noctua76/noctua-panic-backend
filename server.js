@@ -5178,6 +5178,127 @@ app.get("/setup/patrol-system", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------
+// QR PATROL POINTS API
+// ----------------------------------------------------------
+
+app.get("/settings/sites/:siteId/patrol-points", async (req, res) => {
+  try {
+    const { siteId } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        site_id,
+        point_name,
+        point_description,
+        qr_token,
+        expected_interval_minutes,
+        active,
+        created_at
+      FROM patrol_points
+      WHERE site_id = $1
+        AND active = true
+      ORDER BY id ASC
+      `,
+      [siteId]
+    );
+
+    res.json({
+      status: "ok",
+      points: result.rows
+    });
+  } catch (err) {
+    console.error("Load patrol points error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/settings/sites/:siteId/patrol-points", async (req, res) => {
+  try {
+    const { siteId } = req.params;
+
+    const {
+      point_name,
+      point_description,
+      expected_interval_minutes
+    } = req.body;
+
+    if (!point_name) {
+      return res.status(400).json({
+        status: "error",
+        message: "point_name is required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO patrol_points (
+        site_id,
+        point_name,
+        point_description,
+        expected_interval_minutes,
+        active,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,true,NOW())
+      RETURNING *
+      `,
+      [
+        siteId,
+        point_name,
+        point_description || null,
+        expected_interval_minutes || null
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      point: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Create patrol point error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.put("/settings/patrol-points/:id/deactivate", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE patrol_points
+      SET active = false
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      point: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Deactivate patrol point error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 async function reverseGeocode(latitude, longitude) {
   try {
     const url =
