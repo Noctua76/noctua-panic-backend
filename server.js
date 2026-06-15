@@ -5256,6 +5256,119 @@ app.get("/settings/sites/:siteId/patrol-points", async (req, res) => {
   }
 });
 
+app.post("/patrol/scan", async (req, res) => {
+  const {
+    token,
+    latitude,
+    longitude,
+    accuracy,
+  } = req.body;
+
+  if (!token) {
+    return res.status(400).json({
+      status: "error",
+      message: "QR token is required",
+    });
+  }
+
+  try {
+    const pointResult = await pool.query(
+      `
+      SELECT
+        pp.id AS point_id,
+        pp.site_id,
+        pp.point_name,
+        pp.active,
+        s.name AS site_name
+      FROM patrol_points pp
+      LEFT JOIN sites s
+        ON s.id = pp.site_id
+      WHERE pp.qr_token = $1
+      `,
+      [token]
+    );
+
+    if (pointResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Invalid patrol QR token",
+      });
+    }
+
+    const point = pointResult.rows[0];
+
+    if (!point.active) {
+      return res.status(403).json({
+        status: "error",
+        message: "This patrol point is inactive",
+      });
+    }
+
+    const guardResult = await pool.query(
+      `
+      SELECT
+        gs.guard_id
+      FROM guard_sessions gs
+      WHERE gs.site_id = $1
+        AND gs.logout_time IS NULL
+      ORDER BY gs.login_time DESC
+      LIMIT 1
+      `,
+      [point.site_id]
+    );
+
+    const guardId =
+      guardResult.rows.length > 0
+        ? guardResult.rows[0].guard_id
+        : null;
+
+    const insertResult = await pool.query(
+      `
+      INSERT INTO patrol_logs (
+        site_id,
+        point_id,
+        guard_id,
+        qr_token,
+        latitude,
+        longitude,
+        accuracy
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+      `,
+      [
+        point.site_id,
+        point.point_id,
+        guardId,
+        token,
+        latitude || null,
+        longitude || null,
+        accuracy || null,
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Patrol recorded successfully",
+      patrol: insertResult.rows[0],
+      point: {
+        id: point.point_id,
+        name: point.point_name,
+        site_id: point.site_id,
+        site_name: point.site_name,
+      },
+    });
+  } catch (err) {
+    console.error("Patrol scan error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to record patrol scan",
+      detail: err.message,
+    });
+  }
+});
+
 app.post("/settings/sites/:siteId/patrol-points", async (req, res) => {
   try {
     const { siteId } = req.params;
