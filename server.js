@@ -5330,6 +5330,61 @@ app.post("/settings/patrol-points/:id/generate-qr", async (req, res) => {
   }
 });
 
+app.get("/patrols/sites", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        s.id AS site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+        s.status AS site_status,
+
+        COUNT(pp.id) FILTER (WHERE pp.active = true) AS active_points,
+        COUNT(pp.id) FILTER (WHERE pp.qr_token IS NOT NULL AND pp.active = true) AS generated_qrs,
+
+        ps.schedule_type,
+        ps.frequency_minutes,
+        ps.reminder_minutes,
+        ps.days,
+        ps.start_time,
+        ps.end_time
+
+      FROM sites s
+      LEFT JOIN patrol_points pp
+        ON pp.site_id = s.id
+      LEFT JOIN patrol_schedules ps
+        ON ps.site_id = s.id
+
+      GROUP BY
+        s.id,
+        s.name,
+        s.location,
+        s.status,
+        ps.schedule_type,
+        ps.frequency_minutes,
+        ps.reminder_minutes,
+        ps.days,
+        ps.start_time,
+        ps.end_time
+
+      HAVING COUNT(pp.id) > 0
+      ORDER BY s.id ASC
+    `);
+
+    res.json({
+      status: "ok",
+      sites: result.rows,
+    });
+  } catch (err) {
+    console.error("Patrol sites load error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load patrol sites",
+    });
+  }
+});
+
 async function reverseGeocode(latitude, longitude) {
   try {
     const url =
