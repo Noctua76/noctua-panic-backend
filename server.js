@@ -5374,6 +5374,55 @@ app.get("/patrols/sites", async (req, res) => {
   }
 });
 
+app.get("/patrols/sites/:siteId/details", async (req, res) => {
+  const { siteId } = req.params;
+
+  try {
+    const siteResult = await pool.query(
+      `
+      SELECT
+        id AS site_id,
+        name AS site_name,
+        location AS site_location,
+        status AS site_status
+      FROM sites
+      WHERE id = $1
+      `,
+      [siteId]
+    );
+
+    const pointsResult = await pool.query(
+      `
+      SELECT
+        id,
+        point_name,
+        description,
+        qr_token,
+        active,
+        created_at
+      FROM patrol_points
+      WHERE site_id = $1
+      ORDER BY id ASC
+      `,
+      [siteId]
+    );
+
+    res.json({
+      status: "ok",
+      site: siteResult.rows[0],
+      points: pointsResult.rows,
+    });
+  } catch (err) {
+    console.error("Patrol site details error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load patrol site details",
+      detail: err.message,
+    });
+  }
+});
+
 async function reverseGeocode(latitude, longitude) {
   try {
     const url =
