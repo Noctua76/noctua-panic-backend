@@ -5340,32 +5340,20 @@ app.get("/patrols/sites", async (req, res) => {
         s.status AS site_status,
 
         COUNT(pp.id) FILTER (WHERE pp.active = true) AS active_points,
-        COUNT(pp.id) FILTER (WHERE pp.qr_token IS NOT NULL AND pp.active = true) AS generated_qrs,
-
-        ps.schedule_type,
-        ps.frequency_minutes,
-        ps.reminder_minutes,
-        ps.days,
-        ps.start_time,
-        ps.end_time
+        COUNT(pp.id) FILTER (
+          WHERE pp.qr_token IS NOT NULL 
+          AND pp.active = true
+        ) AS generated_qrs
 
       FROM sites s
       LEFT JOIN patrol_points pp
         ON pp.site_id = s.id
-      LEFT JOIN patrol_schedules ps
-        ON ps.site_id = s.id
 
       GROUP BY
         s.id,
         s.name,
         s.location,
-        s.status,
-        ps.schedule_type,
-        ps.frequency_minutes,
-        ps.reminder_minutes,
-        ps.days,
-        ps.start_time,
-        ps.end_time
+        s.status
 
       HAVING COUNT(pp.id) > 0
       ORDER BY s.id ASC
@@ -5381,6 +5369,7 @@ app.get("/patrols/sites", async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Failed to load patrol sites",
+      detail: err.message,
     });
   }
 });
