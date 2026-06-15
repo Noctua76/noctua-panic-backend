@@ -5422,6 +5422,45 @@ FROM patrol_points
   }
 });
 
+app.get("/patrol-points/:id/qr", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        point_name,
+        qr_token,
+        active
+      FROM patrol_points
+      WHERE id = $1
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Patrol point not found",
+      });
+    }
+
+    res.json({
+      status: "ok",
+      point: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Patrol QR load error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load patrol QR",
+      detail: err.message,
+    });
+  }
+});
+
 async function reverseGeocode(latitude, longitude) {
   try {
     const url =
