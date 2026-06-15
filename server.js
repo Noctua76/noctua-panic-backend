@@ -5299,6 +5299,40 @@ app.put("/settings/patrol-points/:id/deactivate", async (req, res) => {
   }
 });
 
+app.post("/settings/patrol-points/:id/generate-qr", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const qrToken =
+      "qr-" +
+      Math.random().toString(36).substring(2, 10) +
+      "-" +
+      Date.now();
+
+    const result = await pool.query(
+      `
+      UPDATE patrol_points
+      SET qr_token = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+      [qrToken, id]
+    );
+
+    res.json({
+      status: "ok",
+      point: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Generate QR error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
 async function reverseGeocode(latitude, longitude) {
   try {
     const url =
