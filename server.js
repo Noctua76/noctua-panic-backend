@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require("crypto");
 const morgan = require('morgan');
 const { Vonage } = require('@vonage/server-sdk');
 const pool = require("./db");
@@ -5303,11 +5304,7 @@ app.post("/settings/patrol-points/:id/generate-qr", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const qrToken =
-      "qr-" +
-      Math.random().toString(36).substring(2, 10) +
-      "-" +
-      Date.now();
+    const qrToken = crypto.randomUUID();
 
     const result = await pool.query(
       `
