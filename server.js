@@ -5479,6 +5479,52 @@ app.post("/settings/patrol-points/:id/generate-qr", async (req, res) => {
   }
 });
 
+app.put("/settings/patrol-points/:id/schedule", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      expected_interval_minutes,
+    } = req.body;
+
+    if (!expected_interval_minutes) {
+      return res.status(400).json({
+        status: "error",
+        message: "expected_interval_minutes is required",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE patrol_points
+      SET expected_interval_minutes = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+      [expected_interval_minutes, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Patrol point not found",
+      });
+    }
+
+    res.json({
+      status: "ok",
+      point: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Update patrol point schedule error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
 app.get("/patrols/sites", async (req, res) => {
   try {
     const result = await pool.query(`
