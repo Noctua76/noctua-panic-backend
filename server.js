@@ -5525,6 +5525,86 @@ app.put("/settings/patrol-points/:id/schedule", async (req, res) => {
   }
 });
 
+app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => {
+  try {
+    const { siteId } = req.params;
+
+    const {
+      scheduled_date,
+      scheduled_time,
+      reminder_minutes_before = 5,
+    } = req.body;
+
+    if (!scheduled_date || !scheduled_time) {
+      return res.status(400).json({
+        status: "error",
+        message: "scheduled_date and scheduled_time are required",
+      });
+    }
+
+    const pointsResult = await pool.query(
+      `
+      SELECT id
+      FROM patrol_points
+      WHERE site_id = $1
+        AND active = true
+      ORDER BY id ASC
+      `,
+      [siteId]
+    );
+
+    if (pointsResult.rows.length === 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "No active patrol points found for this site",
+      });
+    }
+
+    const inserted = [];
+
+    for (const point of pointsResult.rows) {
+      const result = await pool.query(
+        `
+        INSERT INTO patrol_schedules (
+          site_id,
+          patrol_point_id,
+          schedule_type,
+          scheduled_date,
+          scheduled_time,
+          reminder_minutes_before,
+          active,
+          created_at
+        )
+        VALUES ($1,$2,'manual',$3,$4,$5,true,NOW())
+        RETURNING *
+        `,
+        [
+          siteId,
+          point.id,
+          scheduled_date,
+          scheduled_time,
+          reminder_minutes_before,
+        ]
+      );
+
+      inserted.push(result.rows[0]);
+    }
+
+    res.json({
+      status: "ok",
+      message: "Manual patrol schedule added",
+      schedules: inserted,
+    });
+  } catch (err) {
+    console.error("Manual patrol schedule error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
 app.get("/patrols/sites", async (req, res) => {
   try {
     const result = await pool.query(`
