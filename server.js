@@ -5677,8 +5677,7 @@ app.get("/patrols/sites", async (req, res) => {
           ON pp.id = ps.patrol_point_id
 
         WHERE ps.schedule_type = 'manual'
-          AND ps.active = true
-          AND (ps.scheduled_date::timestamp + ps.scheduled_time) >= NOW()
+  AND ps.active = true
       ),
 
       upcoming AS (
