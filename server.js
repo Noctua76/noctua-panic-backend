@@ -5482,40 +5482,66 @@ app.post("/settings/patrol-points/:id/generate-qr", async (req, res) => {
 app.get("/patrols/sites", async (req, res) => {
   try {
     const result = await pool.query(`
+      WITH site_patrols AS (
+        SELECT
+          s.id AS site_id,
+          s.name AS site_name,
+          s.location AS site_location,
+          s.status AS site_status,
+
+          COUNT(DISTINCT pp.id) FILTER (WHERE pp.active = true)::int AS active_points,
+
+          COUNT(DISTINCT pp.id) FILTER (
+            WHERE pp.qr_token IS NOT NULL
+              AND pp.active = true
+          )::int AS generated_qrs,
+
+          MAX(pl.patrol_time) AS last_patrol,
+
+          MIN(
+            CASE
+              WHEN pp.active = true
+                AND pp.expected_interval_minutes IS NOT NULL
+                AND last_point_scan.last_patrol_time IS NOT NULL
+              THEN last_point_scan.last_patrol_time
+                   + (pp.expected_interval_minutes || ' minutes')::interval
+              ELSE NULL
+            END
+          ) AS next_patrol
+
+        FROM sites s
+
+        LEFT JOIN patrol_points pp
+          ON pp.site_id = s.id
+
+        LEFT JOIN LATERAL (
+          SELECT
+            MAX(pl2.patrol_time) AS last_patrol_time
+          FROM patrol_logs pl2
+          WHERE pl2.point_id = pp.id
+        ) last_point_scan ON true
+
+        LEFT JOIN patrol_logs pl
+          ON pl.site_id = s.id
+
+        GROUP BY
+          s.id,
+          s.name,
+          s.location,
+          s.status
+      )
+
       SELECT
-        s.id AS site_id,
-        s.name AS site_name,
-        s.location AS site_location,
-        s.status AS site_status,
-
-        COUNT(DISTINCT pp.id) FILTER (WHERE pp.active = true)::int AS active_points,
-
-        COUNT(DISTINCT pp.id) FILTER (
-          WHERE pp.qr_token IS NOT NULL
-            AND pp.active = true
-        )::int AS generated_qrs,
-
-        MAX(pl.patrol_time) AS last_patrol,
-
-        NULL AS next_patrol
-
-      FROM sites s
-
-      LEFT JOIN patrol_points pp
-        ON pp.site_id = s.id
-
-      LEFT JOIN patrol_logs pl
-        ON pl.site_id = s.id
-
-      GROUP BY
-        s.id,
-        s.name,
-        s.location,
-        s.status
-
-      HAVING COUNT(DISTINCT pp.id) > 0
-
-      ORDER BY s.id ASC
+        *,
+        CASE
+          WHEN next_patrol IS NULL THEN 'not_scheduled'
+          WHEN next_patrol < NOW() THEN 'overdue'
+          WHEN next_patrol <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+          ELSE 'scheduled'
+        END AS patrol_status
+      FROM site_patrols
+      WHERE active_points > 0
+      ORDER BY site_id ASC
     `);
 
     res.json({
