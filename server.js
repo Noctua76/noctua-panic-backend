@@ -5488,15 +5488,24 @@ app.get("/patrols/sites", async (req, res) => {
         s.location AS site_location,
         s.status AS site_status,
 
-        COUNT(pp.id) FILTER (WHERE pp.active = true) AS active_points,
-        COUNT(pp.id) FILTER (
-          WHERE pp.qr_token IS NOT NULL 
-          AND pp.active = true
-        ) AS generated_qrs
+        COUNT(DISTINCT pp.id) FILTER (WHERE pp.active = true)::int AS active_points,
+
+        COUNT(DISTINCT pp.id) FILTER (
+          WHERE pp.qr_token IS NOT NULL
+            AND pp.active = true
+        )::int AS generated_qrs,
+
+        MAX(pl.patrol_time) AS last_patrol,
+
+        NULL AS next_patrol
 
       FROM sites s
+
       LEFT JOIN patrol_points pp
         ON pp.site_id = s.id
+
+      LEFT JOIN patrol_logs pl
+        ON pl.site_id = s.id
 
       GROUP BY
         s.id,
@@ -5504,7 +5513,8 @@ app.get("/patrols/sites", async (req, res) => {
         s.location,
         s.status
 
-      HAVING COUNT(pp.id) > 0
+      HAVING COUNT(DISTINCT pp.id) > 0
+
       ORDER BY s.id ASC
     `);
 
