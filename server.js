@@ -5608,7 +5608,7 @@ app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => 
 app.get("/patrols/sites", async (req, res) => {
   try {
     const result = await pool.query(`
-      WITH site_patrols AS (
+      WITH site_summary AS (
         SELECT
           s.id AS site_id,
           s.name AS site_name,
@@ -5622,30 +5622,12 @@ app.get("/patrols/sites", async (req, res) => {
               AND pp.active = true
           )::int AS generated_qrs,
 
-          MAX(pl.patrol_time) AS last_patrol,
-
-          MIN(
-            CASE
-              WHEN pp.active = true
-                AND pp.expected_interval_minutes IS NOT NULL
-                AND last_point_scan.last_patrol_time IS NOT NULL
-              THEN last_point_scan.last_patrol_time
-                   + (pp.expected_interval_minutes || ' minutes')::interval
-              ELSE NULL
-            END
-          ) AS next_patrol
+          MAX(pl.patrol_time) AS last_patrol
 
         FROM sites s
 
         LEFT JOIN patrol_points pp
           ON pp.site_id = s.id
-
-        LEFT JOIN LATERAL (
-          SELECT
-            MAX(pl2.patrol_time) AS last_patrol_time
-          FROM patrol_logs pl2
-          WHERE pl2.point_id = pp.id
-        ) last_point_scan ON true
 
         LEFT JOIN patrol_logs pl
           ON pl.site_id = s.id
@@ -5655,19 +5637,119 @@ app.get("/patrols/sites", async (req, res) => {
           s.name,
           s.location,
           s.status
+      ),
+
+      recurring_next AS (
+        SELECT
+          pp.site_id,
+          pp.id AS point_id,
+          pp.point_name,
+          'recurring' AS schedule_type,
+          (
+            MAX(pl.patrol_time)
+            + (pp.expected_interval_minutes || ' minutes')::interval
+          ) AS scheduled_at
+        FROM patrol_points pp
+
+        LEFT JOIN patrol_logs pl
+          ON pl.point_id = pp.id
+
+        WHERE pp.active = true
+          AND pp.expected_interval_minutes IS NOT NULL
+
+        GROUP BY
+          pp.site_id,
+          pp.id,
+          pp.point_name,
+          pp.expected_interval_minutes
+      ),
+
+      manual_next AS (
+        SELECT
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name,
+          'manual' AS schedule_type,
+          (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
+        FROM patrol_schedules ps
+
+        LEFT JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+
+        WHERE ps.schedule_type = 'manual'
+          AND ps.active = true
+          AND (ps.scheduled_date::timestamp + ps.scheduled_time) >= NOW()
+      ),
+
+      upcoming AS (
+        SELECT * FROM recurring_next
+        WHERE scheduled_at IS NOT NULL
+
+        UNION ALL
+
+        SELECT * FROM manual_next
+        WHERE scheduled_at IS NOT NULL
+      ),
+
+      site_next AS (
+        SELECT DISTINCT ON (site_id)
+          site_id,
+          scheduled_at AS next_patrol
+        FROM upcoming
+        ORDER BY site_id, scheduled_at ASC
+      ),
+
+      upcoming_json AS (
+        SELECT
+          site_id,
+          json_agg(
+            json_build_object(
+              'point_id', point_id,
+              'point_name', point_name,
+              'schedule_type', schedule_type,
+              'scheduled_at', scheduled_at,
+              'status',
+                CASE
+                  WHEN scheduled_at < NOW() THEN 'overdue'
+                  WHEN scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+                  ELSE 'scheduled'
+                END
+            )
+            ORDER BY scheduled_at ASC
+          ) AS upcoming_patrols
+        FROM (
+          SELECT *
+          FROM upcoming
+          WHERE scheduled_at >= NOW() - INTERVAL '30 minutes'
+          ORDER BY scheduled_at ASC
+        ) u
+        GROUP BY site_id
       )
 
       SELECT
-        *,
+        ss.*,
+        sn.next_patrol,
+
         CASE
-          WHEN next_patrol IS NULL THEN 'not_scheduled'
-          WHEN next_patrol < NOW() THEN 'overdue'
-          WHEN next_patrol <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+          WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
+          WHEN sn.next_patrol < NOW() THEN 'overdue'
+          WHEN sn.next_patrol <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
           ELSE 'scheduled'
-        END AS patrol_status
-      FROM site_patrols
-      WHERE active_points > 0
-      ORDER BY site_id ASC
+        END AS patrol_status,
+
+        COALESCE(uj.upcoming_patrols, '[]'::json) AS upcoming_patrols
+
+      FROM site_summary ss
+
+      LEFT JOIN site_next sn
+        ON sn.site_id = ss.site_id
+
+      LEFT JOIN upcoming_json uj
+        ON uj.site_id = ss.site_id
+
+      WHERE ss.active_points > 0
+
+      ORDER BY ss.site_id ASC
     `);
 
     res.json({
