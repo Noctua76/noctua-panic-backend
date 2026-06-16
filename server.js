@@ -5730,8 +5730,7 @@ app.get("/patrols/sites", async (req, res) => {
           ) AS upcoming_patrols
         FROM (
           SELECT *
-          FROM upcoming
-          WHERE scheduled_at >= NOW() - INTERVAL '30 minutes'
+          FROM upcoming          
           ORDER BY scheduled_at ASC
         ) u
         GROUP BY site_id
