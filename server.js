@@ -5707,10 +5707,18 @@ app.get("/patrols/sites", async (req, res) => {
               'point_id', point_id,
               'point_name', point_name,
               'schedule_type', schedule_type,
-              'scheduled_at', to_char(
-  scheduled_at AT TIME ZONE 'UTC',
-  'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-),
+              'scheduled_at',
+  CASE
+    WHEN schedule_type = 'manual'
+    THEN to_char(
+      scheduled_at,
+      'YYYY-MM-DD"T"HH24:MI:SS.MS'
+    )
+    ELSE to_char(
+      scheduled_at AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )
+  END,
               'status',
                 CASE
                   WHEN scheduled_at < NOW() THEN 'overdue'
