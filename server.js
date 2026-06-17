@@ -5659,29 +5659,60 @@ pl.longitude AS last_patrol_longitude
       ),
 
       recurring_next AS (
-        SELECT
-          pp.site_id,
-          pp.id AS point_id,
-          pp.point_name,
-          'recurring' AS schedule_type,
+  SELECT
+    pp.site_id,
+    pp.id AS point_id,
+    pp.point_name,
+    'recurring' AS schedule_type,
+    CASE
+      WHEN MAX(pl.patrol_time) IS NULL THEN NOW()
+      WHEN (
+        MAX(pl.patrol_time)
+        + (
+          CEIL(
+            EXTRACT(
+              EPOCH FROM (NOW() - MAX(pl.patrol_time))
+            ) / 60 / pp.expected_interval_minutes
+          ) * pp.expected_interval_minutes || ' minutes'
+        )::interval
+      ) <= NOW()
+      THEN (
+        MAX(pl.patrol_time)
+        + (
           (
-            MAX(pl.patrol_time)
-            + (pp.expected_interval_minutes || ' minutes')::interval
-          ) AS scheduled_at
-        FROM patrol_points pp
+            CEIL(
+              EXTRACT(
+                EPOCH FROM (NOW() - MAX(pl.patrol_time))
+              ) / 60 / pp.expected_interval_minutes
+            ) + 1
+          ) * pp.expected_interval_minutes || ' minutes'
+        )::interval
+      )
+      ELSE (
+        MAX(pl.patrol_time)
+        + (
+          CEIL(
+            EXTRACT(
+              EPOCH FROM (NOW() - MAX(pl.patrol_time))
+            ) / 60 / pp.expected_interval_minutes
+          ) * pp.expected_interval_minutes || ' minutes'
+        )::interval
+      )
+    END AS scheduled_at
+  FROM patrol_points pp
 
-        LEFT JOIN patrol_logs pl
-          ON pl.point_id = pp.id
+  LEFT JOIN patrol_logs pl
+    ON pl.point_id = pp.id
 
-        WHERE pp.active = true
-          AND pp.expected_interval_minutes IS NOT NULL
+  WHERE pp.active = true
+    AND pp.expected_interval_minutes IS NOT NULL
 
-        GROUP BY
-          pp.site_id,
-          pp.id,
-          pp.point_name,
-          pp.expected_interval_minutes
-      ),
+  GROUP BY
+    pp.site_id,
+    pp.id,
+    pp.point_name,
+    pp.expected_interval_minutes
+),
 
       manual_next AS (
         SELECT
