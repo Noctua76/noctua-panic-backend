@@ -6126,6 +6126,28 @@ app.get("/debug/patrol-logs-columns", async (req, res) => {
     });
   }
 });
+app.get("/debug/guard-sessions-columns", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        column_name,
+        data_type
+      FROM information_schema.columns
+      WHERE table_name = 'guard_sessions'
+      ORDER BY ordinal_position
+    `);
+
+    res.json({
+      status: "ok",
+      columns: result.rows,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      detail: err.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
