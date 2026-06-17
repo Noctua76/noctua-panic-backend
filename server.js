@@ -6220,6 +6220,35 @@ app.get("/debug/site-shift-rules/:siteId", async (req, res) => {
     });
   }
 });
+app.get("/debug/guard-sessions", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        gs.id,
+        gs.guard_id,
+        g.full_name,
+        gs.site_id,
+        gs.login_time,
+        gs.logout_time,
+        gs.status
+      FROM guard_sessions gs
+      LEFT JOIN guards g
+        ON g.id = gs.guard_id
+      ORDER BY gs.login_time DESC
+      LIMIT 20
+    `);
+
+    res.json({
+      status: "ok",
+      sessions: result.rows,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      detail: err.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
