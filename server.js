@@ -5710,12 +5710,16 @@ pl.longitude AS last_patrol_longitude
       ),
 
       site_next AS (
-        SELECT DISTINCT ON (site_id)
-          site_id,
-          scheduled_at AS next_patrol
-        FROM upcoming
-        ORDER BY site_id, scheduled_at ASC
-      ),
+  SELECT DISTINCT ON (site_id)
+    site_id,
+    point_id AS next_patrol_point_id,
+    point_name AS next_patrol_point,
+    schedule_type AS next_patrol_type,
+    scheduled_at AS next_patrol
+  FROM upcoming
+  WHERE scheduled_at >= NOW()
+  ORDER BY site_id, scheduled_at ASC
+),
 
       upcoming_json AS (
         SELECT
@@ -5762,6 +5766,9 @@ pl.longitude AS last_patrol_longitude
         lpd.last_patrol_latitude,
         lpd.last_patrol_longitude,
         sn.next_patrol,
+sn.next_patrol_point_id,
+sn.next_patrol_point,
+sn.next_patrol_type,
 
         CASE
           WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
