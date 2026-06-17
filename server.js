@@ -5753,41 +5753,63 @@ pl.longitude AS last_patrol_longitude
 ),
 
       upcoming_json AS (
-        SELECT
-          site_id,
-          json_agg(
-            json_build_object(
-              'point_id', point_id,
-              'point_name', point_name,
-              'schedule_type', schedule_type,
-              'scheduled_at',
-  CASE
-    WHEN schedule_type = 'manual'
-    THEN to_char(
-      scheduled_at,
-      'YYYY-MM-DD"T"HH24:MI:SS.MS'
-    )
-    ELSE to_char(
-      scheduled_at AT TIME ZONE 'UTC',
-      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-    )
-  END,
-              'status',
-                CASE
-                  WHEN scheduled_at < NOW() THEN 'overdue'
-                  WHEN scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
-                  ELSE 'scheduled'
-                END
+  SELECT
+    u.site_id,
+    json_agg(
+      json_build_object(
+        'point_id', u.point_id,
+        'point_name', u.point_name,
+        'schedule_type', u.schedule_type,
+        'scheduled_at',
+          CASE
+            WHEN u.schedule_type = 'manual'
+            THEN to_char(
+              u.scheduled_at,
+              'YYYY-MM-DD"T"HH24:MI:SS.MS'
             )
-            ORDER BY scheduled_at ASC
-          ) AS upcoming_patrols
-        FROM (
-          SELECT *
-          FROM upcoming          
-          ORDER BY scheduled_at ASC
-        ) u
-        GROUP BY site_id
+            ELSE to_char(
+              u.scheduled_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+            )
+          END,
+        'status',
+          CASE
+            WHEN u.scheduled_at < NOW() THEN 'overdue'
+            WHEN u.scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+            ELSE 'scheduled'
+          END,
+        'assigned_guard', gs_guard.full_name,
+        'guard_session_login', gs.login_time,
+        'shift_label', '24/7 Coverage'
       )
+      ORDER BY u.scheduled_at ASC
+    ) AS upcoming_patrols
+  FROM (
+    SELECT *
+    FROM upcoming
+    ORDER BY scheduled_at ASC
+  ) u
+
+  LEFT JOIN LATERAL (
+    SELECT
+      gs.guard_id,
+      gs.login_time
+    FROM guard_sessions gs
+    WHERE gs.site_id = u.site_id
+      AND gs.login_time <= u.scheduled_at
+      AND (
+        gs.logout_time IS NULL
+        OR gs.logout_time >= u.scheduled_at
+      )
+    ORDER BY gs.login_time DESC
+    LIMIT 1
+  ) gs ON true
+
+  LEFT JOIN guards gs_guard
+    ON gs_guard.id = gs.guard_id
+
+  GROUP BY u.site_id
+)
 
             SELECT
         ss.*,
