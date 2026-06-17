@@ -5639,6 +5639,25 @@ app.get("/patrols/sites", async (req, res) => {
           s.status
       ),
 
+            last_patrol_details AS (
+        SELECT DISTINCT ON (pl.site_id)
+          pl.site_id,
+          pp.point_name AS last_patrol_point,
+          g.full_name AS last_patrol_guard,
+          pl.gps_accuracy AS last_patrol_accuracy,
+          pl.latitude AS last_patrol_latitude,
+          pl.longitude AS last_patrol_longitude
+        FROM patrol_logs pl
+
+        LEFT JOIN patrol_points pp
+          ON pp.id = pl.point_id
+
+        LEFT JOIN guards g
+          ON g.id = pl.guard_id
+
+        ORDER BY pl.site_id, pl.patrol_time DESC
+      ),
+
       recurring_next AS (
         SELECT
           pp.site_id,
@@ -5735,8 +5754,13 @@ app.get("/patrols/sites", async (req, res) => {
         GROUP BY site_id
       )
 
-      SELECT
+            SELECT
         ss.*,
+        lpd.last_patrol_point,
+        lpd.last_patrol_guard,
+        lpd.last_patrol_accuracy,
+        lpd.last_patrol_latitude,
+        lpd.last_patrol_longitude,
         sn.next_patrol,
 
         CASE
@@ -5748,7 +5772,10 @@ app.get("/patrols/sites", async (req, res) => {
 
         COALESCE(uj.upcoming_patrols, '[]'::json) AS upcoming_patrols
 
-      FROM site_summary ss
+            FROM site_summary ss
+
+      LEFT JOIN last_patrol_details lpd
+        ON lpd.site_id = ss.site_id
 
       LEFT JOIN site_next sn
         ON sn.site_id = ss.site_id
