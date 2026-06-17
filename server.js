@@ -6170,6 +6170,34 @@ app.get("/debug/sites-columns", async (req, res) => {
     });
   }
 });
+app.get("/debug/site-shift-rules/:siteId", async (req, res) => {
+  const { siteId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        coverage_type,
+        shift_rules
+      FROM sites
+      WHERE id = $1
+      `,
+      [siteId]
+    );
+
+    res.json({
+      status: "ok",
+      site: result.rows[0],
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      detail: err.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
