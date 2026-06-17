@@ -5644,7 +5644,7 @@ app.get("/patrols/sites", async (req, res) => {
           pl.site_id,
           pp.point_name AS last_patrol_point,
           g.full_name AS last_patrol_guard,
-          pl.location_accuracy AS last_patrol_accuracy,
+          pl.accuracy AS last_patrol_accuracy,
 pl.latitude AS last_patrol_latitude,
 pl.longitude AS last_patrol_longitude
         FROM patrol_logs pl
