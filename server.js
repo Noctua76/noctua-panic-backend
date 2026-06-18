@@ -5304,7 +5304,8 @@ app.post("/patrol/scan", async (req, res) => {
         pp.site_id,
         pp.point_name,
         pp.active,
-        s.name AS site_name
+pp.expected_interval_minutes,
+s.name AS site_name
       FROM patrol_points pp
       LEFT JOIN sites s
         ON s.id = pp.site_id
@@ -5347,30 +5348,120 @@ app.post("/patrol/scan", async (req, res) => {
         ? guardResult.rows[0].guard_id
         : null;
 
+        const scheduleResult = await pool.query(
+  `
+  WITH manual_candidate AS (
+    SELECT
+      (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
+    FROM patrol_schedules ps
+    WHERE ps.patrol_point_id = $1
+      AND ps.site_id = $2
+      AND ps.schedule_type = 'manual'
+      AND ps.active = true
+      AND (ps.scheduled_date::timestamp + ps.scheduled_time) <= NOW()
+    ORDER BY scheduled_at DESC
+    LIMIT 1
+  ),
+
+  last_completed AS (
+    SELECT MAX(pl.patrol_time) AS last_patrol_time
+    FROM patrol_logs pl
+    WHERE pl.point_id = $1
+  ),
+
+  recurring_candidate AS (
+    SELECT
+      CASE
+        WHEN $3::int IS NULL THEN NULL
+        WHEN lc.last_patrol_time IS NULL THEN NULL
+        ELSE
+          lc.last_patrol_time +
+          (
+            FLOOR(
+              EXTRACT(EPOCH FROM (NOW() - lc.last_patrol_time))
+              / 60
+              / $3::int
+            ) * $3::int || ' minutes'
+          )::interval
+      END AS scheduled_at
+    FROM last_completed lc
+  ),
+
+  candidates AS (
+    SELECT scheduled_at FROM manual_candidate
+    UNION ALL
+    SELECT scheduled_at FROM recurring_candidate
+  )
+
+  SELECT
+    scheduled_at,
+    GREATEST(
+      0,
+      FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / 60)
+    )::int AS delay_minutes
+  FROM candidates
+  WHERE scheduled_at IS NOT NULL
+    AND scheduled_at <= NOW()
+  ORDER BY scheduled_at DESC
+  LIMIT 1
+  `,
+  [
+    point.point_id,
+    point.site_id,
+    point.expected_interval_minutes || null,
+  ]
+);
+
+const matchedSchedule = scheduleResult.rows[0] || null;
+
+const scheduledAt = matchedSchedule?.scheduled_at || null;
+const delayMinutes =
+  matchedSchedule?.delay_minutes !== undefined
+    ? matchedSchedule.delay_minutes
+    : null;
+
+const wasMissed =
+  delayMinutes !== null && Number(delayMinutes) >= 15;
+
+const completionStatus =
+  delayMinutes === null
+    ? "completed"
+    : Number(delayMinutes) > 0
+    ? "completed_late"
+    : "completed_on_time";
+
     const insertResult = await pool.query(
-      `
-      INSERT INTO patrol_logs (
-        site_id,
-        point_id,
-        guard_id,
-        qr_token,
-        latitude,
-        longitude,
-        accuracy
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING *
-      `,
-      [
-        point.site_id,
-        point.point_id,
-        guardId,
-        token,
-        latitude || null,
-        longitude || null,
-        accuracy || null,
-      ]
-    );
+  `
+  INSERT INTO patrol_logs (
+    site_id,
+    point_id,
+    guard_id,
+    qr_token,
+    latitude,
+    longitude,
+    accuracy,
+    scheduled_at,
+    delay_minutes,
+    completion_status,
+    was_missed
+  )
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  RETURNING *
+  `,
+  [
+    point.site_id,
+    point.point_id,
+    guardId,
+    token,
+    latitude || null,
+    longitude || null,
+    accuracy || null,
+    scheduledAt,
+    delayMinutes,
+    completionStatus,
+    wasMissed,
+  ]
+);
 
     res.json({
       status: "ok",
