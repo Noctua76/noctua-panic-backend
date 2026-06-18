@@ -5773,11 +5773,12 @@ pl.longitude AS last_patrol_longitude
             )
           END,
         'status',
-          CASE
-            WHEN u.scheduled_at < NOW() THEN 'overdue'
-            WHEN u.scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
-            ELSE 'scheduled'
-          END,
+  CASE
+    WHEN u.scheduled_at < NOW() - INTERVAL '15 minutes' THEN 'missed'
+    WHEN u.scheduled_at < NOW() THEN 'overdue'
+    WHEN u.scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+    ELSE 'scheduled'
+  END,
         'assigned_guard', gs_guard.full_name,
         'guard_session_login', gs.login_time,
         'shift_label', '24/7 Coverage'
@@ -5824,11 +5825,12 @@ sn.next_patrol_point,
 sn.next_patrol_type,
 
         CASE
-          WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
-          WHEN sn.next_patrol < NOW() THEN 'overdue'
-          WHEN sn.next_patrol <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
-          ELSE 'scheduled'
-        END AS patrol_status,
+  WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
+  WHEN sn.next_patrol < NOW() - INTERVAL '15 minutes' THEN 'missed'
+  WHEN sn.next_patrol < NOW() THEN 'overdue'
+  WHEN sn.next_patrol <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+  ELSE 'scheduled'
+END AS patrol_status,
 
         COALESCE(uj.upcoming_patrols, '[]'::json) AS upcoming_patrols
 
