@@ -5475,7 +5475,13 @@ if (scheduledAt) {
       AND site_id = $2
       AND schedule_type = 'manual'
       AND active = true
-      AND (scheduled_date::timestamp + scheduled_time) = $3::timestamp
+      AND ABS(
+        EXTRACT(
+          EPOCH FROM (
+            (scheduled_date::timestamp + scheduled_time) - $3::timestamp
+          )
+        )
+      ) < 60
     `,
     [
       point.point_id,
