@@ -5893,7 +5893,16 @@ pl.longitude AS last_patrol_longitude
     schedule_type AS next_patrol_type,
     scheduled_at AS next_patrol
   FROM upcoming
-  WHERE scheduled_at >= NOW()
+  WHERE
+  (
+    schedule_type = 'manual'
+    AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
+  )
+  OR
+  (
+    schedule_type = 'recurring'
+    AND scheduled_at >= NOW()
+  )
   ORDER BY site_id, scheduled_at ASC
 ),
 
@@ -5919,11 +5928,32 @@ pl.longitude AS last_patrol_longitude
           END,
         'status',
   CASE
-    WHEN u.scheduled_at < NOW() - INTERVAL '15 minutes' THEN 'missed'
-    WHEN u.scheduled_at < NOW() THEN 'overdue'
-    WHEN u.scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
-    ELSE 'scheduled'
-  END,
+  WHEN u.schedule_type = 'manual'
+    AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
+    THEN 'missed'
+
+  WHEN u.schedule_type = 'manual'
+    AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens')
+    THEN 'overdue'
+
+  WHEN u.schedule_type = 'manual'
+    AND u.scheduled_at <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes'
+    THEN 'due_soon'
+
+  WHEN u.schedule_type = 'recurring'
+    AND u.scheduled_at < NOW() - INTERVAL '15 minutes'
+    THEN 'missed'
+
+  WHEN u.schedule_type = 'recurring'
+    AND u.scheduled_at < NOW()
+    THEN 'overdue'
+
+  WHEN u.schedule_type = 'recurring'
+    AND u.scheduled_at <= NOW() + INTERVAL '5 minutes'
+    THEN 'due_soon'
+
+  ELSE 'scheduled'
+END
         'assigned_guard', gs_guard.full_name,
         'guard_session_login', gs.login_time,
         'shift_label', '24/7 Coverage'
