@@ -5466,27 +5466,28 @@ const completionStatus =
   ]
 );
 
-if (scheduledAt) {
+if (matchedSchedule?.schedule_type === "manual") {
   await pool.query(
     `
-    UPDATE patrol_schedules
+    WITH target_manual AS (
+      SELECT id
+      FROM patrol_schedules
+      WHERE patrol_point_id = $1
+        AND site_id = $2
+        AND schedule_type = 'manual'
+        AND active = true
+        AND (scheduled_date::timestamp + scheduled_time) <= NOW()
+      ORDER BY (scheduled_date::timestamp + scheduled_time) DESC
+      LIMIT 1
+    )
+    UPDATE patrol_schedules ps
     SET active = false
-    WHERE patrol_point_id = $1
-      AND site_id = $2
-      AND schedule_type = 'manual'
-      AND active = true
-      AND ABS(
-        EXTRACT(
-          EPOCH FROM (
-            (scheduled_date::timestamp + scheduled_time) - $3::timestamp
-          )
-        )
-      ) < 60
+    FROM target_manual tm
+    WHERE ps.id = tm.id
     `,
     [
       point.point_id,
       point.site_id,
-      scheduledAt,
     ]
   );
 }
