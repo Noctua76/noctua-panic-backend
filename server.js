@@ -5463,6 +5463,25 @@ const completionStatus =
   ]
 );
 
+if (scheduledAt) {
+  await pool.query(
+    `
+    UPDATE patrol_schedules
+    SET active = false
+    WHERE patrol_point_id = $1
+      AND site_id = $2
+      AND schedule_type = 'manual'
+      AND active = true
+      AND (scheduled_date::timestamp + scheduled_time) = $3::timestamp
+    `,
+    [
+      point.point_id,
+      point.site_id,
+      scheduledAt,
+    ]
+  );
+}
+
     res.json({
       status: "ok",
       message: "Patrol recorded successfully",
