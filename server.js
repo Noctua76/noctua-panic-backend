@@ -6249,6 +6249,43 @@ app.get("/debug/guard-sessions", async (req, res) => {
     });
   }
 });
+app.get("/patrols/history", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        pl.id,
+        pl.patrol_time,
+        s.name AS site_name,
+        pp.point_name,
+        g.full_name AS guard_name,
+        pl.latitude,
+        pl.longitude,
+        pl.accuracy
+      FROM patrol_logs pl
+      LEFT JOIN sites s
+        ON s.id = pl.site_id
+      LEFT JOIN patrol_points pp
+        ON pp.id = pl.point_id
+      LEFT JOIN guards g
+        ON g.id = pl.guard_id
+      ORDER BY pl.patrol_time DESC
+      LIMIT 50
+    `);
+
+    res.json({
+      status: "ok",
+      history: result.rows,
+    });
+  } catch (err) {
+    console.error("Patrol history load error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load patrol history",
+      detail: err.message,
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
