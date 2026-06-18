@@ -5358,7 +5358,7 @@ s.name AS site_name
       AND ps.site_id = $2
       AND ps.schedule_type = 'manual'
       AND ps.active = true
-      AND (ps.scheduled_date::timestamp + ps.scheduled_time) <= NOW()
+      AND (ps.scheduled_date::timestamp + ps.scheduled_time) <= (NOW() AT TIME ZONE 'Europe/Athens')
     ORDER BY scheduled_at DESC
     LIMIT 1
   ),
@@ -5476,7 +5476,7 @@ if (matchedSchedule?.schedule_type === "manual") {
         AND site_id = $2
         AND schedule_type = 'manual'
         AND active = true
-        AND (scheduled_date::timestamp + scheduled_time) <= NOW()
+        AND (scheduled_date::timestamp + scheduled_time) <= (NOW() AT TIME ZONE 'Europe/Athens')
       ORDER BY (scheduled_date::timestamp + scheduled_time) DESC
       LIMIT 1
     )
