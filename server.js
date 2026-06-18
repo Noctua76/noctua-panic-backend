@@ -5953,7 +5953,7 @@ pl.longitude AS last_patrol_longitude
     THEN 'due_soon'
 
   ELSE 'scheduled'
-END
+END,
         'assigned_guard', gs_guard.full_name,
         'guard_session_login', gs.login_time,
         'shift_label', '24/7 Coverage'
