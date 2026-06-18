@@ -5388,22 +5388,25 @@ s.name AS site_name
   ),
 
   candidates AS (
-    SELECT scheduled_at FROM manual_candidate
-    UNION ALL
-    SELECT scheduled_at FROM recurring_candidate
-  )
+  SELECT scheduled_at, 'manual' AS schedule_type FROM manual_candidate
+  UNION ALL
+  SELECT scheduled_at, 'recurring' AS schedule_type FROM recurring_candidate
+)
 
   SELECT
-    scheduled_at,
-    GREATEST(
-      0,
-      FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / 60)
-    )::int AS delay_minutes
-  FROM candidates
-  WHERE scheduled_at IS NOT NULL
-    AND scheduled_at <= NOW()
-  ORDER BY scheduled_at DESC
-  LIMIT 1
+  scheduled_at,
+  schedule_type,
+  GREATEST(
+    0,
+    FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / 60)
+  )::int AS delay_minutes
+FROM candidates
+WHERE scheduled_at IS NOT NULL
+  AND scheduled_at <= NOW()
+ORDER BY
+  CASE WHEN schedule_type = 'manual' THEN 0 ELSE 1 END,
+  scheduled_at DESC
+LIMIT 1
   `,
   [
     point.point_id,
