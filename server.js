@@ -5770,15 +5770,16 @@ app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) 
 
     const intervalMinutes = Number(interval_hours) * 60;
 
-    await pool.query(
-      `
-      UPDATE patrol_points
-      SET expected_interval_minutes = $1
-      WHERE site_id = $2
-        AND active = true
-      `,
-      [intervalMinutes, siteId]
-    );
+    const updatePointsResult = await pool.query(
+  `
+  UPDATE patrol_points
+  SET expected_interval_minutes = $1
+  WHERE site_id = $2
+    AND active = true
+  RETURNING id, point_name, expected_interval_minutes
+  `,
+  [intervalMinutes, siteId]
+);
 
     await pool.query(
       `
@@ -5834,6 +5835,8 @@ app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) 
       message: "Recurring patrol schedule saved for site",
       interval_minutes: intervalMinutes,
       schedule_scope,
+      updated_points_count: updatePointsResult.rowCount,
+updated_points: updatePointsResult.rows,
       schedules: inserted,
     });
   } catch (err) {
