@@ -6576,7 +6576,7 @@ app.get("/patrols/missed-history", async (req, res) => {
           s.location AS site_location,
           ps.patrol_point_id AS point_id,
           pp.point_name,
-          ps.scheduled_at,
+          (ps.scheduled_date + ps.scheduled_time) AS scheduled_at,
           'manual' AS schedule_type,
           'missed' AS status,
           g.full_name AS guard_name
@@ -6587,22 +6587,22 @@ app.get("/patrols/missed-history", async (req, res) => {
           ON pp.id = ps.patrol_point_id
         LEFT JOIN guard_sessions gs
           ON gs.site_id = ps.site_id
-          AND gs.login_time <= ps.scheduled_at
+          AND gs.login_time <= (ps.scheduled_date + ps.scheduled_time)
           AND (
             gs.logout_time IS NULL
-            OR gs.logout_time >= ps.scheduled_at
+            OR gs.logout_time >= (ps.scheduled_date + ps.scheduled_time)
           )
         LEFT JOIN guards g
           ON g.id = gs.guard_id
         WHERE ps.schedule_type = 'manual'
-          AND ps.scheduled_at < NOW()
+          AND (ps.scheduled_date + ps.scheduled_time) < NOW()
           AND NOT EXISTS (
             SELECT 1
             FROM patrol_logs pl
             WHERE pl.point_id = ps.patrol_point_id
               AND pl.site_id = ps.site_id
-              AND pl.patrol_time >= ps.scheduled_at - INTERVAL '10 minutes'
-              AND pl.patrol_time <= ps.scheduled_at + INTERVAL '30 minutes'
+              AND pl.patrol_time >= (ps.scheduled_date + ps.scheduled_time) - INTERVAL '10 minutes'
+              AND pl.patrol_time <= (ps.scheduled_date + ps.scheduled_time) + INTERVAL '30 minutes'
           )
       ),
       combined AS (
