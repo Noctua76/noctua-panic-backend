@@ -5751,6 +5751,102 @@ app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => 
   }
 });
 
+app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) => {
+  try {
+    const { siteId } = req.params;
+
+    const {
+      interval_hours,
+      reminder_minutes_before = 5,
+      schedule_scope = "24_7",
+    } = req.body;
+
+    if (!interval_hours) {
+      return res.status(400).json({
+        status: "error",
+        message: "interval_hours is required",
+      });
+    }
+
+    const intervalMinutes = Number(interval_hours) * 60;
+
+    await pool.query(
+      `
+      UPDATE patrol_points
+      SET expected_interval_minutes = $1
+      WHERE site_id = $2
+        AND active = true
+      `,
+      [intervalMinutes, siteId]
+    );
+
+    await pool.query(
+      `
+      UPDATE patrol_schedules
+      SET active = false
+      WHERE site_id = $1
+        AND schedule_type = 'recurring'
+      `,
+      [siteId]
+    );
+
+    const pointsResult = await pool.query(
+      `
+      SELECT id
+      FROM patrol_points
+      WHERE site_id = $1
+        AND active = true
+      ORDER BY id ASC
+      `,
+      [siteId]
+    );
+
+    const inserted = [];
+
+    for (const point of pointsResult.rows) {
+      const result = await pool.query(
+        `
+        INSERT INTO patrol_schedules (
+          site_id,
+          patrol_point_id,
+          schedule_type,
+          interval_hours,
+          reminder_minutes_before,
+          active,
+          created_at
+        )
+        VALUES ($1,$2,'recurring',$3,$4,true,NOW())
+        RETURNING *
+        `,
+        [
+          siteId,
+          point.id,
+          Number(interval_hours),
+          Number(reminder_minutes_before),
+        ]
+      );
+
+      inserted.push(result.rows[0]);
+    }
+
+    res.json({
+      status: "ok",
+      message: "Recurring patrol schedule saved for site",
+      interval_minutes: intervalMinutes,
+      schedule_scope,
+      schedules: inserted,
+    });
+  } catch (err) {
+    console.error("Recurring patrol schedule error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to save recurring patrol schedule",
+      detail: err.message,
+    });
+  }
+});
+
 app.get("/patrols/sites", async (req, res) => {
   try {
     const result = await pool.query(`
