@@ -6614,8 +6614,14 @@ app.get("/patrols/missed-history", async (req, res) => {
       FROM combined
       WHERE ($1::int IS NULL OR site_id = $1::int)
         AND ($2::int IS NULL OR point_id = $2::int)
-        AND ($3::date IS NULL OR scheduled_at >= $3::date)
-        AND ($4::date IS NULL OR scheduled_at <= ($4::date + INTERVAL '1 day' - INTERVAL '1 millisecond'))
+        AND (
+  $3::date IS NULL
+  OR (scheduled_at AT TIME ZONE 'Europe/Athens')::date >= $3::date
+)
+AND (
+  $4::date IS NULL
+  OR (scheduled_at AT TIME ZONE 'Europe/Athens')::date <= $4::date
+)
         AND (
           $5::text = 'all'
           OR schedule_type = $5::text
