@@ -6498,6 +6498,111 @@ app.get("/debug/guard-sessions", async (req, res) => {
     });
   }
 });
+
+app.get("/patrols/missed-history", async (req, res) => {
+  try {
+    const { site_id, point_id, from, to } = req.query;
+
+    const siteFilter = site_id ? "AND s.id = $1" : "";
+    const values = site_id ? [site_id] : [];
+
+    const result = await pool.query(
+      `
+      WITH last_patrol_per_point AS (
+        SELECT DISTINCT ON (pp.id)
+          pp.id AS point_id,
+          pp.site_id,
+          pp.point_name,
+          pp.expected_interval_minutes,
+          pl.patrol_time AS last_patrol_time
+        FROM patrol_points pp
+        LEFT JOIN patrol_logs pl
+          ON pl.point_id = pp.id
+        WHERE pp.active = true
+        ORDER BY pp.id, pl.patrol_time DESC NULLS LAST
+      ),
+      generated_windows AS (
+        SELECT
+          lpp.site_id,
+          lpp.point_id,
+          lpp.point_name,
+          generate_series(
+            lpp.last_patrol_time + (lpp.expected_interval_minutes || ' minutes')::interval,
+            NOW(),
+            (lpp.expected_interval_minutes || ' minutes')::interval
+          ) AS scheduled_at
+        FROM last_patrol_per_point lpp
+        WHERE lpp.last_patrol_time IS NOT NULL
+          AND lpp.expected_interval_minutes IS NOT NULL
+      )
+      SELECT
+        CONCAT('missed-', gw.point_id, '-', EXTRACT(EPOCH FROM gw.scheduled_at)) AS id,
+        gw.site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+        gw.point_id,
+        gw.point_name,
+        gw.scheduled_at,
+        'missed' AS status,
+        g.full_name AS guard_name
+      FROM generated_windows gw
+      LEFT JOIN sites s
+        ON s.id = gw.site_id
+      LEFT JOIN guard_sessions gs
+        ON gs.site_id = gw.site_id
+        AND gs.login_time <= gw.scheduled_at
+        AND (
+          gs.logout_time IS NULL
+          OR gs.logout_time >= gw.scheduled_at
+        )
+      LEFT JOIN guards g
+        ON g.id = gs.guard_id
+      WHERE gw.scheduled_at < NOW()
+      ${siteFilter}
+      ORDER BY gw.scheduled_at DESC
+      LIMIT 200
+      `,
+      values
+    );
+
+    let history = result.rows;
+
+    if (point_id) {
+      history = history.filter(
+        (entry) => String(entry.point_id) === String(point_id)
+      );
+    }
+
+    if (from) {
+      const fromDate = new Date(from);
+      history = history.filter(
+        (entry) => new Date(entry.scheduled_at) >= fromDate
+      );
+    }
+
+    if (to) {
+      const toDate = new Date(to);
+      toDate.setHours(23, 59, 59, 999);
+      history = history.filter(
+        (entry) => new Date(entry.scheduled_at) <= toDate
+      );
+    }
+
+    res.json({
+      status: "ok",
+      history,
+    });
+  } catch (err) {
+    console.error("Missed patrol history load error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load missed patrol history",
+      detail: err.message,
+    });
+  }
+});
+
 app.get("/patrols/history", async (req, res) => {
   try {
     const result = await pool.query(`
