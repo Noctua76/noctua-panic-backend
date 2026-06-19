@@ -6499,6 +6499,27 @@ app.get("/debug/guard-sessions", async (req, res) => {
   }
 });
 
+app.get("/debug/patrol-schedules-columns", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_name = 'patrol_schedules'
+      ORDER BY ordinal_position
+    `);
+
+    res.json({
+      status: "ok",
+      columns: result.rows,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      detail: err.message,
+    });
+  }
+});
+
 app.get("/patrols/missed-history", async (req, res) => {
   try {
     const { site_id, point_id, from, to, type = "all" } = req.query;
