@@ -6501,10 +6501,7 @@ app.get("/debug/guard-sessions", async (req, res) => {
 
 app.get("/patrols/missed-history", async (req, res) => {
   try {
-    const { site_id, point_id, from, to } = req.query;
-
-    const siteFilter = site_id ? "AND s.id = $1" : "";
-    const values = site_id ? [site_id] : [];
+    const { site_id, point_id, from, to, type = "all" } = req.query;
 
     const result = await pool.query(
       `
@@ -6521,76 +6518,102 @@ app.get("/patrols/missed-history", async (req, res) => {
         WHERE pp.active = true
         ORDER BY pp.id, pl.patrol_time DESC NULLS LAST
       ),
-      generated_windows AS (
+      recurring_missed AS (
         SELECT
+          CONCAT(
+            'recurring-missed-',
+            lpp.point_id,
+            '-',
+            EXTRACT(EPOCH FROM generated_at)
+          ) AS id,
           lpp.site_id,
+          s.name AS site_name,
+          s.location AS site_location,
           lpp.point_id,
           lpp.point_name,
-          generate_series(
-            lpp.last_patrol_time + (lpp.expected_interval_minutes || ' minutes')::interval,
-            NOW(),
-            (lpp.expected_interval_minutes || ' minutes')::interval
-          ) AS scheduled_at
+          generated_at AS scheduled_at,
+          'recurring' AS schedule_type,
+          'missed' AS status,
+          NULL::text AS guard_name
         FROM last_patrol_per_point lpp
+        CROSS JOIN LATERAL generate_series(
+          lpp.last_patrol_time + (lpp.expected_interval_minutes || ' minutes')::interval,
+          NOW(),
+          (lpp.expected_interval_minutes || ' minutes')::interval
+        ) AS generated_at
+        LEFT JOIN sites s
+          ON s.id = lpp.site_id
         WHERE lpp.last_patrol_time IS NOT NULL
           AND lpp.expected_interval_minutes IS NOT NULL
+          AND generated_at < NOW()
+      ),
+      manual_missed AS (
+        SELECT
+          CONCAT('manual-missed-', ps.id) AS id,
+          ps.site_id,
+          s.name AS site_name,
+          s.location AS site_location,
+          ps.point_id,
+          pp.point_name,
+          ps.scheduled_at,
+          'manual' AS schedule_type,
+          'missed' AS status,
+          g.full_name AS guard_name
+        FROM patrol_schedules ps
+        LEFT JOIN sites s
+          ON s.id = ps.site_id
+        LEFT JOIN patrol_points pp
+          ON pp.id = ps.point_id
+        LEFT JOIN guard_sessions gs
+          ON gs.site_id = ps.site_id
+          AND gs.login_time <= ps.scheduled_at
+          AND (
+            gs.logout_time IS NULL
+            OR gs.logout_time >= ps.scheduled_at
+          )
+        LEFT JOIN guards g
+          ON g.id = gs.guard_id
+        WHERE ps.schedule_type = 'manual'
+          AND ps.scheduled_at < NOW()
+          AND NOT EXISTS (
+            SELECT 1
+            FROM patrol_logs pl
+            WHERE pl.point_id = ps.point_id
+              AND pl.site_id = ps.site_id
+              AND pl.patrol_time >= ps.scheduled_at - INTERVAL '10 minutes'
+              AND pl.patrol_time <= ps.scheduled_at + INTERVAL '30 minutes'
+          )
+      ),
+      combined AS (
+        SELECT * FROM recurring_missed
+        UNION ALL
+        SELECT * FROM manual_missed
       )
-      SELECT
-        CONCAT('missed-', gw.point_id, '-', EXTRACT(EPOCH FROM gw.scheduled_at)) AS id,
-        gw.site_id,
-        s.name AS site_name,
-        s.location AS site_location,
-        gw.point_id,
-        gw.point_name,
-        gw.scheduled_at,
-        'missed' AS status,
-        g.full_name AS guard_name
-      FROM generated_windows gw
-      LEFT JOIN sites s
-        ON s.id = gw.site_id
-      LEFT JOIN guard_sessions gs
-        ON gs.site_id = gw.site_id
-        AND gs.login_time <= gw.scheduled_at
+      SELECT *
+      FROM combined
+      WHERE ($1::int IS NULL OR site_id = $1::int)
+        AND ($2::int IS NULL OR point_id = $2::int)
+        AND ($3::date IS NULL OR scheduled_at >= $3::date)
+        AND ($4::date IS NULL OR scheduled_at <= ($4::date + INTERVAL '1 day' - INTERVAL '1 millisecond'))
         AND (
-          gs.logout_time IS NULL
-          OR gs.logout_time >= gw.scheduled_at
+          $5::text = 'all'
+          OR schedule_type = $5::text
         )
-      LEFT JOIN guards g
-        ON g.id = gs.guard_id
-      WHERE gw.scheduled_at < NOW()
-      ${siteFilter}
-      ORDER BY gw.scheduled_at DESC
-      LIMIT 200
+      ORDER BY scheduled_at DESC
+      LIMIT 300
       `,
-      values
+      [
+        site_id ? Number(site_id) : null,
+        point_id ? Number(point_id) : null,
+        from || null,
+        to || null,
+        type || "all",
+      ]
     );
-
-    let history = result.rows;
-
-    if (point_id) {
-      history = history.filter(
-        (entry) => String(entry.point_id) === String(point_id)
-      );
-    }
-
-    if (from) {
-      const fromDate = new Date(from);
-      history = history.filter(
-        (entry) => new Date(entry.scheduled_at) >= fromDate
-      );
-    }
-
-    if (to) {
-      const toDate = new Date(to);
-      toDate.setHours(23, 59, 59, 999);
-      history = history.filter(
-        (entry) => new Date(entry.scheduled_at) <= toDate
-      );
-    }
 
     res.json({
       status: "ok",
-      history,
+      history: result.rows,
     });
   } catch (err) {
     console.error("Missed patrol history load error:", err);
