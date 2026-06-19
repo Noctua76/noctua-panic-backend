@@ -5909,54 +5909,26 @@ pl.longitude AS last_patrol_longitude
     pp.id AS point_id,
     pp.point_name,
     'recurring' AS schedule_type,
-    CASE
-      WHEN MAX(pl.patrol_time) IS NULL THEN NOW()
-      WHEN (
-        MAX(pl.patrol_time)
-        + (
-          CEIL(
-            EXTRACT(
-              EPOCH FROM (NOW() - MAX(pl.patrol_time))
-            ) / 60 / pp.expected_interval_minutes
-          ) * pp.expected_interval_minutes || ' minutes'
-        )::interval
-      ) <= NOW()
-      THEN (
-        MAX(pl.patrol_time)
-        + (
-          (
-            CEIL(
-              EXTRACT(
-                EPOCH FROM (NOW() - MAX(pl.patrol_time))
-              ) / 60 / pp.expected_interval_minutes
-            ) + 1
-          ) * pp.expected_interval_minutes || ' minutes'
-        )::interval
-      )
-      ELSE (
-        MAX(pl.patrol_time)
-        + (
-          CEIL(
-            EXTRACT(
-              EPOCH FROM (NOW() - MAX(pl.patrol_time))
-            ) / 60 / pp.expected_interval_minutes
-          ) * pp.expected_interval_minutes || ' minutes'
-        )::interval
-      )
-    END AS scheduled_at
+    gs.expected_slot AS scheduled_at
   FROM patrol_points pp
 
-  LEFT JOIN patrol_logs pl
-    ON pl.point_id = pp.id
+  LEFT JOIN LATERAL (
+    SELECT MAX(pl.patrol_time) AS last_patrol_time
+    FROM patrol_logs pl
+    WHERE pl.point_id = pp.id
+  ) last_log ON true
+
+  CROSS JOIN LATERAL generate_series(
+    COALESCE(
+      last_log.last_patrol_time + (pp.expected_interval_minutes || ' minutes')::interval,
+      NOW()
+    ),
+    NOW() + (pp.expected_interval_minutes || ' minutes')::interval,
+    (pp.expected_interval_minutes || ' minutes')::interval
+  ) AS gs(expected_slot)
 
   WHERE pp.active = true
     AND pp.expected_interval_minutes IS NOT NULL
-
-  GROUP BY
-    pp.site_id,
-    pp.id,
-    pp.point_name,
-    pp.expected_interval_minutes
 ),
 
       manual_next AS (
