@@ -7079,43 +7079,115 @@ app.get("/patrols/manual-history", async (req, res) => {
 
     const result = await pool.query(
       `
+      WITH manual_items AS (
+        SELECT
+          ps.id,
+          ps.site_id,
+          s.name AS site_name,
+          s.location AS site_location,
+
+          ps.patrol_point_id,
+          pp.point_name,
+
+          ps.scheduled_date,
+          ps.scheduled_time,
+          (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at,
+
+          ps.reminder_minutes_before,
+          ps.active,
+          ps.created_at,
+
+          ps.created_by_admin_id,
+          ps.created_by_username,
+          ps.created_by_role,
+
+          ps.manual_status,
+          ps.cancelled_at,
+          ps.cancelled_by_username,
+          ps.cancel_reason,
+
+          matched_log.id AS patrol_log_id,
+          matched_log.patrol_time,
+          matched_log.guard_name,
+          matched_log.delay_minutes
+
+        FROM patrol_schedules ps
+
+        LEFT JOIN sites s
+          ON s.id = ps.site_id
+
+        LEFT JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+
+        LEFT JOIN LATERAL (
+          SELECT
+            pl.id,
+            pl.patrol_time,
+            g.full_name AS guard_name,
+            FLOOR(
+              EXTRACT(
+                EPOCH FROM (
+                  pl.patrol_time -
+                  (ps.scheduled_date::timestamp + ps.scheduled_time)
+                )
+              ) / 60
+            )::int AS delay_minutes
+          FROM patrol_logs pl
+          LEFT JOIN guards g
+            ON g.id = pl.guard_id
+          WHERE pl.site_id = ps.site_id
+            AND pl.point_id = ps.patrol_point_id
+            AND pl.patrol_time >=
+              (ps.scheduled_date::timestamp + ps.scheduled_time) - INTERVAL '10 minutes'
+            AND pl.patrol_time <=
+              (ps.scheduled_date::timestamp + ps.scheduled_time) + INTERVAL '24 hours'
+          ORDER BY ABS(
+            EXTRACT(
+              EPOCH FROM (
+                pl.patrol_time -
+                (ps.scheduled_date::timestamp + ps.scheduled_time)
+              )
+            )
+          ) ASC
+          LIMIT 1
+        ) matched_log ON true
+
+        ${whereClause}
+      )
+
       SELECT
-        ps.id,
-        ps.site_id,
-        s.name AS site_name,
-        s.location AS site_location,
+        *,
+        CASE
+          WHEN cancelled_at IS NOT NULL
+            THEN 'cancelled'
 
-        ps.patrol_point_id,
-        pp.point_name,
+          WHEN patrol_log_id IS NOT NULL
+            AND patrol_time <= scheduled_at
+            THEN 'completed'
 
-        ps.scheduled_date,
-        ps.scheduled_time,
-        (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at,
+          WHEN patrol_log_id IS NOT NULL
+            AND patrol_time > scheduled_at
+            AND patrol_time <= scheduled_at + INTERVAL '15 minutes'
+            THEN 'completed_late'
 
-        ps.reminder_minutes_before,
-        ps.active,
-        ps.created_at,
+          WHEN patrol_log_id IS NOT NULL
+            AND patrol_time > scheduled_at + INTERVAL '15 minutes'
+            THEN 'missed_completed_late'
 
-        ps.created_by_admin_id,
-        ps.created_by_username,
-        ps.created_by_role,
+          WHEN patrol_log_id IS NULL
+            AND NOW() <= scheduled_at + INTERVAL '15 minutes'
+            THEN 'pending'
 
-        ps.manual_status,
-        ps.cancelled_at,
-        ps.cancelled_by_username,
-        ps.cancel_reason
+          WHEN patrol_log_id IS NULL
+            AND NOW() > scheduled_at + INTERVAL '15 minutes'
+            THEN 'missed'
 
-      FROM patrol_schedules ps
+          ELSE 'pending'
+        END AS computed_status
 
-      LEFT JOIN sites s
-        ON s.id = ps.site_id
+      FROM manual_items
 
-      LEFT JOIN patrol_points pp
-        ON pp.id = ps.patrol_point_id
-
-      ${whereClause}
-
-      ORDER BY ps.created_at DESC, ps.id DESC
+      ORDER BY created_at DESC, id DESC
       LIMIT 100
       `,
       values
