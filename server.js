@@ -7022,10 +7022,12 @@ app.get("/patrols/missed-history/report/pdf", async (req, res) => {
     await browser.close();
 
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${reportId}.pdf"`
-    );
+    const disposition = req.query.preview === "true" ? "inline" : "attachment";
+
+res.setHeader(
+  "Content-Disposition",
+  `${disposition}; filename="${reportId}.pdf"`
+);
 
     res.send(pdfBuffer);
   } catch (err) {
