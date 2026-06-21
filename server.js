@@ -7047,31 +7047,53 @@ res.setHeader(
 
 app.get("/patrols/history", async (req, res) => {
   try {
+    const countResult = await pool.query(`
+  SELECT
+    site_id,
+    COUNT(*) AS total
+  FROM patrol_logs
+  WHERE patrol_time >= NOW() - INTERVAL '24 hours'
+  GROUP BY site_id
+`);
     const result = await pool.query(`
       SELECT
-        pl.id,
-        pl.patrol_time,
-        s.name AS site_name,
-        pp.point_name,
-        g.full_name AS guard_name,
-        pl.latitude,
-        pl.longitude,
-        pl.accuracy
-      FROM patrol_logs pl
-      LEFT JOIN sites s
-        ON s.id = pl.site_id
-      LEFT JOIN patrol_points pp
-        ON pp.id = pl.point_id
-      LEFT JOIN guards g
-        ON g.id = pl.guard_id
-      ORDER BY pl.patrol_time DESC
-      LIMIT 50
+  pl.id,
+  pl.patrol_time,
+  pl.scheduled_at,
+  pl.delay_minutes,
+  pl.completion_status,
+  pl.was_missed,
+
+  s.name AS site_name,
+
+  pp.point_name,
+
+  g.full_name AS guard_name,
+
+  pl.latitude,
+  pl.longitude,
+  pl.accuracy
+
+FROM patrol_logs pl
+
+LEFT JOIN sites s
+  ON s.id = pl.site_id
+
+LEFT JOIN patrol_points pp
+  ON pp.id = pl.point_id
+
+LEFT JOIN guards g
+  ON g.id = pl.guard_id
+
+ORDER BY pl.patrol_time DESC
+LIMIT 50
     `);
 
     res.json({
-      status: "ok",
-      history: result.rows,
-    });
+  status: "ok",
+  history: result.rows,
+  completed_by_site: countResult.rows,
+});
   } catch (err) {
     console.error("Patrol history load error:", err);
 
