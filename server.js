@@ -6685,10 +6685,44 @@ AND (
       ]
     );
 
-    res.json({
-      status: "ok",
-      history: result.rows,
-    });
+    const siteIds = [
+  ...new Set(result.rows.map((row) => row.site_id).filter(Boolean)),
+];
+
+let sitesById = {};
+
+if (siteIds.length > 0) {
+  const sitesResult = await pool.query(
+    `
+    SELECT
+      id,
+      coverage_type,
+      shift_rules
+    FROM sites
+    WHERE id = ANY($1::int[])
+    `,
+    [siteIds]
+  );
+
+  sitesById = sitesResult.rows.reduce((acc, site) => {
+    acc[site.id] = site;
+    return acc;
+  }, {});
+}
+
+const historyWithShift = result.rows.map((row) => {
+  const site = sitesById[row.site_id];
+
+  return {
+    ...row,
+    shift_label: resolveShiftLabel(site, row.scheduled_at),
+  };
+});
+
+res.json({
+  status: "ok",
+  history: historyWithShift,
+});
   } catch (err) {
     console.error("Missed patrol history load error:", err);
 
