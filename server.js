@@ -5680,12 +5680,22 @@ app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => 
       scheduled_date,
       scheduled_time,
       reminder_minutes_before = 5,
+      created_by_admin_id,
+      created_by_username,
+      created_by_role,
     } = req.body;
 
     if (!scheduled_date || !scheduled_time) {
       return res.status(400).json({
         status: "error",
         message: "scheduled_date and scheduled_time are required",
+      });
+    }
+
+    if (!created_by_username) {
+      return res.status(400).json({
+        status: "error",
+        message: "created_by_username is required",
       });
     }
 
@@ -5720,9 +5730,13 @@ app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => 
           scheduled_time,
           reminder_minutes_before,
           active,
-          created_at
+          created_at,
+          created_by_admin_id,
+          created_by_username,
+          created_by_role,
+          manual_status
         )
-        VALUES ($1,$2,'manual',$3,$4,$5,true,NOW())
+        VALUES ($1,$2,'manual',$3,$4,$5,true,NOW(),$6,$7,$8,'pending')
         RETURNING *
         `,
         [
@@ -5731,6 +5745,9 @@ app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => 
           scheduled_date,
           scheduled_time,
           reminder_minutes_before,
+          created_by_admin_id || null,
+          created_by_username,
+          created_by_role || "admin",
         ]
       );
 
