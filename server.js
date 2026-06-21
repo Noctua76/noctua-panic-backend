@@ -5403,6 +5403,7 @@ s.name AS site_name
 FROM candidates
 WHERE scheduled_at IS NOT NULL
   AND scheduled_at <= NOW()
+  AND scheduled_at >= NOW() - INTERVAL '24 hours'
 ORDER BY
   CASE WHEN schedule_type = 'manual' THEN 0 ELSE 1 END,
   scheduled_at DESC
