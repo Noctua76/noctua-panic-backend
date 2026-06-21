@@ -5350,64 +5350,79 @@ s.name AS site_name
 
         const scheduleResult = await pool.query(
   `
-  WITH manual_candidate AS (
+  WITH manual_candidates AS (
     SELECT
+      ps.id AS schedule_id,
+      'manual' AS schedule_type,
       (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
     FROM patrol_schedules ps
     WHERE ps.patrol_point_id = $1
       AND ps.site_id = $2
       AND ps.schedule_type = 'manual'
       AND ps.active = true
-      AND (ps.scheduled_date::timestamp + ps.scheduled_time) <= (NOW() AT TIME ZONE 'Europe/Athens')
-    ORDER BY scheduled_at DESC
-    LIMIT 1
+      AND (ps.scheduled_date::timestamp + ps.scheduled_time) <= NOW()
+      AND (ps.scheduled_date::timestamp + ps.scheduled_time) >= NOW() - INTERVAL '24 hours'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM patrol_logs pl
+        WHERE pl.schedule_id = ps.id
+          AND pl.schedule_type = 'manual'
+      )
   ),
 
-  last_completed AS (
+  last_recurring_completion AS (
     SELECT MAX(pl.patrol_time) AS last_patrol_time
     FROM patrol_logs pl
     WHERE pl.point_id = $1
+      AND pl.site_id = $2
+      AND COALESCE(pl.schedule_type, 'recurring') = 'recurring'
   ),
 
   recurring_candidate AS (
     SELECT
+      NULL::integer AS schedule_id,
+      'recurring' AS schedule_type,
       CASE
         WHEN $3::int IS NULL THEN NULL
-        WHEN lc.last_patrol_time IS NULL THEN NULL
+        WHEN lrc.last_patrol_time IS NULL THEN NULL
         ELSE
-          lc.last_patrol_time +
+          lrc.last_patrol_time +
           (
             FLOOR(
-              EXTRACT(EPOCH FROM (NOW() - lc.last_patrol_time))
+              EXTRACT(EPOCH FROM (NOW() - lrc.last_patrol_time))
               / 60
               / $3::int
             ) * $3::int || ' minutes'
           )::interval
       END AS scheduled_at
-    FROM last_completed lc
+    FROM last_recurring_completion lrc
   ),
 
   candidates AS (
-  SELECT scheduled_at, 'manual' AS schedule_type FROM manual_candidate
-  UNION ALL
-  SELECT scheduled_at, 'recurring' AS schedule_type FROM recurring_candidate
-)
+    SELECT schedule_id, schedule_type, scheduled_at
+    FROM manual_candidates
+
+    UNION ALL
+
+    SELECT schedule_id, schedule_type, scheduled_at
+    FROM recurring_candidate
+    WHERE scheduled_at IS NOT NULL
+      AND scheduled_at <= NOW()
+      AND scheduled_at >= NOW() - INTERVAL '24 hours'
+  )
 
   SELECT
-  scheduled_at,
-  schedule_type,
-  GREATEST(
-    0,
-    FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / 60)
-  )::int AS delay_minutes
-FROM candidates
-WHERE scheduled_at IS NOT NULL
-  AND scheduled_at <= NOW()
-  AND scheduled_at >= NOW() - INTERVAL '24 hours'
-ORDER BY
-  CASE WHEN schedule_type = 'manual' THEN 0 ELSE 1 END,
-  scheduled_at DESC
-LIMIT 1
+    schedule_id,
+    schedule_type,
+    scheduled_at,
+    GREATEST(
+      0,
+      FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / 60)
+    )::int AS delay_minutes
+  FROM candidates
+  WHERE scheduled_at IS NOT NULL
+  ORDER BY scheduled_at ASC
+  LIMIT 1
   `,
   [
     point.point_id,
@@ -5418,7 +5433,10 @@ LIMIT 1
 
 const matchedSchedule = scheduleResult.rows[0] || null;
 
+const scheduleId = matchedSchedule?.schedule_id || null;
+const scheduleType = matchedSchedule?.schedule_type || "unscheduled";
 const scheduledAt = matchedSchedule?.scheduled_at || null;
+
 const delayMinutes =
   matchedSchedule?.delay_minutes !== undefined
     ? matchedSchedule.delay_minutes
@@ -5430,11 +5448,13 @@ const wasMissed =
 const completionStatus =
   delayMinutes === null
     ? "completed"
-    : Number(delayMinutes) > 0
-    ? "completed_late"
-    : "completed_on_time";
+    : Number(delayMinutes) === 0
+    ? "completed_on_time"
+    : Number(delayMinutes) >= 15
+    ? "missed_completed_late"
+    : "completed_late";
 
-    const insertResult = await pool.query(
+const insertResult = await pool.query(
   `
   INSERT INTO patrol_logs (
     site_id,
@@ -5447,9 +5467,11 @@ const completionStatus =
     scheduled_at,
     delay_minutes,
     completion_status,
-    was_missed
+    was_missed,
+    schedule_id,
+    schedule_type
   )
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
   RETURNING *
   `,
   [
@@ -5464,35 +5486,26 @@ const completionStatus =
     delayMinutes,
     completionStatus,
     wasMissed,
+    scheduleId,
+    scheduleType,
   ]
 );
 
-await pool.query(
-  `
-  WITH target_manual AS (
-    SELECT id
-    FROM patrol_schedules
-    WHERE patrol_point_id = $1
-      AND site_id = $2
-      AND schedule_type = 'manual'
-      AND active = true
-      AND (scheduled_date::timestamp + scheduled_time)
-        <= (NOW() AT TIME ZONE 'Europe/Athens')
-      AND (scheduled_date::timestamp + scheduled_time)
-        >= (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
-    ORDER BY (scheduled_date::timestamp + scheduled_time) DESC
-    LIMIT 1
-  )
-  UPDATE patrol_schedules ps
-  SET active = false
-  FROM target_manual tm
-  WHERE ps.id = tm.id
-  `,
-  [
-    point.point_id,
-    point.site_id,
-  ]
-);
+if (scheduleId && scheduleType === "manual") {
+  await pool.query(
+    `
+    UPDATE patrol_schedules
+    SET
+      active = false,
+      manual_status = $2
+    WHERE id = $1
+    `,
+    [
+      scheduleId,
+      completionStatus,
+    ]
+  );
+}
 
     res.json({
       status: "ok",
