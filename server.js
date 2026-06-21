@@ -7063,6 +7063,79 @@ res.setHeader(
   }
 });
 
+app.get("/patrols/manual-history", async (req, res) => {
+  try {
+    const { site_id } = req.query;
+
+    const values = [];
+    let whereClause = `
+      WHERE ps.schedule_type = 'manual'
+    `;
+
+    if (site_id) {
+      values.push(Number(site_id));
+      whereClause += ` AND ps.site_id = $${values.length}`;
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        ps.id,
+        ps.site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+
+        ps.patrol_point_id,
+        pp.point_name,
+
+        ps.scheduled_date,
+        ps.scheduled_time,
+        (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at,
+
+        ps.reminder_minutes_before,
+        ps.active,
+        ps.created_at,
+
+        ps.created_by_admin_id,
+        ps.created_by_username,
+        ps.created_by_role,
+
+        ps.manual_status,
+        ps.cancelled_at,
+        ps.cancelled_by_username,
+        ps.cancel_reason
+
+      FROM patrol_schedules ps
+
+      LEFT JOIN sites s
+        ON s.id = ps.site_id
+
+      LEFT JOIN patrol_points pp
+        ON pp.id = ps.patrol_point_id
+
+      ${whereClause}
+
+      ORDER BY ps.created_at DESC, ps.id DESC
+      LIMIT 100
+      `,
+      values
+    );
+
+    res.json({
+      status: "ok",
+      manual_history: result.rows,
+    });
+  } catch (err) {
+    console.error("Manual patrol history load error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load manual patrol history",
+      detail: err.message,
+    });
+  }
+});
+
 app.get("/patrols/history", async (req, res) => {
   try {
     const countResult = await pool.query(`
