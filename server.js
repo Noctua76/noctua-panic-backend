@@ -7076,6 +7076,66 @@ res.setHeader(
   }
 });
 
+app.put("/patrols/manual/:scheduleId/cancel", async (req, res) => {
+  try {
+    const { scheduleId } = req.params;
+
+    const {
+      cancelled_by_username,
+      cancel_reason = "Cancelled by admin",
+    } = req.body;
+
+    if (!cancelled_by_username) {
+      return res.status(400).json({
+        status: "error",
+        message: "cancelled_by_username is required",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE patrol_schedules
+      SET
+        active = false,
+        manual_status = 'cancelled',
+        cancelled_at = NOW(),
+        cancelled_by_username = $2,
+        cancel_reason = $3
+      WHERE id = $1
+        AND schedule_type = 'manual'
+        AND cancelled_at IS NULL
+      RETURNING *
+      `,
+      [
+        scheduleId,
+        cancelled_by_username,
+        cancel_reason,
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Manual patrol not found or already cancelled",
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "Manual patrol cancelled",
+      manual_patrol: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Manual patrol cancel error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to cancel manual patrol",
+      detail: err.message,
+    });
+  }
+});
+
 app.get("/patrols/manual-history", async (req, res) => {
   try {
     const { site_id } = req.query;
