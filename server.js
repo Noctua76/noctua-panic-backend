@@ -6520,6 +6520,53 @@ app.get("/debug/patrol-schedules-columns", async (req, res) => {
   }
 });
 
+function resolveShiftLabel(site, scheduledAtValue) {
+  try {
+    const shiftRules = site?.shift_rules;
+
+    if (!shiftRules || !Array.isArray(shiftRules.shifts)) {
+      return "Shift rules not configured";
+    }
+
+    const scheduledAt = new Date(scheduledAtValue);
+
+    const athensTime = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/Athens",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(scheduledAt);
+
+    const [currentHour, currentMinute] = athensTime.split(":").map(Number);
+    const currentMinutes = currentHour * 60 + currentMinute;
+
+    const matchedShift = shiftRules.shifts.find((shift) => {
+      if (!shift.start || !shift.end) return false;
+
+      const [startHour, startMinute] = shift.start.split(":").map(Number);
+      const [endHour, endMinute] = shift.end.split(":").map(Number);
+
+      const startMinutes = startHour * 60 + startMinute;
+      const endMinutes = endHour * 60 + endMinute;
+
+      if (startMinutes < endMinutes) {
+        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+      }
+
+      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+    });
+
+    if (!matchedShift) {
+      return "Shift not matched";
+    }
+
+    return `${matchedShift.start} - ${matchedShift.end}`;
+  } catch (err) {
+    console.error("Shift resolution error:", err);
+    return "Shift resolution failed";
+  }
+}
+
 app.get("/patrols/missed-history", async (req, res) => {
   try {
     const { site_id, point_id, from, to, type = "all" } = req.query;
