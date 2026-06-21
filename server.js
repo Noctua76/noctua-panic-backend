@@ -6792,8 +6792,11 @@ app.get("/patrols/missed-history/report/pdf", async (req, res) => {
                 ? "Manual Patrol"
                 : "Routine Patrol"
             )}</td>
-            <td>${escapeHtml(item.guard_name || "-")}</td>
-            <td>${escapeHtml(item.status)}</td>
+            <td>
+  <strong>Guard:</strong> ${escapeHtml(item.guard_name || "-")}<br/>
+  <strong>Shift:</strong> ${escapeHtml(item.shift_label || "-")}
+</td>
+<td>${escapeHtml(item.status === "missed" ? "Missed" : item.status)}</td>
           </tr>
         `
       )
@@ -6949,7 +6952,13 @@ app.get("/patrols/missed-history/report/pdf", async (req, res) => {
 
             <div class="summary-item">
               <span class="label">Patrol Type</span>
-              <span class="value">${escapeHtml(type)}</span>
+              <span class="value">${escapeHtml(
+  type === "manual"
+    ? "Manual Patrols"
+    : type === "recurring"
+    ? "Routine Patrols"
+    : "All Patrols"
+)}</span>
             </div>
 
             <div class="summary-item">
@@ -6977,8 +6986,8 @@ app.get("/patrols/missed-history/report/pdf", async (req, res) => {
                 <th>Site</th>
                 <th>Patrol Point</th>
                 <th>Type</th>
-                <th>Guard</th>
-                <th>Status</th>
+                <th>Guard / Shift</th>
+<th>Status</th>
               </tr>
             </thead>
             <tbody>
