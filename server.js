@@ -7408,11 +7408,7 @@ app.get("/patrols/completed-history", async (req, res) => {
           OR COALESCE(pl.schedule_type, 'recurring') = $5::text
         )
 
-        AND (
-          $6::text = 'all'
-          OR pl.completion_status = $6::text
-        )
-
+        
       ORDER BY pl.patrol_time DESC
       LIMIT 300
       `,
@@ -7473,9 +7469,17 @@ app.get("/patrols/completed-history", async (req, res) => {
   };
 });
 
+let filteredHistory = historyWithShift;
+
+if (status && status !== "all") {
+  filteredHistory = historyWithShift.filter(
+    (row) => row.display_status === status
+  );
+}
+
     res.json({
       status: "ok",
-      history: historyWithShift,
+      history: filteredHistory,
     });
   } catch (err) {
     console.error("Completed patrol history load error:", err);
