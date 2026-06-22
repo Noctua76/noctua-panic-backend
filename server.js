@@ -7417,8 +7417,7 @@ app.get("/patrols/completed-history", async (req, res) => {
         point_id ? Number(point_id) : null,
         from || null,
         to || null,
-        type || "all",
-        status || "all",
+        type || "all",        
       ]
     );
 
