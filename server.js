@@ -7452,13 +7452,26 @@ app.get("/patrols/completed-history", async (req, res) => {
     }
 
     const historyWithShift = result.rows.map((row) => {
-      const site = sitesById[row.site_id];
+  const site = sitesById[row.site_id];
 
-      return {
-        ...row,
-        shift_label: resolveShiftLabel(site, row.patrol_time),
-      };
-    });
+  let displayStatus = "completed";
+
+  if (row.was_missed === true) {
+    displayStatus = "missed_completed_late";
+  } else if (row.completion_status === "completed_late") {
+    displayStatus = "completed_late";
+  } else if (row.completion_status === "missed_completed_late") {
+    displayStatus = "missed_completed_late";
+  } else {
+    displayStatus = "completed";
+  }
+
+  return {
+    ...row,
+    display_status: displayStatus,
+    shift_label: resolveShiftLabel(site, row.patrol_time),
+  };
+});
 
     res.json({
       status: "ok",
