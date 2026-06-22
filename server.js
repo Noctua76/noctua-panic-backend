@@ -7340,6 +7340,141 @@ LIMIT 50
     });
   }
 });
+
+app.get("/patrols/completed-history", async (req, res) => {
+  try {
+    const {
+      site_id,
+      point_id,
+      from,
+      to,
+      type = "all",
+      status = "all",
+    } = req.query;
+
+    const result = await pool.query(
+      `
+      SELECT
+        pl.id,
+        pl.site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+
+        pl.point_id,
+        pp.point_name,
+
+        pl.guard_id,
+        g.full_name AS guard_name,
+
+        pl.patrol_time,
+        pl.scheduled_at,
+        pl.delay_minutes,
+        pl.completion_status,
+        pl.was_missed,
+        COALESCE(pl.schedule_type, 'recurring') AS schedule_type,
+
+        pl.latitude,
+        pl.longitude,
+        pl.accuracy
+
+      FROM patrol_logs pl
+
+      LEFT JOIN sites s
+        ON s.id = pl.site_id
+
+      LEFT JOIN patrol_points pp
+        ON pp.id = pl.point_id
+
+      LEFT JOIN guards g
+        ON g.id = pl.guard_id
+
+      WHERE 1=1
+
+        AND ($1::int IS NULL OR pl.site_id = $1::int)
+        AND ($2::int IS NULL OR pl.point_id = $2::int)
+
+        AND (
+          $3::date IS NULL
+          OR (pl.patrol_time AT TIME ZONE 'Europe/Athens')::date >= $3::date
+        )
+
+        AND (
+          $4::date IS NULL
+          OR (pl.patrol_time AT TIME ZONE 'Europe/Athens')::date <= $4::date
+        )
+
+        AND (
+          $5::text = 'all'
+          OR COALESCE(pl.schedule_type, 'recurring') = $5::text
+        )
+
+        AND (
+          $6::text = 'all'
+          OR pl.completion_status = $6::text
+        )
+
+      ORDER BY pl.patrol_time DESC
+      LIMIT 300
+      `,
+      [
+        site_id ? Number(site_id) : null,
+        point_id ? Number(point_id) : null,
+        from || null,
+        to || null,
+        type || "all",
+        status || "all",
+      ]
+    );
+
+    const siteIds = [
+      ...new Set(result.rows.map((row) => row.site_id).filter(Boolean)),
+    ];
+
+    let sitesById = {};
+
+    if (siteIds.length > 0) {
+      const sitesResult = await pool.query(
+        `
+        SELECT
+          id,
+          coverage_type,
+          shift_rules
+        FROM sites
+        WHERE id = ANY($1::int[])
+        `,
+        [siteIds]
+      );
+
+      sitesById = sitesResult.rows.reduce((acc, site) => {
+        acc[site.id] = site;
+        return acc;
+      }, {});
+    }
+
+    const historyWithShift = result.rows.map((row) => {
+      const site = sitesById[row.site_id];
+
+      return {
+        ...row,
+        shift_label: resolveShiftLabel(site, row.patrol_time),
+      };
+    });
+
+    res.json({
+      status: "ok",
+      history: historyWithShift,
+    });
+  } catch (err) {
+    console.error("Completed patrol history load error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load completed patrol history",
+      detail: err.message,
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
