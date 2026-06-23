@@ -6053,7 +6053,7 @@ AND gs.expected_slot < w.day_end
   OR
   (
     schedule_type = 'recurring'
-    AND scheduled_at >= NOW()
+AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
   )
   ORDER BY site_id, scheduled_at ASC
 ),
@@ -6074,9 +6074,9 @@ AND gs.expected_slot < w.day_end
               'YYYY-MM-DD"T"HH24:MI:SS.MS'
             )
             ELSE to_char(
-              u.scheduled_at AT TIME ZONE 'UTC',
-              'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-            )
+  u.scheduled_at,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+)
           END,
         'status',
   CASE
@@ -6093,16 +6093,16 @@ AND gs.expected_slot < w.day_end
     THEN 'due_soon'
 
   WHEN u.schedule_type = 'recurring'
-    AND u.scheduled_at < NOW() - INTERVAL '15 minutes'
-    THEN 'missed'
+  AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
+  THEN 'missed'
 
-  WHEN u.schedule_type = 'recurring'
-    AND u.scheduled_at < NOW()
-    THEN 'overdue'
+WHEN u.schedule_type = 'recurring'
+  AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens')
+  THEN 'overdue'
 
-  WHEN u.schedule_type = 'recurring'
-    AND u.scheduled_at <= NOW() + INTERVAL '5 minutes'
-    THEN 'due_soon'
+WHEN u.schedule_type = 'recurring'
+  AND u.scheduled_at <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes'
+  THEN 'due_soon'
 
   ELSE 'scheduled'
 END,
@@ -6153,9 +6153,9 @@ sn.next_patrol_type,
 
         CASE
   WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
-  WHEN sn.next_patrol < NOW() - INTERVAL '15 minutes' THEN 'missed'
-  WHEN sn.next_patrol < NOW() THEN 'overdue'
-  WHEN sn.next_patrol <= NOW() + INTERVAL '5 minutes' THEN 'due_soon'
+  WHEN sn.next_patrol < (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes' THEN 'missed'
+WHEN sn.next_patrol < (NOW() AT TIME ZONE 'Europe/Athens') THEN 'overdue'
+WHEN sn.next_patrol <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes' THEN 'due_soon'
   ELSE 'scheduled'
 END AS patrol_status,
 
