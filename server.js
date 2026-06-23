@@ -5979,15 +5979,23 @@ pl.longitude AS last_patrol_longitude
   LEFT JOIN patrol_points pp
     ON pp.id = ps.patrol_point_id
 
+  CROSS JOIN LATERAL (
+    SELECT
+      CASE
+        WHEN (ps.created_at AT TIME ZONE 'Europe/Athens')::date =
+             (NOW() AT TIME ZONE 'Europe/Athens')::date
+        THEN
+          (NOW() AT TIME ZONE 'Europe/Athens')::date + ps.start_time
+        ELSE
+          (NOW() AT TIME ZONE 'Europe/Athens')::date
+      END AS window_start,
+
+      ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day') AS window_end
+  ) w
+
   CROSS JOIN LATERAL generate_series(
-    (
-      (NOW() AT TIME ZONE 'Europe/Athens')::date
-      + ps.start_time
-    ) - INTERVAL '24 hours',
-    (
-      (NOW() AT TIME ZONE 'Europe/Athens')::date
-      + ps.start_time
-    ) + INTERVAL '24 hours',
+    w.window_start,
+    w.window_end,
     (ps.interval_hours || ' hours')::interval
   ) AS gs(expected_slot)
 
@@ -5996,6 +6004,7 @@ pl.longitude AS last_patrol_longitude
     AND pp.active = true
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
+    AND gs.expected_slot < w.window_end
 ),
 
       manual_next AS (
