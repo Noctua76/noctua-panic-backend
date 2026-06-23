@@ -5981,25 +5981,32 @@ pl.longitude AS last_patrol_longitude
 
   CROSS JOIN LATERAL (
   SELECT
-    ((NOW() AT TIME ZONE 'Europe/Athens')::date + ps.start_time)
-      AS window_start,
+    (
+      (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+      + ps.start_time
+    ) AS anchor_time,
 
-    ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day')
-      AS window_end
+    (NOW() AT TIME ZONE 'Europe/Athens')::date AS day_start,
+
+    (
+      (NOW() AT TIME ZONE 'Europe/Athens')::date
+      + INTERVAL '1 day'
+    ) AS day_end
 ) w
 
-  CROSS JOIN LATERAL generate_series(
-    w.window_start,
-    w.window_end,
-    (ps.interval_hours || ' hours')::interval
-  ) AS gs(expected_slot)
+CROSS JOIN LATERAL generate_series(
+  w.anchor_time,
+  w.anchor_time + INTERVAL '365 days',
+  (ps.interval_hours || ' hours')::interval
+) AS gs(expected_slot)
 
   WHERE ps.schedule_type = 'recurring'
     AND ps.active = true
     AND pp.active = true
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
-    AND gs.expected_slot < w.window_end
+    AND gs.expected_slot >= w.day_start
+AND gs.expected_slot < w.day_end
 ),
 
       manual_next AS (
