@@ -5914,6 +5914,60 @@ updated_points: updatePointsResult.rows,
   }
 });
 
+app.get("/settings/sites/:siteId/patrol-schedules", async (req, res) => {
+  try {
+    const { siteId } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT
+        ps.id,
+        ps.site_id,
+        ps.patrol_point_id,
+        pp.point_name,
+        ps.schedule_type,
+        ps.interval_hours,
+        ps.start_time,
+        ps.end_time,
+        ps.scheduled_date,
+        ps.scheduled_time,
+        ps.reminder_minutes_before,
+        ps.active,
+        ps.created_at,
+        ps.created_by_admin_id,
+        ps.created_by_username,
+        ps.created_by_role,
+        ps.manual_status,
+        ps.cancelled_at,
+        ps.cancelled_by_username,
+        ps.cancel_reason
+      FROM patrol_schedules ps
+      LEFT JOIN patrol_points pp
+        ON pp.id = ps.patrol_point_id
+      WHERE ps.site_id = $1
+      ORDER BY
+        ps.active DESC,
+        ps.created_at DESC,
+        ps.id DESC
+      `,
+      [siteId]
+    );
+
+    res.json({
+      status: "ok",
+      schedules: result.rows,
+    });
+  } catch (err) {
+    console.error("Get patrol schedules error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load patrol schedules",
+      detail: err.message,
+    });
+  }
+});
+
 app.get("/patrols/sites", async (req, res) => {
   try {
     const result = await pool.query(`
