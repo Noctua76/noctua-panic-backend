@@ -7491,6 +7491,369 @@ if (status && status !== "all") {
   }
 });
 
+app.get("/patrols/completed-history/report/pdf", async (req, res) => {
+  let browser;
+
+  try {
+    const {
+      site_id,
+      from,
+      to,
+      point_id,
+      type = "all",
+      status = "all",
+    } = req.query;
+
+    const params = new URLSearchParams();
+
+    if (site_id) params.append("site_id", site_id);
+    if (from) params.append("from", from);
+    if (to) params.append("to", to);
+    if (point_id) params.append("point_id", point_id);
+    if (type) params.append("type", type);
+    if (status) params.append("status", status);
+
+    const historyResponse = await fetch(
+      `${req.protocol}://${req.get("host")}/patrols/completed-history?${params.toString()}`
+    );
+
+    const data = await historyResponse.json();
+
+    if (data.status !== "ok") {
+      return res.status(404).json({
+        status: "error",
+        message: "Completed patrol history not found",
+      });
+    }
+
+    const history = data.history || [];
+
+    const totalCompleted = history.length;
+    const completedLate = history.filter(
+      (item) => item.display_status === "completed_late"
+    ).length;
+    const missedCompletedLate = history.filter(
+      (item) => item.display_status === "missed_completed_late"
+    ).length;
+    const completedOnTime = history.filter(
+      (item) => item.display_status === "completed"
+    ).length;
+
+    const siteName = history[0]?.site_name || "Selected Site";
+    const siteLocation = history[0]?.site_location || "-";
+
+    const reportId = `COMPLETED-PATROL-${site_id || "ALL"}-${Date.now()}`;
+
+    const formatStatus = (value) => {
+      if (value === "missed_completed_late") return "Missed Completed Late";
+      if (value === "completed_late") return "Completed Late";
+      return "Completed";
+    };
+
+    const rowsHtml = history
+      .map(
+        (item) => `
+          <tr>
+            <td>${escapeHtml(
+              new Date(item.patrol_time).toLocaleString("el-GR", {
+                timeZone: "Europe/Athens",
+              })
+            )}</td>
+            <td>${escapeHtml(item.site_name)}</td>
+            <td>${escapeHtml(item.point_name)}</td>
+            <td>${escapeHtml(item.guard_name || "-")}</td>
+            <td>${escapeHtml(
+              item.schedule_type === "manual"
+                ? "Manual Patrol"
+                : "Routine Patrol"
+            )}</td>
+            <td>${escapeHtml(formatStatus(item.display_status))}</td>
+            <td>${escapeHtml(
+              item.delay_minutes !== null && item.delay_minutes !== undefined
+                ? `${item.delay_minutes} minutes`
+                : "-"
+            )}</td>
+            <td>${escapeHtml(item.shift_label || "-")}</td>
+            <td>${escapeHtml(
+              item.accuracy ? `${Number(item.accuracy).toFixed(2)} m` : "-"
+            )}</td>
+            <td>${escapeHtml(
+              item.latitude && item.longitude
+                ? `${item.latitude}, ${item.longitude}`
+                : "-"
+            )}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const html = `
+      <html>
+        <head>
+          <title>Completed Patrol History Report</title>
+          <style>
+            @page { margin: 16mm; }
+
+            body {
+              font-family: Arial, sans-serif;
+              color: #111;
+              margin: 0;
+              padding: 28px 34px;
+              box-sizing: border-box;
+            }
+
+            .report-header {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              border-bottom: 3px solid #111827;
+              padding-bottom: 18px;
+              margin-bottom: 28px;
+            }
+
+            .brand-title h1 {
+              margin: 0;
+              font-size: 28px;
+              letter-spacing: 1px;
+            }
+
+            .brand-title p {
+              margin: 4px 0 0;
+              color: #555;
+              font-size: 14px;
+            }
+
+            .report-meta {
+              text-align: right;
+              font-size: 13px;
+              color: #444;
+            }
+
+            .summary-grid {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: 10px 28px;
+              margin-bottom: 28px;
+            }
+
+            .summary-item {
+              border-bottom: 1px solid #eee;
+              padding-bottom: 8px;
+            }
+
+            .label {
+              display: block;
+              font-size: 11px;
+              text-transform: uppercase;
+              color: #666;
+              letter-spacing: .6px;
+              margin-bottom: 3px;
+            }
+
+            .value {
+              font-size: 15px;
+              font-weight: 600;
+            }
+
+            h2 {
+              margin-top: 30px;
+              border-bottom: 1px solid #ddd;
+              padding-bottom: 8px;
+              font-size: 18px;
+            }
+
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              margin-top: 10px;
+            }
+
+            th {
+              text-align: left;
+              background: #111827;
+              color: #fff;
+              padding: 9px 8px;
+              font-size: 12px;
+            }
+
+            td {
+              border-bottom: 1px solid #eee;
+              padding: 9px 8px;
+              font-size: 12px;
+              vertical-align: top;
+            }
+
+            .footer {
+              margin-top: 36px;
+              padding-top: 14px;
+              border-top: 1px solid #ddd;
+              font-size: 12px;
+              color: #555;
+              display: flex;
+              justify-content: space-between;
+            }
+          </style>
+        </head>
+
+        <body>
+          <div class="report-header">
+            <div class="brand-title">
+              <h1>AEGIS LINK</h1>
+              <p>Security Operations Platform</p>
+            </div>
+
+            <div class="report-meta">
+              <strong>Completed Patrol History Report</strong><br/>
+              Report ID: ${escapeHtml(reportId)}<br/>
+              Generated: ${escapeHtml(
+                new Date().toLocaleString("el-GR", {
+                  timeZone: "Europe/Athens",
+                })
+              )}<br/>
+              Generated By: System
+            </div>
+          </div>
+
+          <div class="summary-grid">
+            <div class="summary-item">
+              <span class="label">Site</span>
+              <span class="value">${escapeHtml(siteName)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Location</span>
+              <span class="value">${escapeHtml(siteLocation)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">From Date</span>
+              <span class="value">${escapeHtml(from || "-")}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">To Date</span>
+              <span class="value">${escapeHtml(to || "-")}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Patrol Type</span>
+              <span class="value">${escapeHtml(
+                type === "manual"
+                  ? "Manual Patrols"
+                  : type === "recurring"
+                  ? "Routine Patrols"
+                  : "All Patrols"
+              )}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Completion Status</span>
+              <span class="value">${escapeHtml(
+                status === "completed"
+                  ? "Completed"
+                  : status === "completed_late"
+                  ? "Completed Late"
+                  : status === "missed_completed_late"
+                  ? "Missed Completed Late"
+                  : "All Completed"
+              )}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Total Completed</span>
+              <span class="value">${escapeHtml(totalCompleted)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Completed On Time</span>
+              <span class="value">${escapeHtml(completedOnTime)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Completed Late</span>
+              <span class="value">${escapeHtml(completedLate)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Missed Completed Late</span>
+              <span class="value">${escapeHtml(missedCompletedLate)}</span>
+            </div>
+          </div>
+
+          <h2>Completed Patrol Log</h2>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Date / Time</th>
+                <th>Site</th>
+                <th>Patrol Point</th>
+                <th>Guard</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Delay</th>
+                <th>Shift</th>
+                <th>Accuracy</th>
+                <th>Coordinates</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+          </table>
+
+          <div class="footer">
+            <span>Aegis Link Security Operations Platform</span>
+            <span>Generated Automatically</span>
+          </div>
+        </body>
+      </html>
+    `;
+
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const page = await browser.newPage();
+
+    await page.setContent(html, {
+      waitUntil: "networkidle0",
+    });
+
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      landscape: true,
+    });
+
+    await browser.close();
+
+    res.setHeader("Content-Type", "application/pdf");
+
+    const disposition = req.query.preview === "true" ? "inline" : "attachment";
+
+    res.setHeader(
+      "Content-Disposition",
+      `${disposition}; filename="${reportId}.pdf"`
+    );
+
+    res.send(pdfBuffer);
+  } catch (err) {
+    if (browser) {
+      await browser.close();
+    }
+
+    console.error("Completed patrol history PDF error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to generate completed patrol PDF report",
+      error: err.message,
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
