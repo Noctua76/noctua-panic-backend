@@ -6021,6 +6021,8 @@ pl.longitude AS last_patrol_longitude
 
         WHERE ps.schedule_type = 'manual'
   AND ps.active = true
+  AND ps.scheduled_date =
+      (NOW() AT TIME ZONE 'Europe/Athens')::date
       ),
 
       upcoming AS (
