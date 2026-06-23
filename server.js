@@ -5787,10 +5787,14 @@ app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) 
     const { siteId } = req.params;
 
     const {
-      interval_hours,
-      reminder_minutes_before = 5,
-      schedule_scope = "24_7",
-    } = req.body;
+  interval_hours,
+  start_time,
+  reminder_minutes_before = 5,
+  schedule_scope = "24_7",
+  created_by_admin_id,
+  created_by_username,
+  created_by_role,
+} = req.body;
 
     if (!interval_hours) {
       return res.status(400).json({
@@ -5798,6 +5802,27 @@ app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) 
         message: "interval_hours is required",
       });
     }
+
+    if (!start_time) {
+  return res.status(400).json({
+    status: "error",
+    message: "start_time is required",
+  });
+}
+
+if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start_time)) {
+  return res.status(400).json({
+    status: "error",
+    message: "start_time must be in HH:mm format",
+  });
+}
+
+if (!created_by_username) {
+  return res.status(400).json({
+    status: "error",
+    message: "created_by_username is required",
+  });
+}
 
     const intervalMinutes = Number(interval_hours) * 60;
 
@@ -5839,23 +5864,31 @@ app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) 
       const result = await pool.query(
         `
         INSERT INTO patrol_schedules (
-          site_id,
-          patrol_point_id,
-          schedule_type,
-          interval_hours,
-          reminder_minutes_before,
-          active,
-          created_at
-        )
-        VALUES ($1,$2,'recurring',$3,$4,true,NOW())
-        RETURNING *
+  site_id,
+  patrol_point_id,
+  schedule_type,
+  interval_hours,
+  start_time,
+  reminder_minutes_before,
+  active,
+  created_at,
+  created_by_admin_id,
+  created_by_username,
+  created_by_role
+)
+VALUES ($1,$2,'recurring',$3,$4,$5,true,NOW(),$6,$7,$8)
+RETURNING *
         `,
         [
-          siteId,
-          point.id,
-          Number(interval_hours),
-          Number(reminder_minutes_before),
-        ]
+  siteId,
+  point.id,
+  Number(interval_hours),
+  start_time,
+  Number(reminder_minutes_before),
+  created_by_admin_id || null,
+  created_by_username,
+  created_by_role || "admin",
+]
       );
 
       inserted.push(result.rows[0]);
