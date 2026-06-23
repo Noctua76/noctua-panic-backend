@@ -5980,18 +5980,13 @@ pl.longitude AS last_patrol_longitude
     ON pp.id = ps.patrol_point_id
 
   CROSS JOIN LATERAL (
-    SELECT
-      CASE
-        WHEN (ps.created_at AT TIME ZONE 'Europe/Athens')::date =
-             (NOW() AT TIME ZONE 'Europe/Athens')::date
-        THEN
-          (NOW() AT TIME ZONE 'Europe/Athens')::date + ps.start_time
-        ELSE
-          (NOW() AT TIME ZONE 'Europe/Athens')::date
-      END AS window_start,
+  SELECT
+    ((NOW() AT TIME ZONE 'Europe/Athens')::date + ps.start_time)
+      AS window_start,
 
-      ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day') AS window_end
-  ) w
+    ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day')
+      AS window_end
+) w
 
   CROSS JOIN LATERAL generate_series(
     w.window_start,
