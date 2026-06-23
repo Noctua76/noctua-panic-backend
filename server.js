@@ -5969,30 +5969,33 @@ pl.longitude AS last_patrol_longitude
 
       recurring_next AS (
   SELECT
-    pp.site_id,
-    pp.id AS point_id,
+    ps.site_id,
+    ps.patrol_point_id AS point_id,
     pp.point_name,
     'recurring' AS schedule_type,
     gs.expected_slot AS scheduled_at
-  FROM patrol_points pp
+  FROM patrol_schedules ps
 
-  LEFT JOIN LATERAL (
-    SELECT MAX(pl.patrol_time) AS last_patrol_time
-    FROM patrol_logs pl
-    WHERE pl.point_id = pp.id
-  ) last_log ON true
+  LEFT JOIN patrol_points pp
+    ON pp.id = ps.patrol_point_id
 
   CROSS JOIN LATERAL generate_series(
-    COALESCE(
-      last_log.last_patrol_time + (pp.expected_interval_minutes || ' minutes')::interval,
-      NOW()
-    ),
-    NOW() + (pp.expected_interval_minutes || ' minutes')::interval,
-    (pp.expected_interval_minutes || ' minutes')::interval
+    (
+      (NOW() AT TIME ZONE 'Europe/Athens')::date
+      + ps.start_time
+    ) - INTERVAL '24 hours',
+    (
+      (NOW() AT TIME ZONE 'Europe/Athens')::date
+      + ps.start_time
+    ) + INTERVAL '24 hours',
+    (ps.interval_hours || ' hours')::interval
   ) AS gs(expected_slot)
 
-  WHERE pp.active = true
-    AND pp.expected_interval_minutes IS NOT NULL
+  WHERE ps.schedule_type = 'recurring'
+    AND ps.active = true
+    AND pp.active = true
+    AND ps.start_time IS NOT NULL
+    AND ps.interval_hours IS NOT NULL
 ),
 
       manual_next AS (
