@@ -6200,7 +6200,13 @@ END,
         lpd.last_patrol_accuracy,
         lpd.last_patrol_latitude,
         lpd.last_patrol_longitude,
-        sn.next_patrol,
+        CASE
+  WHEN sn.next_patrol IS NULL THEN NULL
+  ELSE to_char(
+    sn.next_patrol,
+    'YYYY-MM-DD"T"HH24:MI:SS.MS'
+  )
+END AS next_patrol,
 sn.next_patrol_point_id,
 sn.next_patrol_point,
 sn.next_patrol_type,
