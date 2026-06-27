@@ -5318,6 +5318,246 @@ app.get("/settings/sites/:siteId/patrol-points", async (req, res) => {
   }
 });
 
+app.get("/guard/patrols/board", async (req, res) => {
+  try {
+    const { guard_id, session_id } = req.query;
+
+    if (!guard_id || !session_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "guard_id and session_id are required",
+      });
+    }
+
+    const sessionResult = await pool.query(
+      `
+      SELECT
+        gs.id AS session_id,
+        gs.guard_id,
+        gs.site_id,
+        gs.login_time,
+        gs.logout_time,
+        g.full_name AS guard_name,
+        s.name AS site_name,
+        s.location AS site_location
+      FROM guard_sessions gs
+      LEFT JOIN guards g
+        ON g.id = gs.guard_id
+      LEFT JOIN sites s
+        ON s.id = gs.site_id
+      WHERE gs.id = $1
+        AND gs.guard_id = $2
+        AND gs.logout_time IS NULL
+      LIMIT 1
+      `,
+      [session_id, guard_id]
+    );
+
+    if (sessionResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Active guard session not found",
+      });
+    }
+
+    const session = sessionResult.rows[0];
+
+    const boardResult = await pool.query(
+      `
+      WITH active_session AS (
+        SELECT
+          $1::int AS guard_id,
+          $2::int AS session_id,
+          $3::int AS site_id
+      ),
+
+      recurring_slots AS (
+        SELECT
+          NULL::integer AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'recurring' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          pp.qr_token,
+          ps.reminder_minutes_before,
+          gs.expected_slot AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        CROSS JOIN LATERAL (
+          SELECT
+            (
+              (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+              + ps.start_time
+            ) AS anchor_time,
+            (NOW() AT TIME ZONE 'Europe/Athens')::date AS day_start,
+            ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day') AS day_end
+        ) w
+
+        CROSS JOIN LATERAL generate_series(
+          w.anchor_time,
+          w.anchor_time + INTERVAL '365 days',
+          (ps.interval_hours || ' hours')::interval
+        ) AS gs(expected_slot)
+
+        WHERE ps.schedule_type = 'recurring'
+          AND ps.active = true
+          AND ps.site_id = (SELECT site_id FROM active_session)
+          AND ps.start_time IS NOT NULL
+          AND ps.interval_hours IS NOT NULL
+          AND gs.expected_slot >= w.day_start
+          AND gs.expected_slot < w.day_end
+      ),
+
+      manual_slots AS (
+        SELECT
+          ps.id AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'manual' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          pp.qr_token,
+          ps.reminder_minutes_before,
+          (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        WHERE ps.schedule_type = 'manual'
+          AND ps.active = true
+          AND ps.site_id = (SELECT site_id FROM active_session)
+          AND ps.scheduled_date = (NOW() AT TIME ZONE 'Europe/Athens')::date
+      ),
+
+      patrol_items AS (
+        SELECT * FROM recurring_slots
+        UNION ALL
+        SELECT * FROM manual_slots
+      ),
+
+      enriched AS (
+        SELECT
+          pi.*,
+
+          (
+            pi.scheduled_at
+            - (COALESCE(pi.reminder_minutes_before, 5) || ' minutes')::interval
+          ) AS scan_available_from,
+
+          (
+            pi.scheduled_at + INTERVAL '15 minutes'
+          ) AS scan_available_until,
+
+          EXISTS (
+            SELECT 1
+            FROM patrol_logs pl
+            WHERE pl.site_id = pi.site_id
+              AND pl.point_id = pi.point_id
+              AND COALESCE(pl.schedule_type, pi.schedule_type) = pi.schedule_type
+              AND (
+                pi.schedule_type = 'manual'
+                AND pl.schedule_id = pi.schedule_id
+                OR
+                pi.schedule_type = 'recurring'
+                AND pl.scheduled_at = pi.scheduled_at
+              )
+          ) AS already_completed
+        FROM patrol_items pi
+      )
+
+      SELECT
+        schedule_instance_id,
+        schedule_id,
+        schedule_type,
+        site_id,
+        point_id,
+        checkpoint,
+        qr_token,
+        reminder_minutes_before,
+        to_char(scheduled_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scheduled_at,
+        to_char(scan_available_from, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_from,
+        to_char(scan_available_until, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_until,
+
+        CASE
+          WHEN already_completed = true
+            THEN 'completed'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < scan_available_from
+            THEN 'scheduled'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= scan_available_from
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < scheduled_at
+            THEN 'due_soon'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= scheduled_at
+            AND (NOW() AT TIME ZONE 'Europe/Athens') <= scan_available_until
+            THEN 'overdue'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') > scan_available_until
+            THEN 'missed'
+
+          ELSE 'scheduled'
+        END AS status,
+
+        CASE
+          WHEN already_completed = true THEN false
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= scan_available_from
+            AND (NOW() AT TIME ZONE 'Europe/Athens') <= scan_available_until
+            THEN true
+          ELSE false
+        END AS scan_enabled,
+
+        FLOOR(
+          EXTRACT(
+            EPOCH FROM (
+              (NOW() AT TIME ZONE 'Europe/Athens') - scheduled_at
+            )
+          ) / 60
+        )::int AS minutes_delta
+
+      FROM enriched
+
+      ORDER BY scheduled_at ASC, point_id ASC
+      `,
+      [guard_id, session_id, session.site_id]
+    );
+
+    res.json({
+      status: "ok",
+      guard: {
+        id: session.guard_id,
+        name: session.guard_name,
+      },
+      session: {
+        id: session.session_id,
+        site_id: session.site_id,
+        login_time: session.login_time,
+      },
+      site: {
+        id: session.site_id,
+        name: session.site_name,
+        location: session.site_location,
+      },
+      patrols: boardResult.rows,
+    });
+  } catch (err) {
+    console.error("Guard patrol board error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load guard patrol board",
+      detail: err.message,
+    });
+  }
+});
+
 app.post("/patrol/scan", async (req, res) => {
   const {
     token,
