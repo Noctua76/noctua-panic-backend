@@ -5559,240 +5559,290 @@ app.get("/guard/patrols/board", async (req, res) => {
 });
 
 app.post("/patrol/scan", async (req, res) => {
-  const {
-    token,
-    latitude,
-    longitude,
-    accuracy,
-  } = req.body;
-
-  if (!token) {
-    return res.status(400).json({
-      status: "error",
-      message: "QR token is required",
-    });
-  }
-
   try {
-    const pointResult = await pool.query(
-      `
-      SELECT
-        pp.id AS point_id,
-        pp.site_id,
-        pp.point_name,
-        pp.active,
-pp.expected_interval_minutes,
-s.name AS site_name
-      FROM patrol_points pp
-      LEFT JOIN sites s
-        ON s.id = pp.site_id
-      WHERE pp.qr_token = $1
-      `,
-      [token]
-    );
+    const {
+      schedule_id,
+      schedule_type,
+      scheduled_at,
+      guard_id,
+      session_id,
+      qr_token,
+      latitude,
+      longitude,
+      accuracy,
+    } = req.body;
 
-    if (pointResult.rows.length === 0) {
-      return res.status(404).json({
+    if (
+      !schedule_id ||
+      !schedule_type ||
+      !scheduled_at ||
+      !guard_id ||
+      !session_id ||
+      !qr_token
+    ) {
+      return res.status(400).json({
         status: "error",
-        message: "Invalid patrol QR token",
+        message:
+          "schedule_id, schedule_type, scheduled_at, guard_id, session_id and qr_token are required",
       });
     }
 
-    const point = pointResult.rows[0];
-
-    if (!point.active) {
-      return res.status(403).json({
+    if (!["manual", "recurring"].includes(schedule_type)) {
+      return res.status(400).json({
         status: "error",
-        message: "This patrol point is inactive",
+        message: "schedule_type must be manual or recurring",
       });
     }
 
-    const guardResult = await pool.query(
+    const sessionResult = await pool.query(
       `
       SELECT
-        gs.guard_id
+        gs.id AS session_id,
+        gs.guard_id,
+        gs.site_id,
+        gs.login_time,
+        gs.logout_time
       FROM guard_sessions gs
-      WHERE gs.site_id = $1
+      WHERE gs.id = $1
+        AND gs.guard_id = $2
         AND gs.logout_time IS NULL
-      ORDER BY gs.login_time DESC
       LIMIT 1
       `,
-      [point.site_id]
+      [session_id, guard_id]
     );
 
-    const guardId =
-      guardResult.rows.length > 0
-        ? guardResult.rows[0].guard_id
-        : null;
+    if (sessionResult.rows.length === 0) {
+      return res.status(403).json({
+        status: "error",
+        message: "Active guard session not found",
+      });
+    }
 
-        const scheduleResult = await pool.query(
-  `
-  WITH manual_candidates AS (
-    SELECT
-      ps.id AS schedule_id,
-      'manual' AS schedule_type,
-      (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
-    FROM patrol_schedules ps
-    WHERE ps.patrol_point_id = $1
-      AND ps.site_id = $2
-      AND ps.schedule_type = 'manual'
-      AND ps.active = true
-      AND (ps.scheduled_date::timestamp + ps.scheduled_time) <= NOW()
-      AND (ps.scheduled_date::timestamp + ps.scheduled_time) >= NOW() - INTERVAL '24 hours'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM patrol_logs pl
-        WHERE pl.schedule_id = ps.id
-          AND pl.schedule_type = 'manual'
+    const activeSession = sessionResult.rows[0];
+
+    const patrolResult = await pool.query(
+      `
+      SELECT
+        ps.id AS schedule_id,
+        ps.schedule_type,
+        ps.site_id,
+        ps.patrol_point_id AS point_id,
+        pp.point_name,
+        pp.qr_token,
+        pp.active AS point_active,
+        ps.reminder_minutes_before,
+
+        CASE
+          WHEN ps.schedule_type = 'manual'
+            THEN (ps.scheduled_date::timestamp + ps.scheduled_time)
+          ELSE $3::timestamp
+        END AS resolved_scheduled_at
+
+      FROM patrol_schedules ps
+
+      JOIN patrol_points pp
+        ON pp.id = ps.patrol_point_id
+
+      WHERE ps.id = $1
+        AND ps.schedule_type = $2
+        AND ps.active = true
+        AND pp.active = true
+      LIMIT 1
+      `,
+      [schedule_id, schedule_type, scheduled_at]
+    );
+
+    if (patrolResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Scheduled patrol not found or inactive",
+      });
+    }
+
+    const patrol = patrolResult.rows[0];
+
+    if (Number(patrol.site_id) !== Number(activeSession.site_id)) {
+      return res.status(403).json({
+        status: "error",
+        message: "Patrol does not belong to active guard site",
+      });
+    }
+
+    if (String(patrol.qr_token) !== String(qr_token)) {
+      return res.status(403).json({
+        status: "error",
+        message: "QR token does not match this patrol checkpoint",
+      });
+    }
+
+    const windowResult = await pool.query(
+      `
+      SELECT
+        $1::timestamp AS scheduled_at,
+
+        (
+          $1::timestamp
+          - (COALESCE($2::int, 5) || ' minutes')::interval
+        ) AS scan_available_from,
+
+        (
+          $1::timestamp + INTERVAL '15 minutes'
+        ) AS scan_available_until,
+
+        (NOW() AT TIME ZONE 'Europe/Athens') AS now_athens
+      `,
+      [
+        patrol.resolved_scheduled_at,
+        patrol.reminder_minutes_before || 5,
+      ]
+    );
+
+    const scanWindow = windowResult.rows[0];
+
+    if (new Date(scanWindow.now_athens) < new Date(scanWindow.scan_available_from)) {
+      return res.status(403).json({
+        status: "error",
+        message: "Scan not allowed yet",
+        current_status: "scheduled",
+        scan_enabled: false,
+        scan_available_from: scanWindow.scan_available_from,
+        scan_available_until: scanWindow.scan_available_until,
+      });
+    }
+
+    if (new Date(scanWindow.now_athens) > new Date(scanWindow.scan_available_until)) {
+      return res.status(409).json({
+        status: "error",
+        message: "Patrol missed",
+        current_status: "missed",
+        scan_enabled: false,
+        scan_available_from: scanWindow.scan_available_from,
+        scan_available_until: scanWindow.scan_available_until,
+      });
+    }
+
+    const duplicateResult = await pool.query(
+      `
+      SELECT id
+      FROM patrol_logs
+      WHERE site_id = $1
+        AND point_id = $2
+        AND schedule_id = $3
+        AND schedule_type = $4
+        AND scheduled_at = $5::timestamp
+      LIMIT 1
+      `,
+      [
+        patrol.site_id,
+        patrol.point_id,
+        schedule_id,
+        schedule_type,
+        scanWindow.scheduled_at,
+      ]
+    );
+
+    if (duplicateResult.rows.length > 0) {
+      return res.status(409).json({
+        status: "error",
+        message: "This patrol has already been completed",
+        patrol_log_id: duplicateResult.rows[0].id,
+      });
+    }
+
+    const delayResult = await pool.query(
+      `
+      SELECT
+        GREATEST(
+          0,
+          FLOOR(
+            EXTRACT(
+              EPOCH FROM (
+                (NOW() AT TIME ZONE 'Europe/Athens') - $1::timestamp
+              )
+            ) / 60
+          )
+        )::int AS delay_minutes
+      `,
+      [scanWindow.scheduled_at]
+    );
+
+    const delayMinutes = delayResult.rows[0].delay_minutes;
+
+    const insertResult = await pool.query(
+      `
+      INSERT INTO patrol_logs (
+        site_id,
+        point_id,
+        guard_id,
+        session_id,
+        qr_token,
+        latitude,
+        longitude,
+        accuracy,
+        patrol_time,
+        scheduled_at,
+        delay_minutes,
+        completion_status,
+        was_missed,
+        schedule_id,
+        schedule_type,
+        scan_available_from,
+        scan_available_until
       )
-  ),
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,
+        NOW(),
+        $9,$10,
+        'completed',
+        false,
+        $11,$12,$13,$14
+      )
+      RETURNING *
+      `,
+      [
+        patrol.site_id,
+        patrol.point_id,
+        guard_id,
+        session_id,
+        qr_token,
+        latitude || null,
+        longitude || null,
+        accuracy || null,
+        scanWindow.scheduled_at,
+        delayMinutes,
+        schedule_id,
+        schedule_type,
+        scanWindow.scan_available_from,
+        scanWindow.scan_available_until,
+      ]
+    );
 
-  last_recurring_completion AS (
-    SELECT MAX(pl.patrol_time) AS last_patrol_time
-    FROM patrol_logs pl
-    WHERE pl.point_id = $1
-      AND pl.site_id = $2
-      AND COALESCE(pl.schedule_type, 'recurring') = 'recurring'
-  ),
-
-  recurring_candidate AS (
-    SELECT
-      NULL::integer AS schedule_id,
-      'recurring' AS schedule_type,
-      CASE
-        WHEN $3::int IS NULL THEN NULL
-        WHEN lrc.last_patrol_time IS NULL THEN NULL
-        ELSE
-          lrc.last_patrol_time +
-          (
-            FLOOR(
-              EXTRACT(EPOCH FROM (NOW() - lrc.last_patrol_time))
-              / 60
-              / $3::int
-            ) * $3::int || ' minutes'
-          )::interval
-      END AS scheduled_at
-    FROM last_recurring_completion lrc
-  ),
-
-  candidates AS (
-    SELECT schedule_id, schedule_type, scheduled_at
-    FROM manual_candidates
-
-    UNION ALL
-
-    SELECT schedule_id, schedule_type, scheduled_at
-    FROM recurring_candidate
-    WHERE scheduled_at IS NOT NULL
-      AND scheduled_at <= NOW()
-      AND scheduled_at >= NOW() - INTERVAL '24 hours'
-  )
-
-  SELECT
-    schedule_id,
-    schedule_type,
-    scheduled_at,
-    GREATEST(
-      0,
-      FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / 60)
-    )::int AS delay_minutes
-  FROM candidates
-  WHERE scheduled_at IS NOT NULL
-  ORDER BY scheduled_at ASC
-  LIMIT 1
-  `,
-  [
-    point.point_id,
-    point.site_id,
-    point.expected_interval_minutes || null,
-  ]
-);
-
-const matchedSchedule = scheduleResult.rows[0] || null;
-
-const scheduleId = matchedSchedule?.schedule_id || null;
-const scheduleType = matchedSchedule?.schedule_type || "unscheduled";
-const scheduledAt = matchedSchedule?.scheduled_at || null;
-
-const delayMinutes =
-  matchedSchedule?.delay_minutes !== undefined
-    ? matchedSchedule.delay_minutes
-    : null;
-
-const wasMissed =
-  delayMinutes !== null && Number(delayMinutes) >= 15;
-
-const completionStatus =
-  delayMinutes === null
-    ? "completed"
-    : Number(delayMinutes) === 0
-    ? "completed_on_time"
-    : Number(delayMinutes) >= 15
-    ? "missed_completed_late"
-    : "completed_late";
-
-const insertResult = await pool.query(
-  `
-  INSERT INTO patrol_logs (
-    site_id,
-    point_id,
-    guard_id,
-    qr_token,
-    latitude,
-    longitude,
-    accuracy,
-    scheduled_at,
-    delay_minutes,
-    completion_status,
-    was_missed,
-    schedule_id,
-    schedule_type
-  )
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-  RETURNING *
-  `,
-  [
-    point.site_id,
-    point.point_id,
-    guardId,
-    token,
-    latitude || null,
-    longitude || null,
-    accuracy || null,
-    scheduledAt,
-    delayMinutes,
-    completionStatus,
-    wasMissed,
-    scheduleId,
-    scheduleType,
-  ]
-);
-
-if (scheduleId && scheduleType === "manual") {
-  await pool.query(
-    `
-    UPDATE patrol_schedules
-    SET
-      active = false,
-      manual_status = $2
-    WHERE id = $1
-    `,
-    [
-      scheduleId,
-      completionStatus,
-    ]
-  );
-}
+    if (schedule_type === "manual") {
+      await pool.query(
+        `
+        UPDATE patrol_schedules
+        SET
+          active = false,
+          manual_status = 'completed'
+        WHERE id = $1
+          AND schedule_type = 'manual'
+        `,
+        [schedule_id]
+      );
+    }
 
     res.json({
       status: "ok",
-      message: "Patrol recorded successfully",
+      message: "Patrol completed successfully",
       patrol: insertResult.rows[0],
-      point: {
-        id: point.point_id,
-        name: point.point_name,
-        site_id: point.site_id,
-        site_name: point.site_name,
+      checkpoint: {
+        id: patrol.point_id,
+        name: patrol.point_name,
+      },
+      scan_window: {
+        scheduled_at: scanWindow.scheduled_at,
+        scan_available_from: scanWindow.scan_available_from,
+        scan_available_until: scanWindow.scan_available_until,
       },
     });
   } catch (err) {
@@ -5800,7 +5850,7 @@ if (scheduleId && scheduleType === "manual") {
 
     res.status(500).json({
       status: "error",
-      message: "Failed to record patrol scan",
+      message: "Failed to complete patrol scan",
       detail: err.message,
     });
   }
