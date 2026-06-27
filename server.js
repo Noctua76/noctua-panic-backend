@@ -5240,6 +5240,43 @@ app.get("/setup/patrol-log-lifecycle-upgrade", async (req, res) => {
   }
 });
 
+app.get("/setup/patrol-scan-window-upgrade", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE patrol_logs
+      ADD COLUMN IF NOT EXISTS schedule_id INTEGER,
+      ADD COLUMN IF NOT EXISTS schedule_type VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS session_id INTEGER,
+      ADD COLUMN IF NOT EXISTS scan_available_from TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS scan_available_until TIMESTAMP;
+    `);
+
+    await pool.query(`
+      ALTER TABLE patrol_schedules
+      ADD COLUMN IF NOT EXISTS manual_status VARCHAR(50) DEFAULT 'pending',
+      ADD COLUMN IF NOT EXISTS created_by_admin_id INTEGER,
+      ADD COLUMN IF NOT EXISTS created_by_username VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS created_by_role VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS cancelled_by_username VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
+    `);
+
+    res.json({
+      status: "ok",
+      message: "Patrol scan window upgrade completed",
+    });
+  } catch (err) {
+    console.error("Patrol scan window upgrade error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to upgrade patrol scan window fields",
+      detail: err.message,
+    });
+  }
+});
+
 // ----------------------------------------------------------
 // QR PATROL POINTS API
 // ----------------------------------------------------------
