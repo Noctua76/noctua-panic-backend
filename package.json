@@ -24,6 +24,7 @@
     "openai": "^6.9.1",
     "pg": "^8.20.0",
     "puppeteer": "^25.1.0",
+    "web-push": "^3.6.7",
     "ws": "^8.21.0"
   },
   "devDependencies": {

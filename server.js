@@ -10,6 +10,13 @@ const puppeteer = require("puppeteer");
 const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const WebSocket = require("ws");
+const webpush = require("web-push");
+
+webpush.setVapidDetails(
+  process.env.VAPID_SUBJECT,
+  process.env.VAPID_PUBLIC_KEY,
+  process.env.VAPID_PRIVATE_KEY
+);
 
 const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n')
   ? process.env.VONAGE_PRIVATE_KEY.replace(/\\n/g, '\n')
@@ -5553,6 +5560,124 @@ app.get("/guard/patrols/board", async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Failed to load guard patrol board",
+      detail: err.message,
+    });
+  }
+});
+
+// ==========================
+// Push Notifications
+// ==========================
+
+app.get("/push/vapid-public-key", (req, res) => {
+  res.json({
+    status: "ok",
+    publicKey: process.env.VAPID_PUBLIC_KEY,
+  });
+});
+
+app.post("/push/subscribe", async (req, res) => {
+  try {
+    const {
+      guard_id,
+      session_id,
+      subscription,
+      user_agent,
+      device_name,
+    } = req.body;
+
+    if (!guard_id || !session_id || !subscription) {
+      return res.status(400).json({
+        status: "error",
+        message: "guard_id, session_id and subscription are required",
+      });
+    }
+
+    if (
+      !subscription.endpoint ||
+      !subscription.keys ||
+      !subscription.keys.p256dh ||
+      !subscription.keys.auth
+    ) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid push subscription payload",
+      });
+    }
+
+    const sessionResult = await pool.query(
+      `
+      SELECT id, guard_id, site_id, logout_time
+      FROM guard_sessions
+      WHERE id = $1
+        AND guard_id = $2
+        AND logout_time IS NULL
+      LIMIT 1
+      `,
+      [session_id, guard_id]
+    );
+
+    if (sessionResult.rows.length === 0) {
+      return res.status(403).json({
+        status: "error",
+        message: "No active guard session found",
+      });
+    }
+
+    const activeSession = sessionResult.rows[0];
+
+    const result = await pool.query(
+      `
+      INSERT INTO push_subscriptions (
+        guard_id,
+        session_id,
+        site_id,
+        endpoint,
+        p256dh,
+        auth,
+        user_agent,
+        device_name,
+        active,
+        created_at,
+        last_seen
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), NOW())
+      ON CONFLICT (endpoint)
+      DO UPDATE SET
+        guard_id = EXCLUDED.guard_id,
+        session_id = EXCLUDED.session_id,
+        site_id = EXCLUDED.site_id,
+        p256dh = EXCLUDED.p256dh,
+        auth = EXCLUDED.auth,
+        user_agent = EXCLUDED.user_agent,
+        device_name = EXCLUDED.device_name,
+        active = TRUE,
+        last_seen = NOW()
+      RETURNING id, guard_id, session_id, site_id, active, created_at, last_seen
+      `,
+      [
+        guard_id,
+        session_id,
+        activeSession.site_id,
+        subscription.endpoint,
+        subscription.keys.p256dh,
+        subscription.keys.auth,
+        user_agent || req.headers["user-agent"] || null,
+        device_name || null,
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Push subscription saved",
+      subscription: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Push subscribe error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to save push subscription",
       detail: err.message,
     });
   }
