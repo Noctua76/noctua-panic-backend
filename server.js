@@ -5683,6 +5683,60 @@ app.post("/push/subscribe", async (req, res) => {
   }
 });
 
+async function sendPushNotificationToGuard(guardId, payload) {
+  const subscriptions = await pool.query(
+    `
+    SELECT *
+    FROM push_subscriptions
+    WHERE guard_id = $1
+      AND active = TRUE
+    `,
+    [guardId]
+  );
+
+  if (subscriptions.rows.length === 0) {
+    return {
+      status: "no_subscriptions",
+      sent: [],
+    };
+  }
+
+  const results = [];
+
+  for (const sub of subscriptions.rows) {
+    try {
+      await webpush.sendNotification(
+        {
+          endpoint: sub.endpoint,
+          keys: {
+            p256dh: sub.p256dh,
+            auth: sub.auth,
+          },
+        },
+        JSON.stringify(payload)
+      );
+
+      results.push({
+        subscription_id: sub.id,
+        success: true,
+      });
+    } catch (err) {
+      console.error("Push send error:", err);
+
+      results.push({
+        subscription_id: sub.id,
+        success: false,
+        error: err.message,
+      });
+    }
+  }
+
+  return {
+    status: "ok",
+    sent: results,
+  };
+}
+
 app.post("/push/test", async (req, res) => {
   try {
     const { guard_id } = req.body;
@@ -5694,67 +5748,20 @@ app.post("/push/test", async (req, res) => {
       });
     }
 
-    const subscriptions = await pool.query(
-      `
-      SELECT *
-      FROM push_subscriptions
-      WHERE guard_id = $1
-        AND active = TRUE
-      `,
-      [guard_id]
-    );
-
-    if (subscriptions.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "No active push subscriptions found",
-      });
-    }
-
-    const payload = JSON.stringify({
+    const payload = {
       title: "Aegis Link",
       body: "Test Push Notification",
-      url: "https://noctua76.github.io/noctua-panic-webapp/patrol.html",
-    });
+      url: "/patrol.html",
+    };
 
-    const results = [];
-
-    for (const sub of subscriptions.rows) {
-      try {
-        await webpush.sendNotification(
-          {
-            endpoint: sub.endpoint,
-            keys: {
-              p256dh: sub.p256dh,
-              auth: sub.auth,
-            },
-          },
-          payload
-        );
-
-        results.push({
-          endpoint: sub.endpoint,
-          success: true,
-        });
-
-      } catch (err) {
-        console.error(err);
-
-        results.push({
-          endpoint: sub.endpoint,
-          success: false,
-          error: err.message,
-        });
-      }
-    }
+    const result = await sendPushNotificationToGuard(guard_id, payload);
 
     res.json({
       status: "ok",
-      sent: results,
+      result,
     });
-
   } catch (err) {
-    console.error(err);
+    console.error("Push test error:", err);
 
     res.status(500).json({
       status: "error",
