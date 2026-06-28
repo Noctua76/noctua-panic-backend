@@ -5781,7 +5781,7 @@ async function sendScanOpenPushIfNeeded({
   const payload = {
   title: "Patrol Reminder",
   body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nScan window is now open.`,
-  url: "/patrol.html",
+  url: "/noctua-panic-webapp/patrol.html",
 };
 
   const pushResult = await sendPushNotificationToGuard(guardId, payload);
