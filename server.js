@@ -5536,28 +5536,6 @@ app.get("/guard/patrols/board", async (req, res) => {
       [guard_id, session_id, session.site_id]
     );
 
-    for (const patrol of boardResult.rows) {
-  if (patrol.status !== "due_soon") {
-    continue;
-  }
-
-  try {
-    await sendScanOpenPushIfNeeded({
-      guardId: Number(guard_id),
-      sessionId: Number(session_id),
-      siteId: Number(session.site_id),
-      scheduleId: Number(patrol.schedule_id),
-      scheduleType: patrol.schedule_type,
-      scheduledAt: patrol.scheduled_at,
-      checkpoint: patrol.checkpoint,
-      siteName: session.site_name,
-      scanAvailableFrom: patrol.scan_available_from,
-    });
-  } catch (pushErr) {
-    console.error("Scan open push error:", pushErr);
-  }
-}
-
     res.json({
       status: "ok",
       guard: {
@@ -5847,6 +5825,170 @@ async function sendScanOpenPushIfNeeded({
     status: "sent",
     pushResult,
   };
+}
+
+let patrolPushSchedulerRunning = false;
+
+async function runPatrolPushScheduler() {
+  if (patrolPushSchedulerRunning) {
+    return;
+  }
+
+  patrolPushSchedulerRunning = true;
+
+  try {
+    const dueSoonResult = await pool.query(
+      `
+      WITH active_sessions AS (
+        SELECT
+          gs.id AS session_id,
+          gs.guard_id,
+          gs.site_id,
+          s.name AS site_name
+        FROM guard_sessions gs
+        LEFT JOIN sites s
+          ON s.id = gs.site_id
+        WHERE gs.logout_time IS NULL
+      ),
+
+      recurring_slots AS (
+        SELECT
+          NULL::integer AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'recurring' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
+          gs.expected_slot AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        CROSS JOIN LATERAL (
+          SELECT
+            (
+              (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+              + ps.start_time
+            ) AS anchor_time,
+            (NOW() AT TIME ZONE 'Europe/Athens')::date AS day_start,
+            ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day') AS day_end
+        ) w
+
+        CROSS JOIN LATERAL generate_series(
+          w.anchor_time,
+          w.anchor_time + INTERVAL '365 days',
+          (ps.interval_hours || ' hours')::interval
+        ) AS gs(expected_slot)
+
+        WHERE ps.schedule_type = 'recurring'
+          AND ps.active = true
+          AND ps.start_time IS NOT NULL
+          AND ps.interval_hours IS NOT NULL
+          AND gs.expected_slot >= w.day_start
+          AND gs.expected_slot < w.day_end
+      ),
+
+      manual_slots AS (
+        SELECT
+          ps.id AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'manual' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
+          (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        WHERE ps.schedule_type = 'manual'
+          AND ps.active = true
+          AND ps.scheduled_date = (NOW() AT TIME ZONE 'Europe/Athens')::date
+      ),
+
+      patrol_items AS (
+        SELECT * FROM recurring_slots
+        UNION ALL
+        SELECT * FROM manual_slots
+      ),
+
+      enriched AS (
+        SELECT
+          pi.*,
+          (
+            pi.scheduled_at
+            - (COALESCE(pi.reminder_minutes_before, 5) || ' minutes')::interval
+          ) AS scan_available_from,
+          (
+            pi.scheduled_at + INTERVAL '15 minutes'
+          ) AS scan_available_until
+        FROM patrol_items pi
+      )
+
+      SELECT
+        e.schedule_id,
+        e.schedule_type,
+        e.site_id,
+        e.point_id,
+        e.checkpoint,
+        e.reminder_minutes_before,
+        e.scheduled_at,
+        e.scan_available_from,
+        e.scan_available_until,
+        active_sessions.guard_id,
+        active_sessions.session_id,
+        active_sessions.site_name
+      FROM enriched e
+
+      JOIN active_sessions
+        ON active_sessions.site_id = e.site_id
+
+      WHERE (NOW() AT TIME ZONE 'Europe/Athens') >= e.scan_available_from
+        AND (NOW() AT TIME ZONE 'Europe/Athens') < e.scheduled_at
+
+        AND NOT EXISTS (
+          SELECT 1
+          FROM patrol_logs pl
+          WHERE pl.site_id = e.site_id
+            AND pl.point_id = e.point_id
+            AND COALESCE(pl.schedule_type, e.schedule_type) = e.schedule_type
+            AND (
+              e.schedule_type = 'manual'
+              AND pl.schedule_id = e.schedule_id
+              OR
+              e.schedule_type = 'recurring'
+              AND pl.scheduled_at = e.scheduled_at
+            )
+        )
+
+      ORDER BY e.scheduled_at ASC, e.point_id ASC
+      `
+    );
+
+    for (const patrol of dueSoonResult.rows) {
+      await sendScanOpenPushIfNeeded({
+        guardId: Number(patrol.guard_id),
+        sessionId: Number(patrol.session_id),
+        siteId: Number(patrol.site_id),
+        scheduleId: Number(patrol.schedule_id),
+        scheduleType: patrol.schedule_type,
+        scheduledAt: patrol.scheduled_at,
+        checkpoint: patrol.checkpoint,
+        siteName: patrol.site_name,
+        scanAvailableFrom: patrol.scan_available_from,
+      });
+    }
+  } catch (err) {
+    console.error("Patrol push scheduler error:", err);
+  } finally {
+    patrolPushSchedulerRunning = false;
+  }
 }
 
 app.post("/push/test", async (req, res) => {
@@ -8617,6 +8759,10 @@ app.get("/patrols/completed-history/report/pdf", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
+setTimeout(runPatrolPushScheduler, 10000);
+
+setInterval(runPatrolPushScheduler, 60000);
 
 
 
