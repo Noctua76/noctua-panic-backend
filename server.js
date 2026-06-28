@@ -5714,7 +5714,7 @@ app.post("/push/test", async (req, res) => {
     const payload = JSON.stringify({
       title: "Aegis Link",
       body: "Test Push Notification",
-      url: "/patrol.html",
+      url: "https://noctua76.github.io/noctua-panic-webapp/patrol.html",
     });
 
     const results = [];
