@@ -5536,6 +5536,28 @@ app.get("/guard/patrols/board", async (req, res) => {
       [guard_id, session_id, session.site_id]
     );
 
+    for (const patrol of boardResult.rows) {
+  if (patrol.status !== "due_soon") {
+    continue;
+  }
+
+  try {
+    await sendScanOpenPushIfNeeded({
+      guardId: Number(guard_id),
+      sessionId: Number(session_id),
+      siteId: Number(session.site_id),
+      scheduleId: Number(patrol.schedule_id),
+      scheduleType: patrol.schedule_type,
+      scheduledAt: patrol.scheduled_at,
+      checkpoint: patrol.checkpoint,
+      siteName: session.site_name,
+      scanAvailableFrom: patrol.scan_available_from,
+    });
+  } catch (pushErr) {
+    console.error("Scan open push error:", pushErr);
+  }
+}
+
     res.json({
       status: "ok",
       guard: {
@@ -5734,6 +5756,96 @@ async function sendPushNotificationToGuard(guardId, payload) {
   return {
     status: "ok",
     sent: results,
+  };
+}
+
+async function sendScanOpenPushIfNeeded({
+  guardId,
+  sessionId,
+  siteId,
+  scheduleId,
+  scheduleType,
+  scheduledAt,
+  checkpoint,
+  siteName,
+  scanAvailableFrom,
+}) {
+  const notificationType = "scan_open";
+
+  const existing = await pool.query(
+    `
+    SELECT id
+    FROM patrol_push_notifications
+    WHERE guard_id = $1
+      AND site_id = $2
+      AND schedule_id = $3
+      AND schedule_type = $4
+      AND scheduled_at = $5::timestamp
+      AND notification_type = $6
+    LIMIT 1
+    `,
+    [
+      guardId,
+      siteId,
+      scheduleId,
+      scheduleType,
+      scheduledAt,
+      notificationType,
+    ]
+  );
+
+  if (existing.rows.length > 0) {
+    return {
+      status: "already_sent",
+    };
+  }
+
+  const payload = {
+    title: "Patrol Reminder",
+    body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nScan window is now open.`,
+    url: "https://noctua76.github.io/noctua-panic-webapp/patrol.html",
+  };
+
+  const pushResult = await sendPushNotificationToGuard(guardId, payload);
+
+  await pool.query(
+    `
+    INSERT INTO patrol_push_notifications (
+      guard_id,
+      session_id,
+      site_id,
+      schedule_id,
+      schedule_type,
+      scheduled_at,
+      notification_type,
+      sent_at,
+      created_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6::timestamp, $7, NOW(), NOW())
+    ON CONFLICT (
+      guard_id,
+      site_id,
+      schedule_id,
+      schedule_type,
+      scheduled_at,
+      notification_type
+    )
+    DO NOTHING
+    `,
+    [
+      guardId,
+      sessionId,
+      siteId,
+      scheduleId,
+      scheduleType,
+      scheduledAt,
+      notificationType,
+    ]
+  );
+
+  return {
+    status: "sent",
+    pushResult,
   };
 }
 
