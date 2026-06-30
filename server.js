@@ -5536,6 +5536,38 @@ app.get("/guard/patrols/board", async (req, res) => {
       [guard_id, session_id, session.site_id]
     );
 
+    const completedResult = await pool.query(
+  `
+  SELECT
+    pl.id,
+    pl.site_id,
+    pl.point_id,
+    pp.point_name AS checkpoint,
+    COALESCE(pl.schedule_type, 'recurring') AS schedule_type,
+    pl.schedule_id,
+    pl.scheduled_at,
+    pl.patrol_time,
+    pl.delay_minutes,
+    pl.completion_status,
+    pl.was_missed,
+    pl.latitude,
+    pl.longitude,
+    pl.accuracy,
+    'completed' AS status,
+    false AS scan_enabled
+  FROM patrol_logs pl
+  LEFT JOIN patrol_points pp
+    ON pp.id = pl.point_id
+  WHERE pl.guard_id = $1
+    AND pl.session_id = $2
+    AND pl.site_id = $3
+    AND pl.patrol_time >= NOW() - INTERVAL '24 hours'
+  ORDER BY pl.patrol_time DESC
+  LIMIT 20
+  `,
+  [guard_id, session_id, session.site_id]
+);
+
     res.json({
       status: "ok",
       guard: {
@@ -5553,6 +5585,7 @@ app.get("/guard/patrols/board", async (req, res) => {
         location: session.site_location,
       },
       patrols: boardResult.rows,
+      completed_patrols: completedResult.rows,
     });
   } catch (err) {
     console.error("Guard patrol board error:", err);
