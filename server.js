@@ -668,6 +668,25 @@ function pad2(value) {
   return String(value).padStart(2, "0");
 }
 
+function parseTimeToMinutes(value) {
+  if (!value || !value.includes(":")) return null;
+
+  const [hour, minute] = value.split(":").map(Number);
+
+  if (
+    Number.isNaN(hour) ||
+    Number.isNaN(minute) ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59
+  ) {
+    return null;
+  }
+
+  return hour * 60 + minute;
+}
+
 function shiftDatePlusDays(year, month, day, offsetDays) {
   const d = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
   d.setUTCDate(d.getUTCDate() + offsetDays);
@@ -679,11 +698,13 @@ function shiftDatePlusDays(year, month, day, offsetDays) {
   };
 }
 
-function toPgTimestamp(dateParts, hour, minute = 0) {
+function toPgTimestamp(dateParts, timeValue) {
+  const [hour, minute] = timeValue.split(":").map(Number);
+
   return `${dateParts.year}-${pad2(dateParts.month)}-${pad2(dateParts.day)} ${pad2(hour)}:${pad2(minute)}:00`;
 }
 
-function getScheduledShiftForAthens(date = new Date()) {
+function getAthensDateParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/Athens",
     year: "numeric",
@@ -696,52 +717,70 @@ function getScheduledShiftForAthens(date = new Date()) {
 
   const get = (type) => Number(parts.find((p) => p.type === type).value);
 
-  const year = get("year");
-  const month = get("month");
-  const day = get("day");
-  const hour = get("hour");
-  const minute = get("minute");
-
-  const currentMinutes = hour * 60 + minute;
-  const today = { year, month, day };
-
-  // 06:30–14:29 → 07:00–15:00
-  if (currentMinutes >= 390 && currentMinutes < 870) {
-    return {
-      start: toPgTimestamp(today, 7),
-      end: toPgTimestamp(today, 15),
-      label: "07:00–15:00",
-    };
-  }
-
-  // 14:30–22:29 → 15:00–23:00
-  if (currentMinutes >= 870 && currentMinutes < 1350) {
-    return {
-      start: toPgTimestamp(today, 15),
-      end: toPgTimestamp(today, 23),
-      label: "15:00–23:00",
-    };
-  }
-
-  // 22:30–23:59 → 23:00–07:00 next day
-  if (currentMinutes >= 1350) {
-    const tomorrow = shiftDatePlusDays(year, month, day, 1);
-
-    return {
-      start: toPgTimestamp(today, 23),
-      end: toPgTimestamp(tomorrow, 7),
-      label: "23:00–07:00",
-    };
-  }
-
-  // 00:00–06:29 → 23:00 previous day – 07:00 today
-  const yesterday = shiftDatePlusDays(year, month, day, -1);
-
   return {
-    start: toPgTimestamp(yesterday, 23),
-    end: toPgTimestamp(today, 7),
-    label: "23:00–07:00",
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: get("hour"),
+    minute: get("minute"),
   };
+}
+
+function getScheduledShiftFromRules(shiftRules, date = new Date()) {
+  const rules =
+    typeof shiftRules === "string" ? JSON.parse(shiftRules || "{}") : shiftRules;
+
+  const shifts = Array.isArray(rules?.shifts) ? rules.shifts : [];
+
+  if (shifts.length === 0) return null;
+
+  const { year, month, day, hour, minute } = getAthensDateParts(date);
+  const currentMinutes = hour * 60 + minute;
+
+  const today = { year, month, day };
+  const yesterday = shiftDatePlusDays(year, month, day, -1);
+  const tomorrow = shiftDatePlusDays(year, month, day, 1);
+
+  for (const shift of shifts) {
+    const startMinutes = parseTimeToMinutes(shift.start);
+    const endMinutes = parseTimeToMinutes(shift.end);
+
+    if (startMinutes === null || endMinutes === null) continue;
+
+    const label = `${shift.start}–${shift.end}`;
+
+    // Same-day shift, e.g. 07:00–15:00
+    if (startMinutes < endMinutes) {
+      if (currentMinutes >= startMinutes && currentMinutes < endMinutes) {
+        return {
+          start: toPgTimestamp(today, shift.start),
+          end: toPgTimestamp(today, shift.end),
+          label,
+        };
+      }
+    }
+
+    // Overnight shift, e.g. 23:00–07:00
+    if (startMinutes > endMinutes) {
+      if (currentMinutes >= startMinutes) {
+        return {
+          start: toPgTimestamp(today, shift.start),
+          end: toPgTimestamp(tomorrow, shift.end),
+          label,
+        };
+      }
+
+      if (currentMinutes < endMinutes) {
+        return {
+          start: toPgTimestamp(yesterday, shift.start),
+          end: toPgTimestamp(today, shift.end),
+          label,
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 // ----------------------------------------------------------
@@ -805,7 +844,19 @@ app.post("/guard/login", async (req, res) => {
       [guard.id]
     );
 
-    const scheduledShift = getScheduledShiftForAthens();
+    const siteResult = await pool.query(
+  `
+  SELECT shift_rules
+  FROM sites
+  WHERE id = $1
+  `,
+  [guard.site_id]
+);
+
+const scheduledShift =
+  siteResult.rows.length > 0
+    ? getScheduledShiftFromRules(siteResult.rows[0].shift_rules)
+    : null;
     const sessionResult = await pool.query(
       `
       INSERT INTO guard_sessions (
@@ -829,9 +880,9 @@ app.post("/guard/login", async (req, res) => {
     guard.site_id,
     device_info || null,
     req.ip || null,
-    scheduledShift.start,
-    scheduledShift.end,
-    scheduledShift.label
+    scheduledShift?.start || null,
+scheduledShift?.end || null,
+scheduledShift?.label || null
   ]
 );
 
