@@ -1625,8 +1625,9 @@ app.get("/guards/shifts/history", async (req, res) => {
     s.name AS site_name,
     s.location AS site_location,
 
-    NULL AS shift_start,
-    NULL AS shift_end,
+    gs.scheduled_shift_start AS shift_start,
+gs.scheduled_shift_end AS shift_end,
+gs.scheduled_shift_label AS shift_label,
 
     gs.login_time AS check_in_time,
     gs.logout_time AS check_out_time,
