@@ -664,6 +664,86 @@ VALUES ($1,$2,$3,NOW(),NOW(),true)
   }
 });
 
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+function shiftDatePlusDays(year, month, day, offsetDays) {
+  const d = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  d.setUTCDate(d.getUTCDate() + offsetDays);
+
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+  };
+}
+
+function toPgTimestamp(dateParts, hour, minute = 0) {
+  return `${dateParts.year}-${pad2(dateParts.month)}-${pad2(dateParts.day)} ${pad2(hour)}:${pad2(minute)}:00`;
+}
+
+function getScheduledShiftForAthens(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Athens",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+
+  const year = get("year");
+  const month = get("month");
+  const day = get("day");
+  const hour = get("hour");
+  const minute = get("minute");
+
+  const currentMinutes = hour * 60 + minute;
+  const today = { year, month, day };
+
+  // 06:30–14:29 → 07:00–15:00
+  if (currentMinutes >= 390 && currentMinutes < 870) {
+    return {
+      start: toPgTimestamp(today, 7),
+      end: toPgTimestamp(today, 15),
+      label: "07:00–15:00",
+    };
+  }
+
+  // 14:30–22:29 → 15:00–23:00
+  if (currentMinutes >= 870 && currentMinutes < 1350) {
+    return {
+      start: toPgTimestamp(today, 15),
+      end: toPgTimestamp(today, 23),
+      label: "15:00–23:00",
+    };
+  }
+
+  // 22:30–23:59 → 23:00–07:00 next day
+  if (currentMinutes >= 1350) {
+    const tomorrow = shiftDatePlusDays(year, month, day, 1);
+
+    return {
+      start: toPgTimestamp(today, 23),
+      end: toPgTimestamp(tomorrow, 7),
+      label: "23:00–07:00",
+    };
+  }
+
+  // 00:00–06:29 → 23:00 previous day – 07:00 today
+  const yesterday = shiftDatePlusDays(year, month, day, -1);
+
+  return {
+    start: toPgTimestamp(yesterday, 23),
+    end: toPgTimestamp(today, 7),
+    label: "23:00–07:00",
+  };
+}
+
 // ----------------------------------------------------------
 // GUARD LOGIN
 // ----------------------------------------------------------
@@ -725,28 +805,35 @@ app.post("/guard/login", async (req, res) => {
       [guard.id]
     );
 
+    const scheduledShift = getScheduledShiftForAthens();
     const sessionResult = await pool.query(
       `
       INSERT INTO guard_sessions (
-        guard_id,
-        site_id,
-        login_time,
-        last_heartbeat,
-        status,
-        device_info,
-        ip_address,
-        created_at
-      )
-      VALUES ($1,$2,NOW(),NOW(),'online',$3,$4,NOW())
-      RETURNING *
-      `,
-      [
-        guard.id,
-        guard.site_id,
-        device_info || null,
-        req.ip || null
-      ]
-    );
+    guard_id,
+    site_id,
+    login_time,
+    last_heartbeat,
+    status,
+    device_info,
+    ip_address,
+    created_at,
+    scheduled_shift_start,
+    scheduled_shift_end,
+    scheduled_shift_label
+  )
+  VALUES ($1,$2,NOW(),NOW(),'online',$3,$4,NOW(),$5,$6,$7)
+  RETURNING *
+  `,
+  [
+    guard.id,
+    guard.site_id,
+    device_info || null,
+    req.ip || null,
+    scheduledShift.start,
+    scheduledShift.end,
+    scheduledShift.label
+  ]
+);
 
     res.json({
       status: "ok",
