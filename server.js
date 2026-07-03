@@ -1093,19 +1093,24 @@ app.post("/guard/logout", async (req, res) => {
       });
     }
 
-    await pool.query(
-      `
-      UPDATE guard_sessions
-      SET
-        logout_time = NOW(),
-        status = 'logged_out',
-        last_heartbeat = NOW()
-      WHERE id = $1
-        AND guard_id = $2
-        AND logout_time IS NULL
-      `,
-      [session_id, guard_id]
-    );
+    const logoutResult = await pool.query(
+  `
+  UPDATE guard_sessions
+  SET
+    logout_time = (NOW() AT TIME ZONE 'Europe/Athens'),
+    status = 'logged_out',
+    last_heartbeat = (NOW() AT TIME ZONE 'Europe/Athens')
+  WHERE id = $1
+    AND guard_id = $2
+    AND logout_time IS NULL
+  RETURNING id
+  `,
+  [session_id, guard_id]
+);
+
+for (const row of logoutResult.rows) {
+  await syncScheduledShiftsForSession(row.id);
+}
 
     res.json({ status: "ok" });
 
