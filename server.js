@@ -982,6 +982,8 @@ const scheduledShift =
     ? getScheduledShiftFromRules(siteResult.rows[0].shift_rules)
     : null;
 
+    console.log("SCHEDULED SHIFT:", scheduledShift);
+
     const sessionResult = await pool.query(
       `
       INSERT INTO guard_sessions (
@@ -1022,6 +1024,8 @@ scheduledShift?.end || null,
 scheduledShift?.label || null
   ]
 );
+
+console.log("NEW SESSION:", sessionResult.rows[0]);
 
 await syncScheduledShiftsForSession(sessionResult.rows[0].id);
 
