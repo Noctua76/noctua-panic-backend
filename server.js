@@ -863,6 +863,45 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
   return created;
 }
 
+async function syncScheduledShiftsForSession(sessionId) {
+  await pool.query(
+    `
+    UPDATE scheduled_shifts ss
+    SET
+      guard_id = gs.guard_id,
+      guard_session_id = gs.id,
+      actual_login_time = gs.login_time,
+      actual_logout_time = gs.logout_time,
+      login_delay_minutes = CASE
+        WHEN gs.login_time IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (gs.login_time - ss.scheduled_start)) / 60),
+          0
+        )
+      END,
+      logout_delay_minutes = CASE
+        WHEN gs.logout_time IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (gs.logout_time - ss.scheduled_end)) / 60),
+          0
+        )
+      END,
+      status = CASE
+        WHEN gs.logout_time IS NULL THEN 'active'
+        WHEN gs.status = 'auto_closed' THEN 'abandoned'
+        ELSE 'completed'
+      END,
+      updated_at = NOW()
+    FROM guard_sessions gs
+    WHERE gs.id = $1
+      AND ss.site_id = gs.site_id
+      AND gs.login_time < ss.scheduled_end
+      AND COALESCE(gs.logout_time, NOW()) > ss.scheduled_start
+    `,
+    [sessionId]
+  );
+}
+
 // ----------------------------------------------------------
 // GUARD LOGIN
 // ----------------------------------------------------------
@@ -911,18 +950,23 @@ app.post("/guard/login", async (req, res) => {
       });
     }
 
-    await pool.query(
-      `
-      UPDATE guard_sessions
-      SET
-        logout_time = NOW(),
-        status = 'auto_closed',
-        last_heartbeat = NOW()
-      WHERE guard_id = $1
-        AND logout_time IS NULL
-      `,
-      [guard.id]
-    );
+    const closedSessions = await pool.query(
+  `
+  UPDATE guard_sessions
+  SET
+    logout_time = NOW(),
+    status = 'auto_closed',
+    last_heartbeat = NOW()
+  WHERE guard_id = $1
+    AND logout_time IS NULL
+  RETURNING id
+  `,
+  [guard.id]
+);
+
+for (const row of closedSessions.rows) {
+  await syncScheduledShiftsForSession(row.id);
+}
 
     const siteResult = await pool.query(
   `
@@ -937,6 +981,7 @@ const scheduledShift =
   siteResult.rows.length > 0
     ? getScheduledShiftFromRules(siteResult.rows[0].shift_rules)
     : null;
+    
     const sessionResult = await pool.query(
       `
       INSERT INTO guard_sessions (
@@ -965,6 +1010,8 @@ scheduledShift?.end || null,
 scheduledShift?.label || null
   ]
 );
+
+await syncScheduledShiftsForSession(sessionResult.rows[0].id);
 
     res.json({
       status: "ok",
