@@ -783,6 +783,86 @@ function getScheduledShiftFromRules(shiftRules, date = new Date()) {
   return null;
 }
 
+async function generateScheduledShiftsForSite(siteId, targetDate) {
+  const siteResult = await pool.query(
+    `
+    SELECT id, shift_rules
+    FROM sites
+    WHERE id = $1
+    `,
+    [siteId]
+  );
+
+  if (siteResult.rows.length === 0) {
+    throw new Error("Site not found");
+  }
+
+  const site = siteResult.rows[0];
+  const rules =
+    typeof site.shift_rules === "string"
+      ? JSON.parse(site.shift_rules || "{}")
+      : site.shift_rules;
+
+  const shifts = Array.isArray(rules?.shifts) ? rules.shifts : [];
+
+  if (shifts.length === 0) {
+    return [];
+  }
+
+  const created = [];
+
+  const [year, month, day] = targetDate.split("-").map(Number);
+  const dateParts = { year, month, day };
+  const nextDay = shiftDatePlusDays(year, month, day, 1);
+
+  for (const shift of shifts) {
+    if (!shift.start || !shift.end) continue;
+
+    const startMinutes = parseTimeToMinutes(shift.start);
+    const endMinutes = parseTimeToMinutes(shift.end);
+
+    if (startMinutes === null || endMinutes === null) continue;
+
+    const scheduledStart = toPgTimestamp(dateParts, shift.start);
+    const scheduledEnd =
+      startMinutes > endMinutes
+        ? toPgTimestamp(nextDay, shift.end)
+        : toPgTimestamp(dateParts, shift.end);
+
+    const shiftLabel = `${shift.start}–${shift.end}`;
+
+    const result = await pool.query(
+      `
+      INSERT INTO scheduled_shifts (
+        site_id,
+        scheduled_start,
+        scheduled_end,
+        shift_label,
+        status,
+        created_at,
+        updated_at
+      )
+      SELECT $1, $2, $3, $4, 'scheduled', NOW(), NOW()
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM scheduled_shifts
+        WHERE site_id = $1
+          AND scheduled_start = $2
+          AND scheduled_end = $3
+      )
+      RETURNING *
+      `,
+      [siteId, scheduledStart, scheduledEnd, shiftLabel]
+    );
+
+    if (result.rows.length > 0) {
+      created.push(result.rows[0]);
+    }
+  }
+
+  return created;
+}
+
 // ----------------------------------------------------------
 // GUARD LOGIN
 // ----------------------------------------------------------
@@ -902,6 +982,33 @@ scheduledShift?.label || null
 
   } catch (err) {
     console.error("Guard login error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/admin/scheduled-shifts/generate", async (req, res) => {
+  try {
+    const { site_id, date } = req.body;
+
+    if (!site_id || !date) {
+      return res.status(400).json({
+        status: "error",
+        message: "site_id and date are required"
+      });
+    }
+
+    const created = await generateScheduledShiftsForSite(site_id, date);
+
+    res.json({
+      status: "ok",
+      created_count: created.length,
+      scheduled_shifts: created
+    });
+  } catch (err) {
+    console.error("Generate scheduled shifts error:", err);
     res.status(500).json({
       status: "error",
       message: err.message
