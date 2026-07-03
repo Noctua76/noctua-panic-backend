@@ -1772,51 +1772,80 @@ events.sort((a, b) => {
 app.get("/guards/shifts/history", async (req, res) => {
   try {
     const result = await pool.query(`
-  SELECT
-    gs.id,
-    NULL AS company_id,
-    gs.guard_id,
+      SELECT
+        ss.id,
+        NULL AS company_id,
 
-    COALESCE(g.full_name, g.username, 'Unknown Guard') AS full_name,
+        gs.guard_id,
+        COALESCE(g.full_name, g.username, 'No Login') AS full_name,
 
-    gs.site_id,
-    s.name AS site_name,
-    s.location AS site_location,
+        ss.site_id,
+        s.name AS site_name,
+        s.location AS site_location,
 
-    gs.scheduled_shift_start AS shift_start,
-gs.scheduled_shift_end AS shift_end,
-gs.scheduled_shift_label AS shift_label,
+        ss.scheduled_start AS shift_start,
+        ss.scheduled_end AS shift_end,
+        ss.shift_label AS shift_label,
 
-    gs.login_time AS check_in_time,
-    gs.logout_time AS check_out_time,
+        gs.login_time AS check_in_time,
+        gs.logout_time AS check_out_time,
+        gs.last_heartbeat AS last_seen,
 
-    gs.last_heartbeat AS last_seen,
+        (gs.id IS NOT NULL AND gs.logout_time IS NULL) AS online,
 
-    (gs.logout_time IS NULL) AS online,
+        CASE
+          WHEN gs.id IS NULL THEN 'no_login'
+          WHEN gs.logout_time IS NULL THEN 'active'
+          WHEN gs.status = 'auto_closed' THEN 'abandoned'
+          ELSE 'completed'
+        END AS status,
 
-    CASE
-      WHEN gs.logout_time IS NULL THEN 'active'
-      WHEN gs.status = 'auto_closed' THEN 'abandoned'
-      ELSE 'completed'
-    END AS status,
+        ss.created_at AS created_at,
 
-    gs.login_time AS created_at,
+        (
+          gs.id IS NOT NULL
+          AND gs.logout_time IS NULL
+          AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
+        ) AS is_currently_online,
 
-    (
-      gs.logout_time IS NULL
-      AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
-    ) AS is_currently_online
+        CASE
+          WHEN gs.login_time IS NULL THEN NULL
+          ELSE GREATEST(
+            FLOOR(EXTRACT(EPOCH FROM (gs.login_time - ss.scheduled_start)) / 60),
+            0
+          )
+        END AS login_delay_minutes,
 
-  FROM guard_sessions gs
+        CASE
+          WHEN gs.logout_time IS NULL THEN NULL
+          ELSE GREATEST(
+            FLOOR(EXTRACT(EPOCH FROM (gs.logout_time - ss.scheduled_end)) / 60),
+            0
+          )
+        END AS logout_delay_minutes,
 
-  LEFT JOIN guards g
-    ON g.id = gs.guard_id
+        gs.id AS guard_session_id
 
-  LEFT JOIN sites s
-    ON s.id = gs.site_id
+      FROM scheduled_shifts ss
 
-  ORDER BY gs.login_time DESC
-`);
+      LEFT JOIN LATERAL (
+        SELECT gs_inner.*
+        FROM guard_sessions gs_inner
+        WHERE gs_inner.site_id = ss.site_id
+          AND gs_inner.login_time >= ss.scheduled_start - INTERVAL '30 minutes'
+          AND gs_inner.login_time < ss.scheduled_end
+        ORDER BY gs_inner.login_time ASC
+        LIMIT 1
+      ) gs ON TRUE
+
+      LEFT JOIN guards g
+        ON g.id = gs.guard_id
+
+      LEFT JOIN sites s
+        ON s.id = ss.site_id
+
+      ORDER BY ss.scheduled_start DESC
+    `);
 
     res.json({
       status: "ok",
