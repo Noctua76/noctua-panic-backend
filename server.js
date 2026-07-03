@@ -866,111 +866,155 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
 async function syncScheduledShiftsForSession(sessionId) {
   await pool.query(
     `
-    UPDATE scheduled_shifts ss
-    SET
-      guard_id = gs.guard_id,
-      guard_session_id = gs.id,
-      actual_login_time = gs.login_time,
-      actual_logout_time = gs.logout_time,
-
-      login_delay_minutes = GREATEST(
-        FLOOR(EXTRACT(EPOCH FROM (gs.login_time - ss.scheduled_start)) / 60),
+    INSERT INTO scheduled_shift_sessions (
+      scheduled_shift_id,
+      guard_session_id,
+      guard_id,
+      overlap_start,
+      overlap_end,
+      coverage_minutes,
+      created_at
+    )
+    SELECT
+      ss.id,
+      gs.id,
+      gs.guard_id,
+      GREATEST(gs.login_time, ss.scheduled_start),
+      LEAST(COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')), ss.scheduled_end),
+      GREATEST(
+        FLOOR(
+          EXTRACT(EPOCH FROM (
+            LEAST(COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')), ss.scheduled_end)
+            - GREATEST(gs.login_time, ss.scheduled_start)
+          )) / 60
+        ),
         0
       ),
+      (NOW() AT TIME ZONE 'Europe/Athens')
+    FROM guard_sessions gs
+    JOIN scheduled_shifts ss
+      ON ss.site_id = gs.site_id
+     AND gs.login_time < ss.scheduled_end
+     AND COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')) > ss.scheduled_start
+    WHERE gs.id = $1
+    ON CONFLICT (scheduled_shift_id, guard_session_id)
+    DO UPDATE SET
+      overlap_start = EXCLUDED.overlap_start,
+      overlap_end = EXCLUDED.overlap_end,
+      coverage_minutes = EXCLUDED.coverage_minutes
+    `,
+    [sessionId]
+  );
 
-      logout_delay_minutes = CASE
-        WHEN gs.logout_time IS NULL THEN NULL
-        ELSE GREATEST(
-          FLOOR(EXTRACT(EPOCH FROM (gs.logout_time - ss.scheduled_end)) / 60),
-          0
-        )
-      END,
+  await pool.query(
+    `
+    UPDATE scheduled_shifts ss
+    SET
+      guard_id = last_session.guard_id,
+      guard_session_id = last_session.guard_session_id,
+      actual_login_time = first_session.overlap_start,
+      actual_logout_time = last_session.overlap_end,
 
-      early_logout_minutes = CASE
-        WHEN gs.logout_time IS NULL THEN NULL
-        ELSE GREATEST(
-          FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - gs.logout_time)) / 60),
-          0
-        )
-      END,
-
-      coverage_minutes = CASE
-        WHEN gs.logout_time IS NULL THEN
-          GREATEST(
-            FLOOR(EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Athens') - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
-            0
-          )
-        ELSE
-          GREATEST(
-            FLOOR(EXTRACT(EPOCH FROM (LEAST(gs.logout_time, ss.scheduled_end) - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
-            0
-          )
-      END,
+      coverage_minutes = COALESCE(total_coverage.coverage_minutes, 0),
 
       uncovered_minutes = GREATEST(
-        FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) -
-        CASE
-          WHEN gs.logout_time IS NULL THEN
-            GREATEST(
-              FLOOR(EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Athens') - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
-              0
-            )
-          ELSE
-            GREATEST(
-              FLOOR(EXTRACT(EPOCH FROM (LEAST(gs.logout_time, ss.scheduled_end) - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
-              0
-            )
-        END,
+        FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60)
+        - COALESCE(total_coverage.coverage_minutes, 0),
         0
       ),
 
       coverage_percent = ROUND(
         (
-          CASE
-            WHEN gs.logout_time IS NULL THEN
-              GREATEST(
-                FLOOR(EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Athens') - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
-                0
-              )
-            ELSE
-              GREATEST(
-                FLOOR(EXTRACT(EPOCH FROM (LEAST(gs.logout_time, ss.scheduled_end) - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
-                0
-              )
-          END
+          COALESCE(total_coverage.coverage_minutes, 0)
           /
           NULLIF(FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60), 0)
         ) * 100,
         2
       ),
 
+      login_delay_minutes = CASE
+        WHEN first_session.overlap_start IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (first_session.overlap_start - ss.scheduled_start)) / 60),
+          0
+        )
+      END,
+
+      logout_delay_minutes = CASE
+        WHEN last_session.overlap_end IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (last_session.overlap_end - ss.scheduled_end)) / 60),
+          0
+        )
+      END,
+
+      early_logout_minutes = CASE
+        WHEN last_session.overlap_end IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - last_session.overlap_end)) / 60),
+          0
+        )
+      END,
+
       coverage_status = CASE
-        WHEN gs.logout_time IS NULL THEN 'active'
-        WHEN gs.status = 'auto_closed' THEN 'abandoned'
-        WHEN gs.login_time <= ss.scheduled_start + INTERVAL '10 minutes'
-         AND gs.logout_time >= ss.scheduled_end - INTERVAL '10 minutes'
+        WHEN COALESCE(total_coverage.coverage_minutes, 0) = 0 THEN 'no_login'
+        WHEN active_sessions.active_count > 0 THEN 'active'
+        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '10 minutes'
+         AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '10 minutes'
+         AND COALESCE(total_coverage.coverage_minutes, 0) >=
+             FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) - 20
           THEN 'completed'
         ELSE 'partial_coverage'
       END,
 
       status = CASE
-        WHEN gs.logout_time IS NULL THEN 'active'
-        WHEN gs.status = 'auto_closed' THEN 'abandoned'
-        WHEN gs.login_time <= ss.scheduled_start + INTERVAL '10 minutes'
-         AND gs.logout_time >= ss.scheduled_end - INTERVAL '10 minutes'
+        WHEN COALESCE(total_coverage.coverage_minutes, 0) = 0 THEN 'no_login'
+        WHEN active_sessions.active_count > 0 THEN 'active'
+        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '10 minutes'
+         AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '10 minutes'
+         AND COALESCE(total_coverage.coverage_minutes, 0) >=
+             FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) - 20
           THEN 'completed'
         ELSE 'partial_coverage'
       END,
 
       updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
 
-    FROM guard_sessions gs
-    WHERE gs.id = $1
-      AND ss.site_id = gs.site_id
-      AND gs.login_time < ss.scheduled_end
-      AND COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')) > ss.scheduled_start
-    `,
-    [sessionId]
+    FROM (
+      SELECT scheduled_shift_id, SUM(coverage_minutes) AS coverage_minutes
+      FROM scheduled_shift_sessions
+      GROUP BY scheduled_shift_id
+    ) total_coverage
+
+    LEFT JOIN LATERAL (
+      SELECT overlap_start
+      FROM scheduled_shift_sessions
+      WHERE scheduled_shift_id = total_coverage.scheduled_shift_id
+      ORDER BY overlap_start ASC
+      LIMIT 1
+    ) first_session ON TRUE
+
+    LEFT JOIN LATERAL (
+      SELECT
+        guard_id,
+        guard_session_id,
+        overlap_end
+      FROM scheduled_shift_sessions
+      WHERE scheduled_shift_id = total_coverage.scheduled_shift_id
+      ORDER BY overlap_end DESC
+      LIMIT 1
+    ) last_session ON TRUE
+
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) AS active_count
+      FROM scheduled_shift_sessions sss
+      JOIN guard_sessions gs ON gs.id = sss.guard_session_id
+      WHERE sss.scheduled_shift_id = total_coverage.scheduled_shift_id
+        AND gs.logout_time IS NULL
+    ) active_sessions ON TRUE
+
+    WHERE ss.id = total_coverage.scheduled_shift_id
+    `
   );
 }
 
