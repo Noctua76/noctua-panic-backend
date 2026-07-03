@@ -1829,14 +1829,19 @@ app.get("/guards/shifts/history", async (req, res) => {
       FROM scheduled_shifts ss
 
       LEFT JOIN LATERAL (
-        SELECT gs_inner.*
-        FROM guard_sessions gs_inner
-        WHERE gs_inner.site_id = ss.site_id
-          AND gs_inner.login_time >= ss.scheduled_start - INTERVAL '30 minutes'
-          AND gs_inner.login_time < ss.scheduled_end
-        ORDER BY gs_inner.login_time ASC
-        LIMIT 1
-      ) gs ON TRUE
+  SELECT gs_inner.*
+  FROM guard_sessions gs_inner
+  WHERE gs_inner.site_id = ss.site_id
+    AND gs_inner.login_time < ss.scheduled_end
+    AND COALESCE(gs_inner.logout_time, NOW()) > ss.scheduled_start
+  ORDER BY
+    CASE
+      WHEN gs_inner.login_time <= ss.scheduled_start THEN 0
+      ELSE 1
+    END,
+    gs_inner.login_time ASC
+  LIMIT 1
+) gs ON TRUE
 
       LEFT JOIN guards g
         ON g.id = gs.guard_id
