@@ -872,6 +872,7 @@ async function syncScheduledShiftsForSession(sessionId) {
       guard_session_id = gs.id,
       actual_login_time = gs.login_time,
       actual_logout_time = gs.logout_time,
+
       login_delay_minutes = CASE
         WHEN gs.login_time IS NULL THEN NULL
         ELSE GREATEST(
@@ -879,6 +880,7 @@ async function syncScheduledShiftsForSession(sessionId) {
           0
         )
       END,
+
       logout_delay_minutes = CASE
         WHEN gs.logout_time IS NULL THEN NULL
         ELSE GREATEST(
@@ -886,12 +888,23 @@ async function syncScheduledShiftsForSession(sessionId) {
           0
         )
       END,
+
+      early_logout_minutes = CASE
+        WHEN gs.logout_time IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - gs.logout_time)) / 60),
+          0
+        )
+      END,
+
       status = CASE
         WHEN gs.logout_time IS NULL THEN 'active'
         WHEN gs.status = 'auto_closed' THEN 'abandoned'
         ELSE 'completed'
       END,
+
       updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+
     FROM guard_sessions gs
     WHERE gs.id = $1
       AND ss.site_id = gs.site_id
