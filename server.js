@@ -842,7 +842,7 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
         created_at,
         updated_at
       )
-      SELECT $1, $2, $3, $4, 'scheduled', NOW(), NOW()
+      SELECT $1, $2::timestamp, $3::timestamp, $4, 'scheduled', (NOW() AT TIME ZONE 'Europe/Athens'), (NOW() AT TIME ZONE 'Europe/Athens')
       WHERE NOT EXISTS (
         SELECT 1
         FROM scheduled_shifts
@@ -981,7 +981,7 @@ const scheduledShift =
   siteResult.rows.length > 0
     ? getScheduledShiftFromRules(siteResult.rows[0].shift_rules)
     : null;
-    
+
     const sessionResult = await pool.query(
       `
       INSERT INTO guard_sessions (
@@ -997,7 +997,19 @@ const scheduledShift =
     scheduled_shift_end,
     scheduled_shift_label
   )
-  VALUES ($1,$2,NOW(),NOW(),'online',$3,$4,NOW(),$5,$6,$7)
+  VALUES (
+  $1,
+  $2,
+  (NOW() AT TIME ZONE 'Europe/Athens'),
+  (NOW() AT TIME ZONE 'Europe/Athens'),
+  'online',
+  $3,
+  $4,
+  (NOW() AT TIME ZONE 'Europe/Athens'),
+  $5::timestamp,
+  $6::timestamp,
+  $7
+)
   RETURNING *
   `,
   [
