@@ -873,13 +873,10 @@ async function syncScheduledShiftsForSession(sessionId) {
       actual_login_time = gs.login_time,
       actual_logout_time = gs.logout_time,
 
-      login_delay_minutes = CASE
-        WHEN gs.login_time IS NULL THEN NULL
-        ELSE GREATEST(
-          FLOOR(EXTRACT(EPOCH FROM (gs.login_time - ss.scheduled_start)) / 60),
-          0
-        )
-      END,
+      login_delay_minutes = GREATEST(
+        FLOOR(EXTRACT(EPOCH FROM (gs.login_time - ss.scheduled_start)) / 60),
+        0
+      ),
 
       logout_delay_minutes = CASE
         WHEN gs.logout_time IS NULL THEN NULL
@@ -897,10 +894,72 @@ async function syncScheduledShiftsForSession(sessionId) {
         )
       END,
 
+      coverage_minutes = CASE
+        WHEN gs.logout_time IS NULL THEN
+          GREATEST(
+            FLOOR(EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Athens') - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
+            0
+          )
+        ELSE
+          GREATEST(
+            FLOOR(EXTRACT(EPOCH FROM (LEAST(gs.logout_time, ss.scheduled_end) - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
+            0
+          )
+      END,
+
+      uncovered_minutes = GREATEST(
+        FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) -
+        CASE
+          WHEN gs.logout_time IS NULL THEN
+            GREATEST(
+              FLOOR(EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Athens') - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
+              0
+            )
+          ELSE
+            GREATEST(
+              FLOOR(EXTRACT(EPOCH FROM (LEAST(gs.logout_time, ss.scheduled_end) - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
+              0
+            )
+        END,
+        0
+      ),
+
+      coverage_percent = ROUND(
+        (
+          CASE
+            WHEN gs.logout_time IS NULL THEN
+              GREATEST(
+                FLOOR(EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Athens') - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
+                0
+              )
+            ELSE
+              GREATEST(
+                FLOOR(EXTRACT(EPOCH FROM (LEAST(gs.logout_time, ss.scheduled_end) - GREATEST(gs.login_time, ss.scheduled_start))) / 60),
+                0
+              )
+          END
+          /
+          NULLIF(FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60), 0)
+        ) * 100,
+        2
+      ),
+
+      coverage_status = CASE
+        WHEN gs.logout_time IS NULL THEN 'active'
+        WHEN gs.status = 'auto_closed' THEN 'abandoned'
+        WHEN gs.login_time <= ss.scheduled_start + INTERVAL '10 minutes'
+         AND gs.logout_time >= ss.scheduled_end - INTERVAL '10 minutes'
+          THEN 'completed'
+        ELSE 'partial_coverage'
+      END,
+
       status = CASE
         WHEN gs.logout_time IS NULL THEN 'active'
         WHEN gs.status = 'auto_closed' THEN 'abandoned'
-        ELSE 'completed'
+        WHEN gs.login_time <= ss.scheduled_start + INTERVAL '10 minutes'
+         AND gs.logout_time >= ss.scheduled_end - INTERVAL '10 minutes'
+          THEN 'completed'
+        ELSE 'partial_coverage'
       END,
 
       updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
@@ -908,8 +967,8 @@ async function syncScheduledShiftsForSession(sessionId) {
     FROM guard_sessions gs
     WHERE gs.id = $1
       AND ss.site_id = gs.site_id
-      AND gs.login_time < ss.scheduled_end
-      AND COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')) > ss.scheduled_start
+      AND gs.login_time >= ss.scheduled_start - INTERVAL '10 minutes'
+      AND gs.login_time <= ss.scheduled_start + INTERVAL '10 minutes'
     `,
     [sessionId]
   );
