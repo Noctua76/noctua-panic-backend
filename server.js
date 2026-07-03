@@ -891,12 +891,12 @@ async function syncScheduledShiftsForSession(sessionId) {
         WHEN gs.status = 'auto_closed' THEN 'abandoned'
         ELSE 'completed'
       END,
-      updated_at = NOW()
+      updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
     FROM guard_sessions gs
     WHERE gs.id = $1
       AND ss.site_id = gs.site_id
       AND gs.login_time < ss.scheduled_end
-      AND COALESCE(gs.logout_time, NOW()) > ss.scheduled_start
+      AND COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')) > ss.scheduled_start
     `,
     [sessionId]
   );
