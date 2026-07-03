@@ -967,8 +967,8 @@ async function syncScheduledShiftsForSession(sessionId) {
     FROM guard_sessions gs
     WHERE gs.id = $1
       AND ss.site_id = gs.site_id
-      AND gs.login_time >= ss.scheduled_start - INTERVAL '10 minutes'
-      AND gs.login_time <= ss.scheduled_start + INTERVAL '10 minutes'
+      AND gs.login_time < ss.scheduled_end
+      AND COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')) > ss.scheduled_start
     `,
     [sessionId]
   );
