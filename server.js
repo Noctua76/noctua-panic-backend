@@ -1143,6 +1143,10 @@ scheduledShift?.label || null
 
 console.log("NEW SESSION:", sessionResult.rows[0]);
 
+const athensToday = getAthensDateParts(new Date());
+const todayDate = `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
+
+await generateScheduledShiftsForSite(guard.site_id, todayDate);
 await syncScheduledShiftsForSession(sessionResult.rows[0].id);
 
     res.json({
