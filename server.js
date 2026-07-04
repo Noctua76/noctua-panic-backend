@@ -1972,8 +1972,8 @@ app.get("/guards/shifts/history", async (req, res) => {
         s.name AS site_name,
         s.location AS site_location,
 
-        ss.scheduled_start AS shift_start,
-        ss.scheduled_end AS shift_end,
+        to_char(ss.scheduled_start, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_start,
+to_char(ss.scheduled_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_end,
         ss.shift_label AS shift_label,
 
         ss.actual_login_time AS check_in_time,
@@ -2087,10 +2087,16 @@ app.get("/guards/shifts/history", async (req, res) => {
                 'guard_session_id', sss.guard_session_id,
                 'guard_id', sss.guard_id,
                 'guard_name', COALESCE(sg.full_name, sg.username, 'Unknown Guard'),
-                'login_time', gs.login_time,
-                'logout_time', gs.logout_time,
-                'overlap_start', sss.overlap_start,
-                'overlap_end', sss.overlap_end,
+                'login_time', to_char(gs.login_time, 'YYYY-MM-DD"T"HH24:MI:SS.MS'),
+'logout_time', CASE
+  WHEN gs.logout_time IS NULL THEN NULL
+  ELSE to_char(gs.logout_time, 'YYYY-MM-DD"T"HH24:MI:SS.MS')
+END,
+'overlap_start', to_char(sss.overlap_start, 'YYYY-MM-DD"T"HH24:MI:SS.MS'),
+'overlap_end', CASE
+  WHEN sss.overlap_end IS NULL THEN NULL
+  ELSE to_char(sss.overlap_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS')
+END,
                 'coverage_minutes', sss.coverage_minutes
               )
               ORDER BY sss.overlap_start ASC
