@@ -2021,7 +2021,7 @@ app.get("/guards/shifts/history", async (req, res) => {
       LEFT JOIN sites s
         ON s.id = ss.site_id
 
-      ORDER BY ss.scheduled_start DESC
+      ORDER BY ss.scheduled_start ASC
     `);
 
     res.json({
