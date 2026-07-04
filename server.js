@@ -1956,6 +1956,7 @@ events.sort((a, b) => {
 
 // ----------------------------------------------------------
 // GUARD SHIFT HISTORY
+// Event Logs source of truth: scheduled_shifts
 // ----------------------------------------------------------
 app.get("/guards/shifts/history", async (req, res) => {
   try {
@@ -1964,7 +1965,7 @@ app.get("/guards/shifts/history", async (req, res) => {
         ss.id,
         NULL AS company_id,
 
-        gs.guard_id,
+        ss.guard_id,
         COALESCE(g.full_name, g.username, 'No Login') AS full_name,
 
         ss.site_id,
@@ -1975,64 +1976,47 @@ app.get("/guards/shifts/history", async (req, res) => {
         ss.scheduled_end AS shift_end,
         ss.shift_label AS shift_label,
 
-        gs.login_time AS check_in_time,
-        gs.logout_time AS check_out_time,
-        gs.last_heartbeat AS last_seen,
+        ss.actual_login_time AS check_in_time,
+        ss.actual_logout_time AS check_out_time,
+        ss.updated_at AS last_seen,
 
-        (gs.id IS NOT NULL AND gs.logout_time IS NULL) AS online,
+        EXISTS (
+          SELECT 1
+          FROM scheduled_shift_sessions sss
+          JOIN guard_sessions gs
+            ON gs.id = sss.guard_session_id
+          WHERE sss.scheduled_shift_id = ss.id
+            AND gs.logout_time IS NULL
+        ) AS online,
 
-        CASE
-          WHEN gs.id IS NULL THEN 'no_login'
-          WHEN gs.logout_time IS NULL THEN 'active'
-          WHEN gs.status = 'auto_closed' THEN 'abandoned'
-          ELSE 'completed'
-        END AS status,
+        ss.status AS status,
+        ss.coverage_status,
+        ss.coverage_minutes,
+        ss.uncovered_minutes,
+        ss.coverage_percent,
 
         ss.created_at AS created_at,
 
-        (
-          gs.id IS NOT NULL
-          AND gs.logout_time IS NULL
-          AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
+        EXISTS (
+          SELECT 1
+          FROM scheduled_shift_sessions sss
+          JOIN guard_sessions gs
+            ON gs.id = sss.guard_session_id
+          WHERE sss.scheduled_shift_id = ss.id
+            AND gs.logout_time IS NULL
+            AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
         ) AS is_currently_online,
 
-        CASE
-          WHEN gs.login_time IS NULL THEN NULL
-          ELSE GREATEST(
-            FLOOR(EXTRACT(EPOCH FROM (gs.login_time - ss.scheduled_start)) / 60),
-            0
-          )
-        END AS login_delay_minutes,
+        ss.login_delay_minutes,
+        ss.logout_delay_minutes,
+        ss.early_logout_minutes,
 
-        CASE
-          WHEN gs.logout_time IS NULL THEN NULL
-          ELSE GREATEST(
-            FLOOR(EXTRACT(EPOCH FROM (gs.logout_time - ss.scheduled_end)) / 60),
-            0
-          )
-        END AS logout_delay_minutes,
-
-        gs.id AS guard_session_id
+        ss.guard_session_id
 
       FROM scheduled_shifts ss
 
-      LEFT JOIN LATERAL (
-  SELECT gs_inner.*
-  FROM guard_sessions gs_inner
-  WHERE gs_inner.site_id = ss.site_id
-    AND gs_inner.login_time < ss.scheduled_end
-    AND COALESCE(gs_inner.logout_time, NOW()) > ss.scheduled_start
-  ORDER BY
-    CASE
-      WHEN gs_inner.login_time <= ss.scheduled_start THEN 0
-      ELSE 1
-    END,
-    gs_inner.login_time ASC
-  LIMIT 1
-) gs ON TRUE
-
       LEFT JOIN guards g
-        ON g.id = gs.guard_id
+        ON g.id = ss.guard_id
 
       LEFT JOIN sites s
         ON s.id = ss.site_id
