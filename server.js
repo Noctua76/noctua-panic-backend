@@ -1980,6 +1980,15 @@ app.get("/guards/shifts/history", async (req, res) => {
         ss.actual_logout_time AS check_out_time,
         ss.updated_at AS last_seen,
 
+        ss.coverage_minutes,
+        ss.uncovered_minutes,
+        ss.coverage_percent,
+        ss.login_delay_minutes,
+        ss.logout_delay_minutes,
+        ss.early_logout_minutes,
+        ss.guard_session_id,
+        ss.created_at,
+
         EXISTS (
           SELECT 1
           FROM scheduled_shift_sessions sss
@@ -1989,14 +1998,6 @@ app.get("/guards/shifts/history", async (req, res) => {
             AND gs.logout_time IS NULL
         ) AS online,
 
-        ss.status AS status,
-        ss.coverage_status,
-        ss.coverage_minutes,
-        ss.uncovered_minutes,
-        ss.coverage_percent,
-
-        ss.created_at AS created_at,
-
         EXISTS (
           SELECT 1
           FROM scheduled_shift_sessions sss
@@ -2004,14 +2005,105 @@ app.get("/guards/shifts/history", async (req, res) => {
             ON gs.id = sss.guard_session_id
           WHERE sss.scheduled_shift_id = ss.id
             AND gs.logout_time IS NULL
-            AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
+            AND gs.last_heartbeat > (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '90 seconds'
         ) AS is_currently_online,
 
-        ss.login_delay_minutes,
-        ss.logout_delay_minutes,
-        ss.early_logout_minutes,
+        CASE
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_start
+            THEN 'scheduled'
 
-        ss.guard_session_id
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= ss.scheduled_start
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND EXISTS (
+              SELECT 1
+              FROM scheduled_shift_sessions sss
+              JOIN guard_sessions gs
+                ON gs.id = sss.guard_session_id
+              WHERE sss.scheduled_shift_id = ss.id
+                AND gs.logout_time IS NULL
+            )
+            THEN 'on_duty'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= ss.scheduled_start
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND COALESCE(ss.coverage_minutes, 0) > 0
+            THEN 'in_progress'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= ss.scheduled_start
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            THEN 'no_guard'
+
+          ELSE 'finished'
+        END AS operational_status,
+
+        CASE
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            THEN 'pending'
+
+          WHEN COALESCE(ss.coverage_minutes, 0) = 0
+            THEN 'missed'
+
+          WHEN ss.coverage_status = 'completed'
+            THEN 'completed'
+
+          ELSE 'partial_coverage'
+        END AS evaluation_status,
+
+        CASE
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_start
+            THEN 'scheduled'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND EXISTS (
+              SELECT 1
+              FROM scheduled_shift_sessions sss
+              JOIN guard_sessions gs
+                ON gs.id = sss.guard_session_id
+              WHERE sss.scheduled_shift_id = ss.id
+                AND gs.logout_time IS NULL
+            )
+            THEN 'on_duty'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND COALESCE(ss.coverage_minutes, 0) > 0
+            THEN 'in_progress'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            THEN 'no_guard'
+
+          WHEN COALESCE(ss.coverage_minutes, 0) = 0
+            THEN 'missed'
+
+          WHEN ss.coverage_status = 'completed'
+            THEN 'completed'
+
+          ELSE 'partial_coverage'
+        END AS display_status,
+
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'guard_session_id', sss.guard_session_id,
+                'guard_id', sss.guard_id,
+                'guard_name', COALESCE(sg.full_name, sg.username, 'Unknown Guard'),
+                'login_time', gs.login_time,
+                'logout_time', gs.logout_time,
+                'overlap_start', sss.overlap_start,
+                'overlap_end', sss.overlap_end,
+                'coverage_minutes', sss.coverage_minutes
+              )
+              ORDER BY sss.overlap_start ASC
+            )
+            FROM scheduled_shift_sessions sss
+            JOIN guard_sessions gs
+              ON gs.id = sss.guard_session_id
+            LEFT JOIN guards sg
+              ON sg.id = sss.guard_id
+            WHERE sss.scheduled_shift_id = ss.id
+          ),
+          '[]'::json
+        ) AS sessions
 
       FROM scheduled_shifts ss
 
