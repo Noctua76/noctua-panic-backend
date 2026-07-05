@@ -888,17 +888,21 @@ function startScheduledShiftGenerator() {
       const todayDate =
         `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
 
+      console.log("[SHIFT GENERATOR] Running for", todayDate);
+
       const created = await generateScheduledShiftsForAllSites(todayDate);
 
-      if (created.length > 0) {
-        console.log(
-          `[SHIFT GENERATOR] Created ${created.length} scheduled shifts for ${todayDate}`
-        );
-      }
+      console.log(
+        "[SHIFT GENERATOR] Created",
+        created.length,
+        "scheduled shifts"
+      );
+
     } catch (err) {
-      console.error("[SHIFT GENERATOR]", err);
+      console.error("[SHIFT GENERATOR ERROR]");
+      console.error(err);
     }
-  }, 60 * 1000);
+  }, 60000);
 }
 
 async function syncScheduledShiftsForSession(sessionId) {
