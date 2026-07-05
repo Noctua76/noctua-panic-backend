@@ -9403,6 +9403,22 @@ app.get("/patrols/completed-history/report/pdf", async (req, res) => {
   }
 });
 
+app.get("/debug/scheduled-shifts", async (req, res) => {
+  const result = await pool.query(`
+    SELECT
+      id,
+      site_id,
+      scheduled_start,
+      scheduled_end,
+      shift_label
+    FROM scheduled_shifts
+    ORDER BY scheduled_start DESC
+    LIMIT 20
+  `);
+
+  res.json(result.rows);
+});
+
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
