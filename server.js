@@ -865,14 +865,27 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
 
 async function generateScheduledShiftsForAllSites(targetDate) {
   const sites = await pool.query(`
-  SELECT id
-  FROM sites
-`);
+    SELECT id
+    FROM sites
+  `);
+
+  console.log("[SHIFT GENERATOR] Found", sites.rows.length, "sites");
 
   const created = [];
 
   for (const site of sites.rows) {
+    console.log("[SHIFT GENERATOR] Processing site", site.id);
+
     const result = await generateScheduledShiftsForSite(site.id, targetDate);
+
+    console.log(
+      "[SHIFT GENERATOR] Site",
+      site.id,
+      "created",
+      result.length,
+      "shifts"
+    );
+
     created.push(...result);
   }
 
@@ -898,9 +911,12 @@ function startScheduledShiftGenerator() {
       );
 
     } catch (err) {
-      console.error("[SHIFT GENERATOR ERROR]");
-      console.error(err);
-    }
+  console.error("[SHIFT GENERATOR ERROR]", err.message);
+
+  if (err.stack) {
+    console.error(err.stack);
+  }
+}
   }, 60000);
 }
 
