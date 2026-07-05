@@ -2119,6 +2119,13 @@ END,
       LEFT JOIN sites s
         ON s.id = ss.site_id
 
+        WHERE
+  ss.scheduled_end > ((NOW() AT TIME ZONE 'Europe/Athens')::date)
+  AND ss.scheduled_start < (
+    ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day')
+    + INTERVAL '7 hours'
+  )
+
       ORDER BY ss.scheduled_start ASC
     `);
 
