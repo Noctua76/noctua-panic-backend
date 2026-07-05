@@ -2177,9 +2177,9 @@ END,
         ON s.id = ss.site_id
 
         WHERE
-  ss.scheduled_end > ((NOW() AT TIME ZONE 'Europe/Athens')::date)
+  ss.scheduled_end > to_char((NOW() AT TIME ZONE 'Europe/Athens')::date, 'YYYY-MM-DD')::timestamp
   AND ss.scheduled_start < (
-    ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day')
+    to_char((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day', 'YYYY-MM-DD')::timestamp
     + INTERVAL '7 hours'
   )
 
