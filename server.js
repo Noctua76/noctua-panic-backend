@@ -863,6 +863,44 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
   return created;
 }
 
+async function generateScheduledShiftsForAllSites(targetDate) {
+  const sites = await pool.query(`
+    SELECT id
+    FROM sites
+    WHERE active = true
+  `);
+
+  const created = [];
+
+  for (const site of sites.rows) {
+    const result = await generateScheduledShiftsForSite(site.id, targetDate);
+    created.push(...result);
+  }
+
+  return created;
+}
+
+function startScheduledShiftGenerator() {
+  setInterval(async () => {
+    try {
+      const athensToday = getAthensDateParts(new Date());
+
+      const todayDate =
+        `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
+
+      const created = await generateScheduledShiftsForAllSites(todayDate);
+
+      if (created.length > 0) {
+        console.log(
+          `[SHIFT GENERATOR] Created ${created.length} scheduled shifts for ${todayDate}`
+        );
+      }
+    } catch (err) {
+      console.error("[SHIFT GENERATOR]", err);
+    }
+  }, 60 * 1000);
+}
+
 async function syncScheduledShiftsForSession(sessionId) {
   await pool.query(
     `
@@ -9349,6 +9387,8 @@ app.get("/patrols/completed-history/report/pdf", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
+
+startScheduledShiftGenerator();
 
 setTimeout(runPatrolPushScheduler, 10000);
 
