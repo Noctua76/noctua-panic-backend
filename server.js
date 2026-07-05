@@ -865,10 +865,9 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
 
 async function generateScheduledShiftsForAllSites(targetDate) {
   const sites = await pool.query(`
-    SELECT id
-    FROM sites
-    WHERE active = true
-  `);
+  SELECT id
+  FROM sites
+`);
 
   const created = [];
 
