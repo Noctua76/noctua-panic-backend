@@ -2045,6 +2045,11 @@ app.get("/guards/shifts/history", async (req, res) => {
 
         to_char(ss.scheduled_start, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_start,
 to_char(ss.scheduled_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_end,
+
+FLOOR(
+  EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60
+)::int AS shift_minutes,
+
         ss.shift_label AS shift_label,
 
         ss.actual_login_time AS check_in_time,
