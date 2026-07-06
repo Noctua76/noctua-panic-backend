@@ -950,9 +950,9 @@ async function syncScheduledShiftsForSession(sessionId) {
       (NOW() AT TIME ZONE 'Europe/Athens')
     FROM guard_sessions gs
     JOIN scheduled_shifts ss
-      ON ss.site_id = gs.site_id
-     AND gs.login_time < ss.scheduled_end
-     AND COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')) > ss.scheduled_start
+  ON ss.site_id = gs.site_id
+ AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
+ AND gs.login_time <= ss.scheduled_start + INTERVAL '15 minutes'
     WHERE gs.id = $1
     ON CONFLICT (scheduled_shift_id, guard_session_id)
     DO UPDATE SET
@@ -1016,8 +1016,8 @@ async function syncScheduledShiftsForSession(sessionId) {
       coverage_status = CASE
         WHEN COALESCE(total_coverage.coverage_minutes, 0) = 0 THEN 'no_login'
         WHEN active_sessions.active_count > 0 THEN 'active'
-        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '10 minutes'
-         AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '10 minutes'
+        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '15 minutes'
+AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '15 minutes'
          AND COALESCE(total_coverage.coverage_minutes, 0) >=
              FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) - 20
           THEN 'completed'
@@ -1027,8 +1027,8 @@ async function syncScheduledShiftsForSession(sessionId) {
       status = CASE
         WHEN COALESCE(total_coverage.coverage_minutes, 0) = 0 THEN 'no_login'
         WHEN active_sessions.active_count > 0 THEN 'active'
-        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '10 minutes'
-         AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '10 minutes'
+        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '15 minutes'
+AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '15 minutes'
          AND COALESCE(total_coverage.coverage_minutes, 0) >=
              FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) - 20
           THEN 'completed'
