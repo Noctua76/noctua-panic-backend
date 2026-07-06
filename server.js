@@ -970,7 +970,10 @@ async function syncScheduledShiftsForSession(sessionId) {
       guard_id = last_session.guard_id,
       guard_session_id = last_session.guard_session_id,
       actual_login_time = first_session.overlap_start,
-      actual_logout_time = last_session.overlap_end,
+      actual_logout_time = CASE
+  WHEN active_sessions.active_count > 0 THEN NULL
+  ELSE last_session.overlap_end
+END,
 
       coverage_minutes = COALESCE(total_coverage.coverage_minutes, 0),
 
