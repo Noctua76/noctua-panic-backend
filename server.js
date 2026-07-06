@@ -1055,15 +1055,19 @@ AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '15 minutes'
     ) first_session ON TRUE
 
     LEFT JOIN LATERAL (
-      SELECT
-        guard_id,
-        guard_session_id,
-        overlap_end
-      FROM scheduled_shift_sessions
-      WHERE scheduled_shift_id = total_coverage.scheduled_shift_id
-      ORDER BY overlap_end DESC
-      LIMIT 1
-    ) last_session ON TRUE
+  SELECT
+    sss.guard_id,
+    sss.guard_session_id,
+    CASE
+      WHEN gs.logout_time IS NULL THEN NULL
+      ELSE sss.overlap_end
+    END AS overlap_end
+  FROM scheduled_shift_sessions sss
+  JOIN guard_sessions gs
+    ON gs.id = sss.guard_session_id
+  WHERE sss.scheduled_shift_id = total_coverage.scheduled_shift_id
+  ORDER BY sss.overlap_start DESC
+) last_session ON TRUE
 
     LEFT JOIN LATERAL (
       SELECT COUNT(*) AS active_count
