@@ -952,7 +952,7 @@ async function syncScheduledShiftsForSession(sessionId) {
     JOIN scheduled_shifts ss
   ON ss.site_id = gs.site_id
  AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
- AND gs.login_time <= ss.scheduled_start + INTERVAL '15 minutes'
+ AND gs.login_time < ss.scheduled_end
     WHERE gs.id = $1
     ON CONFLICT (scheduled_shift_id, guard_session_id)
     DO UPDATE SET
