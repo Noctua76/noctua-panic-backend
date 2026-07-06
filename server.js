@@ -2040,6 +2040,65 @@ to_char(ss.scheduled_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_end,
         ss.coverage_minutes,
         ss.uncovered_minutes,
         ss.coverage_percent,
+        COALESCE(
+  (
+    SELECT SUM(
+      CASE
+        WHEN gs.logout_time IS NULL THEN
+          GREATEST(
+            FLOOR(
+              EXTRACT(EPOCH FROM (
+                LEAST((NOW() AT TIME ZONE 'Europe/Athens'), ss.scheduled_end)
+                - sss.overlap_start
+              )) / 60
+            ),
+            0
+          )
+        ELSE COALESCE(sss.coverage_minutes, 0)
+      END
+    )
+    FROM scheduled_shift_sessions sss
+    JOIN guard_sessions gs
+      ON gs.id = sss.guard_session_id
+    WHERE sss.scheduled_shift_id = ss.id
+  ),
+  0
+)::int AS live_coverage_minutes,
+
+ROUND(
+  (
+    COALESCE(
+      (
+        SELECT SUM(
+          CASE
+            WHEN gs.logout_time IS NULL THEN
+              GREATEST(
+                FLOOR(
+                  EXTRACT(EPOCH FROM (
+                    LEAST((NOW() AT TIME ZONE 'Europe/Athens'), ss.scheduled_end)
+                    - sss.overlap_start
+                  )) / 60
+                ),
+                0
+              )
+            ELSE COALESCE(sss.coverage_minutes, 0)
+          END
+        )
+        FROM scheduled_shift_sessions sss
+        JOIN guard_sessions gs
+          ON gs.id = sss.guard_session_id
+        WHERE sss.scheduled_shift_id = ss.id
+      ),
+      0
+    )
+    /
+    NULLIF(
+      FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60),
+      0
+    )
+  ) * 100,
+  2
+) AS live_coverage_percent,
         ss.login_delay_minutes,
         ss.logout_delay_minutes,
         ss.early_logout_minutes,
@@ -2154,7 +2213,20 @@ END,
   WHEN sss.overlap_end IS NULL THEN NULL
   ELSE to_char(sss.overlap_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS')
 END,
-                'coverage_minutes', sss.coverage_minutes
+                'coverage_minutes',
+CASE
+  WHEN gs.logout_time IS NULL THEN
+    GREATEST(
+      FLOOR(
+        EXTRACT(EPOCH FROM (
+          LEAST((NOW() AT TIME ZONE 'Europe/Athens'), ss.scheduled_end)
+          - sss.overlap_start
+        )) / 60
+      ),
+      0
+    )
+  ELSE sss.coverage_minutes
+END
               )
               ORDER BY sss.overlap_start ASC
             )
