@@ -937,16 +937,23 @@ async function syncScheduledShiftsForSession(sessionId) {
       gs.id,
       gs.guard_id,
       GREATEST(gs.login_time, ss.scheduled_start),
-      LEAST(COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')), ss.scheduled_end),
-      GREATEST(
-        FLOOR(
-          EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(gs.logout_time, (NOW() AT TIME ZONE 'Europe/Athens')), ss.scheduled_end)
-            - GREATEST(gs.login_time, ss.scheduled_start)
-          )) / 60
-        ),
-        0
-      ),
+      CASE
+  WHEN gs.logout_time IS NULL THEN NULL
+  ELSE LEAST(gs.logout_time, ss.scheduled_end)
+END,
+       GREATEST(
+  FLOOR(
+    CASE
+      WHEN gs.logout_time IS NULL THEN 0
+      ELSE
+        EXTRACT(EPOCH FROM (
+          LEAST(gs.logout_time, ss.scheduled_end)
+          - GREATEST(gs.login_time, ss.scheduled_start)
+        )) / 60
+    END
+  ),
+  0
+),
       (NOW() AT TIME ZONE 'Europe/Athens')
     FROM guard_sessions gs
     JOIN scheduled_shifts ss
