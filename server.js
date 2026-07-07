@@ -589,6 +589,45 @@ app.post("/admin/users/create", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------
+// ADMIN USERS MANAGEMENT
+// ----------------------------------------------------------
+
+app.get("/admin/users", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        full_name,
+        username,
+        email,
+        secondary_email,
+        phone,
+        mobile_phone,
+        backup_phone,
+        role,
+        status,
+        must_change_password,
+        company_id,
+        created_at
+      FROM users
+      ORDER BY id ASC
+    `);
+
+    res.json({
+      status: "ok",
+      users: result.rows
+    });
+  } catch (err) {
+    console.error("Fetch admin users error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 app.post("/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
