@@ -664,6 +664,143 @@ VALUES ($1,$2,$3,NOW(),NOW(),true)
   }
 });
 
+// ----------------------------------------------------------
+// USER PASSWORD MANAGEMENT
+// ----------------------------------------------------------
+
+app.put("/admin/users/:id/reset-password", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const temporaryPassword = crypto
+  .randomBytes(9)
+  .toString("base64")
+  .replace(/[+/=]/g, "")
+  .slice(0, 12);
+
+const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        password_hash = $1,
+        must_change_password = true
+      WHERE id = $2
+      RETURNING
+        id,
+        full_name,
+        username,
+        email,
+        phone,
+        role,
+        status,
+        must_change_password
+      `,
+      [passwordHash, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+  status: "ok",
+  message: "Password reset successfully",
+  temporary_password: temporaryPassword,
+  user: result.rows[0]
+});
+  } catch (err) {
+    console.error("User reset password error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/auth/change-password", async (req, res) => {
+  try {
+    const { user_id, current_password, new_password } = req.body;
+
+    if (!user_id || !current_password || !new_password) {
+      return res.status(400).json({
+        status: "error",
+        message: "user_id, current_password and new_password are required"
+      });
+    }
+
+    const userResult = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE id = $1
+        AND status = 'active'
+      `,
+      [user_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found or inactive"
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    const validPassword = await bcrypt.compare(
+      current_password,
+      user.password_hash
+    );
+
+    if (!validPassword) {
+      return res.status(401).json({
+        status: "error",
+        message: "Current password is incorrect"
+      });
+    }
+
+    const newPasswordHash = await bcrypt.hash(new_password, 10);
+
+    const updateResult = await pool.query(
+      `
+      UPDATE users
+      SET
+        password_hash = $1,
+        must_change_password = false
+      WHERE id = $2
+      RETURNING
+        id,
+        full_name,
+        username,
+        email,
+        phone,
+        role,
+        status,
+        must_change_password
+      `,
+      [newPasswordHash, user_id]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Password changed successfully",
+      user: updateResult.rows[0]
+    });
+  } catch (err) {
+    console.error("Change password error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 function pad2(value) {
   return String(value).padStart(2, "0");
 }
