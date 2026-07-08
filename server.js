@@ -675,6 +675,103 @@ app.get("/admin/users/:id", async (req, res) => {
   }
 });
 
+app.post("/admin/users", async (req, res) => {
+  try {
+    const {
+      full_name,
+      username,
+      email,
+      secondary_email,
+      phone,
+      mobile_phone,
+      backup_phone,
+      role = "supervisor",
+      status = "active",
+      company_id = 1
+    } = req.body;
+
+    if (!full_name || !username) {
+      return res.status(400).json({
+        status: "error",
+        message: "full_name and username are required"
+      });
+    }
+
+    const temporaryPassword = crypto
+      .randomBytes(9)
+      .toString("base64")
+      .replace(/[+/=]/g, "")
+      .slice(0, 12);
+
+    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+
+    const result = await pool.query(
+      `
+      INSERT INTO users (
+        full_name,
+        username,
+        email,
+        secondary_email,
+        phone,
+        mobile_phone,
+        backup_phone,
+        role,
+        status,
+        company_id,
+        password_hash,
+        must_change_password,
+        created_at
+      )
+      VALUES (
+        $1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),
+        NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,true,NOW()
+      )
+      RETURNING
+        id,
+        full_name,
+        username,
+        email,
+        secondary_email,
+        phone,
+        mobile_phone,
+        backup_phone,
+        role,
+        status,
+        must_change_password,
+        company_id,
+        created_at
+      `,
+      [
+        full_name,
+        username,
+        email,
+        secondary_email,
+        phone,
+        mobile_phone,
+        backup_phone,
+        role,
+        status,
+        company_id,
+        passwordHash
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "User created successfully",
+      temporary_password: temporaryPassword,
+      user: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Create admin user error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 app.post("/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
