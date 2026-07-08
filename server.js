@@ -772,6 +772,87 @@ app.post("/admin/users", async (req, res) => {
   }
 });
 
+app.put("/admin/users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      full_name,
+      email,
+      secondary_email,
+      phone,
+      mobile_phone,
+      backup_phone,
+      role,
+      status,
+      company_id
+    } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        full_name = COALESCE(NULLIF($1, ''), full_name),
+        email = NULLIF($2, ''),
+        secondary_email = NULLIF($3, ''),
+        phone = NULLIF($4, ''),
+        mobile_phone = NULLIF($5, ''),
+        backup_phone = NULLIF($6, ''),
+        role = COALESCE(NULLIF($7, ''), role),
+        status = COALESCE(NULLIF($8, ''), status),
+        company_id = COALESCE($9, company_id)
+      WHERE id = $10
+      RETURNING
+        id,
+        full_name,
+        username,
+        email,
+        secondary_email,
+        phone,
+        mobile_phone,
+        backup_phone,
+        role,
+        status,
+        must_change_password,
+        company_id,
+        created_at
+      `,
+      [
+        full_name,
+        email,
+        secondary_email,
+        phone,
+        mobile_phone,
+        backup_phone,
+        role,
+        status,
+        company_id || null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      message: "User updated successfully",
+      user: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Update admin user error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
 app.post("/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
