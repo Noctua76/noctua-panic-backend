@@ -778,6 +778,7 @@ app.put("/admin/users/:id", async (req, res) => {
 
     const {
       full_name,
+      username,
       email,
       secondary_email,
       phone,
@@ -793,15 +794,17 @@ app.put("/admin/users/:id", async (req, res) => {
       UPDATE users
       SET
         full_name = COALESCE(NULLIF($1, ''), full_name),
-        email = NULLIF($2, ''),
-        secondary_email = NULLIF($3, ''),
-        phone = NULLIF($4, ''),
-        mobile_phone = NULLIF($5, ''),
-        backup_phone = NULLIF($6, ''),
-        role = COALESCE(NULLIF($7, ''), role),
-        status = COALESCE(NULLIF($8, ''), status),
-        company_id = COALESCE($9, company_id)
-      WHERE id = $10
+        username = COALESCE(NULLIF($2, ''), username),
+        email = NULLIF($3, ''),
+        secondary_email = NULLIF($4, ''),
+        phone = NULLIF($5, ''),
+        mobile_phone = NULLIF($6, ''),
+        backup_phone = NULLIF($7, ''),
+        role = COALESCE(NULLIF($8, ''), role),
+        status = COALESCE(NULLIF($9, ''), status),
+        company_id = COALESCE($10, company_id),
+        updated_at = NOW()
+      WHERE id = $11
       RETURNING
         id,
         full_name,
@@ -815,10 +818,12 @@ app.put("/admin/users/:id", async (req, res) => {
         status,
         must_change_password,
         company_id,
-        created_at
+        created_at,
+        updated_at
       `,
       [
         full_name,
+        username,
         email,
         secondary_email,
         phone,
