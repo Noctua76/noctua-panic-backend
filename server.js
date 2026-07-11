@@ -1326,6 +1326,96 @@ function startScheduledShiftGenerator() {
   }, 60000);
 }
 
+async function detectShiftDelayEvents() {
+  const result = await pool.query(`
+    INSERT INTO operational_events (
+      site_id,
+      scheduled_shift_id,
+      guard_id,
+      guard_session_id,
+      event_type,
+      event_status,
+      severity,
+      title,
+      description,
+      detected_at,
+      created_at,
+      updated_at,
+      email_status
+    )
+    SELECT
+      ss.site_id,
+      ss.id,
+      NULL,
+      NULL,
+      'SHIFT_DELAY',
+      'open',
+      'high',
+      'Shift Delay - No Guard Login',
+      'No guard login detected within 15 minutes of the scheduled shift start.',
+      (NOW() AT TIME ZONE 'Europe/Athens'),
+      (NOW() AT TIME ZONE 'Europe/Athens'),
+      (NOW() AT TIME ZONE 'Europe/Athens'),
+      'pending'
+    FROM scheduled_shifts ss
+    WHERE ss.scheduled_start + INTERVAL '15 minutes'
+          <= (NOW() AT TIME ZONE 'Europe/Athens')
+
+      AND ss.scheduled_end >
+          (NOW() AT TIME ZONE 'Europe/Athens')
+
+      AND NOT EXISTS (
+        SELECT 1
+        FROM guard_sessions gs
+        WHERE gs.site_id = ss.site_id
+          AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
+          AND gs.login_time < ss.scheduled_end
+      )
+
+      AND NOT EXISTS (
+        SELECT 1
+        FROM operational_events oe
+        WHERE oe.scheduled_shift_id = ss.id
+          AND oe.event_type = 'SHIFT_DELAY'
+          AND oe.event_status = 'open'
+      )
+
+    RETURNING
+      id,
+      site_id,
+      scheduled_shift_id,
+      event_type,
+      event_status,
+      detected_at
+  `);
+
+  if (result.rows.length > 0) {
+    console.log(
+      "[SHIFT DELAY] Created",
+      result.rows.length,
+      "operational event(s)"
+    );
+
+    console.log("[SHIFT DELAY EVENTS]", result.rows);
+  }
+
+  return result.rows;
+}
+
+function startShiftDelayMonitor() {
+  setInterval(async () => {
+    try {
+      await detectShiftDelayEvents();
+    } catch (err) {
+      console.error("[SHIFT DELAY MONITOR ERROR]", err.message);
+
+      if (err.stack) {
+        console.error(err.stack);
+      }
+    }
+  }, 60000);
+}
+
 async function syncScheduledShiftsForSession(sessionId) {
   await pool.query(
     `
