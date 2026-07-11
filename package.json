@@ -21,6 +21,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.1",
     "multer": "^2.1.1",
+    "nodemailer": "^9.0.3",
     "openai": "^6.9.1",
     "pg": "^8.20.0",
     "puppeteer": "^25.1.0",

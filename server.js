@@ -11,6 +11,210 @@ const multer = require("multer");
 const { createClient } = require("@supabase/supabase-js");
 const WebSocket = require("ws");
 const webpush = require("web-push");
+const nodemailer = require("nodemailer");
+
+const emailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: process.env.SMTP_SECURE === "true",
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+async function verifyEmailTransporter() {
+  try {
+    await emailTransporter.verify();
+    console.log("[EMAIL] SMTP transporter ready");
+  } catch (err) {
+    console.error("[EMAIL] SMTP transporter error:", err.message);
+  }
+}
+
+async function getShiftDelayEmailRecipients(companyId) {
+  const result = await pool.query(
+    `
+    SELECT
+      id,
+      full_name,
+      email,
+      secondary_email
+    FROM users
+    WHERE company_id = $1
+      AND role = 'supervisor'
+      AND status = 'active'
+      AND (
+  NULLIF(BTRIM(email), '') IS NOT NULL
+  OR NULLIF(BTRIM(secondary_email), '') IS NOT NULL
+)
+    ORDER BY id ASC
+    `,
+    [companyId]
+  );
+
+  return result.rows;
+}
+
+async function sendShiftDelayEmail(event) {
+  const recipients = await getShiftDelayEmailRecipients(event.company_id);
+
+  if (recipients.length === 0) {
+    throw new Error(
+      `No active supervisor email found for company ${event.company_id}`
+    );
+  }
+
+  const recipientEmails = [
+  ...new Set(
+    recipients
+      .flatMap((recipient) => [
+        recipient.email,
+        recipient.secondary_email,
+      ])
+      .map((email) => email?.trim())
+      .filter(Boolean)
+  ),
+];
+
+  const scheduledStart = new Date(event.scheduled_start).toLocaleString(
+    "el-GR",
+    {
+      timeZone: "Europe/Athens",
+      dateStyle: "short",
+      timeStyle: "short",
+    }
+  );
+
+  const alertThreshold = new Date(event.alert_threshold).toLocaleString(
+    "el-GR",
+    {
+      timeZone: "Europe/Athens",
+      dateStyle: "short",
+      timeStyle: "short",
+    }
+  );
+
+  const subject =
+    `[Aegis Link] Shift Delay – ${event.site_name}`;
+
+  const text = [
+    "AEGIS LINK – SHIFT DELAY ALERT",
+    "",
+    `Site: ${event.site_name}`,
+    `Location: ${event.site_location || "-"}`,
+    `Shift: ${event.shift_label}`,
+    `Scheduled Start: ${scheduledStart}`,
+    `Alert Threshold: ${alertThreshold}`,
+    "",
+    "No guard login was detected within the permitted delay threshold.",
+    "",
+    `Operational Event ID: ${event.id}`,
+  ].join("\n");
+
+  const result = await emailTransporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: recipientEmails,
+    subject,
+    text,
+  });
+
+  return {
+    recipients: recipientEmails,
+    messageId: result.messageId || null,
+  };
+}
+
+async function processPendingShiftDelayEmails() {
+  const pendingResult = await pool.query(`
+    SELECT
+      oe.id,
+      oe.site_id,
+      oe.scheduled_shift_id,
+      oe.email_status,
+
+      ss.shift_label,
+      ss.scheduled_start,
+      ss.scheduled_start + INTERVAL '15 minutes' AS alert_threshold,
+
+      s.company_id,
+      s.name AS site_name,
+      s.location AS site_location
+
+    FROM operational_events oe
+
+    JOIN scheduled_shifts ss
+      ON ss.id = oe.scheduled_shift_id
+
+    JOIN sites s
+      ON s.id = oe.site_id
+
+    WHERE oe.event_type = 'SHIFT_DELAY'
+      AND oe.event_status = 'open'
+      AND oe.email_status = 'pending'
+
+    ORDER BY oe.detected_at ASC
+  `);
+
+  for (const event of pendingResult.rows) {
+    const claimResult = await pool.query(
+      `
+      UPDATE operational_events
+      SET
+        email_status = 'processing',
+        updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+      WHERE id = $1
+        AND email_status = 'pending'
+      RETURNING id
+      `,
+      [event.id]
+    );
+
+    if (claimResult.rows.length === 0) {
+      continue;
+    }
+
+    try {
+      const emailResult = await sendShiftDelayEmail(event);
+
+      await pool.query(
+        `
+        UPDATE operational_events
+        SET
+          email_status = 'sent',
+          email_recipient = $1,
+          email_sent_at = (NOW() AT TIME ZONE 'Europe/Athens'),
+          email_error = NULL,
+          updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+        WHERE id = $2
+        `,
+        [emailResult.recipients.join(", "), event.id]
+      );
+
+      console.log(
+        `[SHIFT DELAY EMAIL] Event ${event.id} sent to`,
+        emailResult.recipients
+      );
+    } catch (err) {
+      await pool.query(
+        `
+        UPDATE operational_events
+        SET
+          email_status = 'failed',
+          email_error = $1,
+          updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+        WHERE id = $2
+        `,
+        [err.message, event.id]
+      );
+
+      console.error(
+        `[SHIFT DELAY EMAIL ERROR] Event ${event.id}:`,
+        err.message
+      );
+    }
+  }
+}
 
 webpush.setVapidDetails(
   process.env.VAPID_SUBJECT,
@@ -1406,6 +1610,7 @@ function startShiftDelayMonitor() {
   setInterval(async () => {
     try {
       await detectShiftDelayEvents();
+      await processPendingShiftDelayEmails();
     } catch (err) {
       console.error("[SHIFT DELAY MONITOR ERROR]", err.message);
 
@@ -10010,6 +10215,7 @@ app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
 
+verifyEmailTransporter();
 startScheduledShiftGenerator();
 startShiftDelayMonitor();
 
