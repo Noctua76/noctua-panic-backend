@@ -61,22 +61,22 @@ async function sendShiftDelayEmail(event) {
   ];
 
   const scheduledStart = new Date(event.scheduled_start).toLocaleString(
-    "el-GR",
-    {
-      timeZone: "Europe/Athens",
-      dateStyle: "short",
-      timeStyle: "short",
-    }
-  );
+  "el-GR",
+  {
+    timeZone: "UTC",
+    dateStyle: "short",
+    timeStyle: "short",
+  }
+);
 
-  const alertThreshold = new Date(event.alert_threshold).toLocaleString(
-    "el-GR",
-    {
-      timeZone: "Europe/Athens",
-      dateStyle: "short",
-      timeStyle: "short",
-    }
-  );
+const alertThreshold = new Date(event.alert_threshold).toLocaleString(
+  "el-GR",
+  {
+    timeZone: "UTC",
+    dateStyle: "short",
+    timeStyle: "short",
+  }
+);
 
   const subject = `[Aegis Link] Shift Delay – ${event.site_name}`;
 
