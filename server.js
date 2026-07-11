@@ -13,24 +13,7 @@ const WebSocket = require("ws");
 const webpush = require("web-push");
 const nodemailer = require("nodemailer");
 
-const emailTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: process.env.SMTP_SECURE === "true",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
 
-async function verifyEmailTransporter() {
-  try {
-    await emailTransporter.verify();
-    console.log("[EMAIL] SMTP transporter ready");
-  } catch (err) {
-    console.error("[EMAIL] SMTP transporter error:", err.message);
-  }
-}
 
 async function getShiftDelayEmailRecipients(companyId) {
   const result = await pool.query(
@@ -66,16 +49,16 @@ async function sendShiftDelayEmail(event) {
   }
 
   const recipientEmails = [
-  ...new Set(
-    recipients
-      .flatMap((recipient) => [
-        recipient.email,
-        recipient.secondary_email,
-      ])
-      .map((email) => email?.trim())
-      .filter(Boolean)
-  ),
-];
+    ...new Set(
+      recipients
+        .flatMap((recipient) => [
+          recipient.email,
+          recipient.secondary_email,
+        ])
+        .map((email) => email?.trim())
+        .filter(Boolean)
+    ),
+  ];
 
   const scheduledStart = new Date(event.scheduled_start).toLocaleString(
     "el-GR",
@@ -95,8 +78,7 @@ async function sendShiftDelayEmail(event) {
     }
   );
 
-  const subject =
-    `[Aegis Link] Shift Delay – ${event.site_name}`;
+  const subject = `[Aegis Link] Shift Delay – ${event.site_name}`;
 
   const text = [
     "AEGIS LINK – SHIFT DELAY ALERT",
@@ -112,16 +94,41 @@ async function sendShiftDelayEmail(event) {
     `Operational Event ID: ${event.id}`,
   ].join("\n");
 
-  const result = await emailTransporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: recipientEmails,
-    subject,
-    text,
+  const postmarkToken = process.env.POSTMARK_SERVER_TOKEN;
+
+  if (!postmarkToken) {
+    throw new Error("POSTMARK_SERVER_TOKEN is not configured");
+  }
+
+  const response = await fetch("https://api.postmarkapp.com/email", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Postmark-Server-Token": postmarkToken,
+    },
+    body: JSON.stringify({
+      From: process.env.SMTP_FROM || "info@eliaskalyvas.gr",
+      To: recipientEmails.join(","),
+      Subject: subject,
+      TextBody: text,
+      MessageStream: "outbound",
+    }),
   });
+
+  const result = await response.json();
+
+  if (!response.ok || result.ErrorCode !== 0) {
+    throw new Error(
+      `Postmark API error ${result.ErrorCode ?? response.status}: ${
+        result.Message || "Unknown Postmark error"
+      }`
+    );
+  }
 
   return {
     recipients: recipientEmails,
-    messageId: result.messageId || null,
+    messageId: result.MessageID || null,
   };
 }
 
@@ -10215,7 +10222,6 @@ app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
 });
 
-verifyEmailTransporter();
 startScheduledShiftGenerator();
 startShiftDelayMonitor();
 
