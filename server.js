@@ -1365,12 +1365,12 @@ async function detectShiftDelayEvents() {
           (NOW() AT TIME ZONE 'Europe/Athens')
 
       AND NOT EXISTS (
-        SELECT 1
-        FROM guard_sessions gs
-        WHERE gs.site_id = ss.site_id
-          AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
-          AND gs.login_time < ss.scheduled_end
-      )
+  SELECT 1
+  FROM guard_sessions gs
+  WHERE gs.site_id = ss.site_id
+    AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
+    AND gs.login_time <= ss.scheduled_start + INTERVAL '15 minutes'
+)
 
       AND NOT EXISTS (
         SELECT 1
@@ -10011,6 +10011,7 @@ app.listen(PORT, () => {
 });
 
 startScheduledShiftGenerator();
+startShiftDelayMonitor();
 
 setTimeout(runPatrolPushScheduler, 10000);
 
