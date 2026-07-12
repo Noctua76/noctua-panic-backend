@@ -439,83 +439,95 @@ ORDER BY username,last_seen DESC
     });
   }
 });
+
 // --------------------------------------------------
 // ADMIN HEARTBEAT
 // --------------------------------------------------
 
-app.post("/admin/heartbeat", async (req, res) => {
+app.post("/admin/heartbeat", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      UPDATE admin_sessions
+      SET last_seen = NOW()
+      WHERE id = $1
+        AND user_id = $2
+        AND is_active = true
+      RETURNING id, last_seen
+      `,
+      [
+        req.auth.session_id,
+        req.auth.user_id,
+      ]
+    );
 
-try{
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Active session not found",
+      });
+    }
 
-const { username } = req.body;
+    return res.json({
+      status: "ok",
+      last_seen: result.rows[0].last_seen,
+    });
+  } catch (err) {
+    console.error("Admin heartbeat error:", err);
 
-await pool.query(
-`
-UPDATE admin_sessions
-
-SET last_seen=NOW()
-
-WHERE username=$1
-AND is_active=true
-`,
-[username]
-);
-
-res.json({
-status:"ok"
-});
-
-}catch(err){
-
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
 });
 
 // --------------------------------------------------
 // ADMIN LOGOUT
 // --------------------------------------------------
 
-app.post("/admin/logout", async (req,res)=>{
+app.post("/admin/logout", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      UPDATE admin_sessions
+      SET
+        is_active = false,
+        logout_time = NOW(),
+        session_duration_seconds =
+          EXTRACT(EPOCH FROM (NOW() - login_time))::int
+      WHERE id = $1
+        AND user_id = $2
+        AND is_active = true
+      RETURNING
+        id,
+        logout_time,
+        session_duration_seconds
+      `,
+      [req.auth.session_id, req.auth.user_id]
+    );
 
-try{
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Active session not found",
+      });
+    }
 
-const { username } = req.body;
+    return res.json({
+      status: "ok",
+      logout_time: result.rows[0].logout_time,
+      session_duration_seconds:
+        result.rows[0].session_duration_seconds,
+    });
+  } catch (err) {
+    console.error("Admin logout error:", err);
 
-await pool.query(
-`
-UPDATE admin_sessions
-
-SET
-logout_time = NOW(),
-is_active = false,
-last_seen = NOW(),
-session_duration_seconds =
-EXTRACT(EPOCH FROM (NOW() - login_time))
-
-WHERE username = $1
-AND is_active = true
-`,
-[username]
-);
-
-res.json({
-status:"ok"
-});
-
-}catch(err){
-
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
 });
 
 // --------------------------------------------------
