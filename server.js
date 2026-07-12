@@ -1239,6 +1239,133 @@ app.post("/auth/login", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// AUTHENTICATED SESSION CONTEXT
+// ----------------------------------------------------------
+
+async function requireAuth(req, res, next) {
+  try {
+    const authorization = req.headers.authorization || "";
+
+    if (!authorization.startsWith("Bearer ")) {
+      return res.status(401).json({
+        status: "error",
+        message: "Authentication required",
+      });
+    }
+
+    const sessionToken = authorization.slice(7).trim();
+
+    if (!sessionToken) {
+      return res.status(401).json({
+        status: "error",
+        message: "Authentication required",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        ads.id AS session_id,
+        ads.user_id,
+        ads.session_token,
+        ads.login_time,
+        ads.last_seen,
+        ads.is_active,
+
+        u.full_name,
+        u.username,
+        u.email,
+        u.role,
+        u.status AS user_status,
+        u.company_id,
+
+        c.name AS company_name,
+        c.status AS company_status,
+        c.tenant_type
+
+      FROM admin_sessions ads
+
+      INNER JOIN users u
+        ON u.id = ads.user_id
+
+      LEFT JOIN companies c
+        ON c.id = u.company_id
+
+      WHERE ads.session_token = $1
+        AND ads.is_active = true
+      `,
+      [sessionToken]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid or inactive session",
+      });
+    }
+
+    const auth = result.rows[0];
+
+    if (auth.user_status !== "active") {
+      return res.status(403).json({
+        status: "error",
+        message: "User account is inactive",
+      });
+    }
+
+    if (!auth.company_id) {
+      return res.status(403).json({
+        status: "error",
+        message: "User is not assigned to a company",
+      });
+    }
+
+    if (!auth.company_name) {
+      return res.status(403).json({
+        status: "error",
+        message: "User company was not found",
+      });
+    }
+
+    if (
+      auth.role !== "system_owner" &&
+      !["pilot", "active"].includes(auth.company_status)
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Company account is not active",
+      });
+    }
+
+    req.auth = {
+      session_id: auth.session_id,
+      user_id: auth.user_id,
+      full_name: auth.full_name,
+      username: auth.username,
+      email: auth.email,
+      role: auth.role,
+      company_id: auth.company_id,
+      company_name: auth.company_name,
+      company_status: auth.company_status,
+      tenant_type: auth.tenant_type,
+      access_scope:
+        auth.role === "system_owner"
+          ? "platform"
+          : "company",
+    };
+
+    next();
+  } catch (err) {
+    console.error("Authentication middleware error:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+}
+
+// ----------------------------------------------------------
 // USER PASSWORD MANAGEMENT
 // ----------------------------------------------------------
 
