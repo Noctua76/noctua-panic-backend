@@ -1622,24 +1622,51 @@ app.get("/auth/context", requireAuth, async (req, res) => {
 // USER PASSWORD MANAGEMENT
 // ----------------------------------------------------------
 
-app.put("/admin/users/:id/reset-password", async (req, res) => {
+app.put("/admin/users/:id/reset-password", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const temporaryPassword = crypto
-  .randomBytes(9)
-  .toString("base64")
-  .replace(/[+/=]/g, "")
-  .slice(0, 12);
 
-const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    const userId = Number(id);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user id"
+      });
+    }
+
+    const {
+      companyId,
+      error
+    } = resolveAdminUsersCompanyScope(req);
+
+    if (error) {
+      return res.status(400).json({
+        status: "error",
+        message: error
+      });
+    }
+
+    const temporaryPassword = crypto
+      .randomBytes(9)
+      .toString("base64")
+      .replace(/[+/=]/g, "")
+      .slice(0, 12);
+
+    const passwordHash = await bcrypt.hash(
+      temporaryPassword,
+      10
+    );
 
     const result = await pool.query(
       `
       UPDATE users
       SET
         password_hash = $1,
-        must_change_password = true
+        must_change_password = true,
+        updated_at = NOW()
       WHERE id = $2
+        AND company_id = $3
       RETURNING
         id,
         full_name,
@@ -1648,9 +1675,14 @@ const passwordHash = await bcrypt.hash(temporaryPassword, 10);
         phone,
         role,
         status,
-        must_change_password
+        must_change_password,
+        company_id
       `,
-      [passwordHash, id]
+      [
+        passwordHash,
+        userId,
+        companyId
+      ]
     );
 
     if (result.rows.length === 0) {
@@ -1660,16 +1692,16 @@ const passwordHash = await bcrypt.hash(temporaryPassword, 10);
       });
     }
 
-    res.json({
-  status: "ok",
-  message: "Password reset successfully",
-  temporary_password: temporaryPassword,
-  user: result.rows[0]
-});
+    return res.json({
+      status: "ok",
+      message: "Password reset successfully",
+      temporary_password: temporaryPassword,
+      user: result.rows[0]
+    });
   } catch (err) {
     console.error("User reset password error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
       message: err.message
     });
