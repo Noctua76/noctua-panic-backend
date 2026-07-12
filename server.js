@@ -4060,9 +4060,12 @@ message:err.message
 // SETTINGS - SITES MANAGEMENT
 // ----------------------------------------------------------
 
-app.get("/settings/sites", async (req, res) => {
+app.get("/settings/sites", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const isSystemOwner = req.auth.role === "system_owner";
+
+    const result = await pool.query(
+      `
       SELECT
         id,
         company_id,
@@ -4072,55 +4075,110 @@ app.get("/settings/sites", async (req, res) => {
         required_shifts,
         full_address,
         coverage_type,
-shift_rules,
-site_phone,
-shift_schedule,
-residence_contact_name,
-residence_contact_phone,
-supervisor_contact_name,
-supervisor_contact_phone,
-operational_notes,
-sop_text,
-sop_file_url,
-sop_title,
-sop_version,
-sop_updated_at,
-general_notes,
-access_instructions,
-patrol_instructions,
-emergency_instructions,
-special_warnings,
+        shift_rules,
+        site_phone,
+        shift_schedule,
+        residence_contact_name,
+        residence_contact_phone,
+        supervisor_contact_name,
+        supervisor_contact_phone,
+        operational_notes,
+        sop_text,
+        sop_file_url,
+        sop_title,
+        sop_version,
+        sop_updated_at,
+        general_notes,
+        access_instructions,
+        patrol_instructions,
+        emergency_instructions,
+        special_warnings,
         created_at
       FROM sites
+      WHERE (
+        $1::boolean = true
+        OR company_id = $2
+      )
       ORDER BY id ASC
-    `);
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    );
 
-    res.json({
+    return res.json({
       status: "ok",
-      sites: result.rows
+      sites: result.rows,
     });
   } catch (err) {
     console.error("Settings sites GET error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
 
-app.post("/settings/sites", async (req, res) => {
+app.post("/settings/sites", requireAuth, async (req, res) => {
   try {
     const {
       name,
       location,
-      required_shifts = 1
+      required_shifts = 1,
     } = req.body;
 
-    if (!name) {
+    const siteName =
+      typeof name === "string" ? name.trim() : "";
+
+    const siteLocation =
+      typeof location === "string" ? location.trim() : "";
+
+    const requiredShifts = Number(required_shifts);
+
+    if (!siteName) {
       return res.status(400).json({
         status: "error",
-        message: "Site name is required"
+        message: "Site name is required",
+      });
+    }
+
+    if (
+      !Number.isInteger(requiredShifts) ||
+      requiredShifts <= 0
+    ) {
+      return res.status(400).json({
+        status: "error",
+        message: "required_shifts must be a positive integer",
+      });
+    }
+
+    const targetCompanyId = Number(req.auth.company_id);
+
+    if (
+      !Number.isInteger(targetCompanyId) ||
+      targetCompanyId <= 0
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Authenticated user is not assigned to a company",
+      });
+    }
+
+    const companyResult = await pool.query(
+      `
+      SELECT id
+      FROM companies
+      WHERE id = $1
+      `,
+      [targetCompanyId]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Company not found",
       });
     }
 
@@ -4134,35 +4192,35 @@ app.post("/settings/sites", async (req, res) => {
         required_shifts,
         created_at
       )
-      VALUES ($1,$2,$3,$4,$5,NOW())
+      VALUES ($1, $2, $3, $4, $5, NOW())
       RETURNING *
       `,
       [
-        1,
-        name,
-        location || "",
+        targetCompanyId,
+        siteName,
+        siteLocation,
         "active",
-        required_shifts
+        requiredShifts,
       ]
     );
 
-    res.json({
+    return res.json({
       status: "ok",
-      site: result.rows[0]
+      site: result.rows[0],
     });
   } catch (err) {
     console.error("Settings site POST error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
 
-app.put("/settings/sites/:id", async (req, res) => {
+app.put("/settings/sites/:id", requireAuth, async (req, res) => {
   try {
-    const { id } = req.params;
+    const siteId = Number(req.params.id);
 
     const {
       name,
@@ -4180,15 +4238,24 @@ app.put("/settings/sites/:id", async (req, res) => {
       sop_text,
       sop_file_url,
       sop_title,
-sop_version,
+      sop_version,
       coverage_type,
       shift_rules,
       general_notes,
       access_instructions,
       patrol_instructions,
       emergency_instructions,
-      special_warnings
+      special_warnings,
     } = req.body;
+
+    if (!Number.isInteger(siteId) || siteId <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid site id",
+      });
+    }
+
+    const isSystemOwner = req.auth.role === "system_owner";
 
     const result = await pool.query(
       `
@@ -4207,22 +4274,29 @@ sop_version,
         supervisor_contact_phone = COALESCE($11, supervisor_contact_phone),
         operational_notes = COALESCE($12, operational_notes),
         sop_text = COALESCE($13, sop_text),
-sop_file_url = COALESCE($14, sop_file_url),
-sop_title = COALESCE($15, sop_title),
-sop_version = COALESCE($16, sop_version),
-sop_updated_at = CASE
-  WHEN $13 IS NOT NULL OR $14 IS NOT NULL OR $15 IS NOT NULL OR $16 IS NOT NULL
-  THEN NOW()
-  ELSE sop_updated_at
-END,
-coverage_type = COALESCE($17, coverage_type),
-shift_rules = COALESCE($18, shift_rules),
-general_notes = COALESCE($19, general_notes),
-access_instructions = COALESCE($20, access_instructions),
-patrol_instructions = COALESCE($21, patrol_instructions),
-emergency_instructions = COALESCE($22, emergency_instructions),
-special_warnings = COALESCE($23, special_warnings)
-WHERE id = $24
+        sop_file_url = COALESCE($14, sop_file_url),
+        sop_title = COALESCE($15, sop_title),
+        sop_version = COALESCE($16, sop_version),
+        sop_updated_at = CASE
+          WHEN $13 IS NOT NULL
+            OR $14 IS NOT NULL
+            OR $15 IS NOT NULL
+            OR $16 IS NOT NULL
+          THEN NOW()
+          ELSE sop_updated_at
+        END,
+        coverage_type = COALESCE($17, coverage_type),
+        shift_rules = COALESCE($18, shift_rules),
+        general_notes = COALESCE($19, general_notes),
+        access_instructions = COALESCE($20, access_instructions),
+        patrol_instructions = COALESCE($21, patrol_instructions),
+        emergency_instructions = COALESCE($22, emergency_instructions),
+        special_warnings = COALESCE($23, special_warnings)
+      WHERE id = $24
+        AND (
+          $25::boolean = true
+          OR company_id = $26
+        )
       RETURNING *
       `,
       [
@@ -4239,47 +4313,84 @@ WHERE id = $24
         supervisor_contact_phone || null,
         operational_notes || null,
         sop_text || null,
-sop_file_url || null,
-sop_title || null,
-sop_version || null,
-coverage_type || null,
-shift_rules || null,
-general_notes || null,
-access_instructions || null,
-patrol_instructions || null,
-emergency_instructions || null,
-special_warnings || null,
-id
+        sop_file_url || null,
+        sop_title || null,
+        sop_version || null,
+        coverage_type || null,
+        shift_rules || null,
+        general_notes || null,
+        access_instructions || null,
+        patrol_instructions || null,
+        emergency_instructions || null,
+        special_warnings || null,
+        siteId,
+        isSystemOwner,
+        req.auth.company_id,
       ]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({
         status: "error",
-        message: "Site not found"
+        message: "Site not found",
       });
     }
 
-    res.json({
+    return res.json({
       status: "ok",
-      site: result.rows[0]
+      site: result.rows[0],
     });
   } catch (err) {
     console.error("Settings site PUT error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
 
 app.post(
   "/settings/sites/:id/sop/upload",
+  requireAuth,
   upload.single("sop_file"),
   async (req, res) => {
     try {
-      const { id } = req.params;
+      const siteId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT
+          id,
+          company_id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
 
       if (!req.file) {
         return res.status(400).json({
@@ -4302,7 +4413,10 @@ app.post(
         .replace(/\s+/g, "-")
         .replace(/[^a-zA-Z0-9._-]/g, "");
 
-      const filePath = `sites/site-${id}/sop-${Date.now()}-${safeOriginalName}`;
+      const filePath =
+        `companies/company-${siteResult.rows[0].company_id}/` +
+        `sites/site-${siteId}/` +
+        `sop-${Date.now()}-${safeOriginalName}`;
 
       const { error: uploadError } = await supabase.storage
         .from(bucket)
@@ -4312,12 +4426,14 @@ app.post(
         });
 
       if (uploadError) {
-        console.error("Supabase SOP upload error:", uploadError);
+        console.error(
+          "Supabase SOP upload error:",
+          uploadError
+        );
 
         return res.status(500).json({
           status: "error",
           message: "Failed to upload SOP file",
-          error: uploadError.message,
         });
       }
 
@@ -4334,9 +4450,18 @@ app.post(
           sop_file_url = $1,
           sop_updated_at = NOW()
         WHERE id = $2
+          AND (
+            $3::boolean = true
+            OR company_id = $4
+          )
         RETURNING *
         `,
-        [publicUrl, id]
+        [
+          publicUrl,
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
       );
 
       if (result.rows.length === 0) {
@@ -4346,7 +4471,7 @@ app.post(
         });
       }
 
-      res.json({
+      return res.json({
         status: "ok",
         message: "SOP file uploaded",
         site: result.rows[0],
@@ -4355,9 +4480,9 @@ app.post(
     } catch (err) {
       console.error("SOP upload endpoint error:", err);
 
-      res.status(500).json({
+      return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "SOP upload failed",
       });
     }
   }
@@ -4365,16 +4490,51 @@ app.post(
 
 app.post(
   "/settings/sites/:id/documents/:slot/upload",
+  requireAuth,
   upload.single("site_document"),
   async (req, res) => {
     try {
-      const siteId = req.params.id;
+      const siteId = Number(req.params.id);
       const slot = Number(req.params.slot);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
 
       if (![1, 2].includes(slot)) {
         return res.status(400).json({
           status: "error",
           message: "Invalid document slot",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT
+          id,
+          company_id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
         });
       }
 
@@ -4385,36 +4545,73 @@ app.post(
         });
       }
 
-      const fileExt = req.file.originalname.split(".").pop();
-      const fileName = `sites/site-${siteId}/documents/document-${slot}-${Date.now()}.${fileExt}`;
+      if (req.file.mimetype !== "application/pdf") {
+        return res.status(400).json({
+          status: "error",
+          message: "Only PDF files are allowed",
+        });
+      }
+
+      const bucket =
+        process.env.SUPABASE_SOP_BUCKET || "aegis-sop-files";
+
+      const fileName =
+        `companies/company-${siteResult.rows[0].company_id}/` +
+        `sites/site-${siteId}/documents/` +
+        `document-${slot}-${Date.now()}.pdf`;
 
       const { error: uploadError } = await supabase.storage
-        .from("aegis-sop-files")
+        .from(bucket)
         .upload(fileName, req.file.buffer, {
-          contentType: req.file.mimetype,
+          contentType: "application/pdf",
           upsert: true,
         });
 
       if (uploadError) {
-        throw uploadError;
+        console.error(
+          "Supabase site document upload error:",
+          uploadError
+        );
+
+        return res.status(500).json({
+          status: "error",
+          message: "Failed to upload site document",
+        });
       }
 
       const { data } = supabase.storage
-        .from("aegis-sop-files")
+        .from(bucket)
         .getPublicUrl(fileName);
 
       const columnName = `document_${slot}_url`;
 
-      await pool.query(
+      const updateResult = await pool.query(
         `
         UPDATE sites
         SET ${columnName} = $1
         WHERE id = $2
+          AND (
+            $3::boolean = true
+            OR company_id = $4
+          )
+        RETURNING id
         `,
-        [data.publicUrl, siteId]
+        [
+          data.publicUrl,
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
       );
 
-      res.json({
+      if (updateResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
         status: "ok",
         slot,
         document_url: data.publicUrl,
@@ -4422,7 +4619,7 @@ app.post(
     } catch (err) {
       console.error("Site document upload error:", err);
 
-      res.status(500).json({
+      return res.status(500).json({
         status: "error",
         message: "Site document upload failed",
       });
@@ -4430,79 +4627,119 @@ app.post(
   }
 );
 
-app.put("/settings/sites/:id/toggle-active", async (req, res) => {
-  try {
-    const { id } = req.params;
+app.put(
+  "/settings/sites/:id/toggle-active",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const result = await pool.query(
-      `
-      UPDATE sites
-      SET status =
-        CASE
-          WHEN status = 'active' THEN 'inactive'
-          ELSE 'active'
-        END
-      WHERE id = $1
-      RETURNING *
-      `,
-      [id]
-    );
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
+      const result = await pool.query(
+        `
+        UPDATE sites
+        SET status =
+          CASE
+            WHEN status = 'active' THEN 'inactive'
+            ELSE 'active'
+          END
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        RETURNING *
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        site: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Site toggle error:", err);
+
+      return res.status(500).json({
         status: "error",
-        message: "Site not found"
+        message: err.message,
       });
     }
-
-    res.json({
-      status: "ok",
-      site: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Site toggle error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
-app.put("/settings/sites/:id/archive", async (req, res) => {
-  try {
-    const { id } = req.params;
+app.put(
+  "/settings/sites/:id/archive",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const result = await pool.query(
-      `
-      UPDATE sites
-      SET status = 'archived'
-      WHERE id = $1
-      RETURNING *
-      `,
-      [id]
-    );
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
+      const result = await pool.query(
+        `
+        UPDATE sites
+        SET status = 'archived'
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        RETURNING *
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        site: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Settings site archive error:", err);
+
+      return res.status(500).json({
         status: "error",
-        message: "Site not found"
+        message: err.message,
       });
     }
-
-    res.json({
-      status: "ok",
-      site: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Settings site archive error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
 // ----------------------------------------------------------
 // SETTINGS - GUARDS MANAGEMENT
@@ -7255,42 +7492,78 @@ app.get("/setup/patrol-scan-window-upgrade", async (req, res) => {
 // QR PATROL POINTS API
 // ----------------------------------------------------------
 
-app.get("/settings/sites/:siteId/patrol-points", async (req, res) => {
-  try {
-    const { siteId } = req.params;
+app.get(
+  "/settings/sites/:siteId/patrol-points",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.siteId);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        site_id,
-        point_name,
-        point_description,
-        qr_token,
-        expected_interval_minutes,
-        active,
-        created_at
-      FROM patrol_points
-      WHERE site_id = $1
-        AND active = true
-      ORDER BY id ASC
-      `,
-      [siteId]
-    );
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site ID",
+        });
+      }
 
-    res.json({
-      status: "ok",
-      points: result.rows
-    });
-  } catch (err) {
-    console.error("Load patrol points error:", err);
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          site_id,
+          point_name,
+          point_description,
+          qr_token,
+          expected_interval_minutes,
+          active,
+          created_at
+        FROM patrol_points
+        WHERE site_id = $1
+          AND active = true
+        ORDER BY id ASC
+        `,
+        [siteId]
+      );
+
+      return res.json({
+        status: "ok",
+        points: result.rows,
+      });
+    } catch (err) {
+      console.error("Load patrol points error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to load patrol points",
+      });
+    }
   }
-});
+);
 
 app.get("/guard/patrols/board", async (req, res) => {
   try {
@@ -8322,390 +8595,675 @@ app.post("/patrol/scan", async (req, res) => {
   }
 });
 
-app.post("/settings/sites/:siteId/patrol-points", async (req, res) => {
-  try {
-    const { siteId } = req.params;
+app.post(
+  "/settings/sites/:siteId/patrol-points",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.siteId);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const {
-      point_name,
-      point_description,
-      expected_interval_minutes
-    } = req.body;
-
-    if (!point_name) {
-      return res.status(400).json({
-        status: "error",
-        message: "point_name is required"
-      });
-    }
-
-    const result = await pool.query(
-      `
-      INSERT INTO patrol_points (
-        site_id,
+      const {
         point_name,
         point_description,
         expected_interval_minutes,
-        active,
-        created_at
-      )
-      VALUES ($1,$2,$3,$4,true,NOW())
-      RETURNING *
-      `,
-      [
-        siteId,
-        point_name,
-        point_description || null,
-        expected_interval_minutes || null
-      ]
-    );
+      } = req.body;
 
-    res.json({
-      status: "ok",
-      point: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Create patrol point error:", err);
+      const normalizedPointName =
+        typeof point_name === "string" ? point_name.trim() : "";
 
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
+      const normalizedPointDescription =
+        typeof point_description === "string"
+          ? point_description.trim()
+          : "";
 
-app.put("/settings/patrol-points/:id/deactivate", async (req, res) => {
-  try {
-    const { id } = req.params;
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site ID",
+        });
+      }
 
-    const result = await pool.query(
-      `
-      UPDATE patrol_points
-      SET active = false
-      WHERE id = $1
-      RETURNING *
-      `,
-      [id]
-    );
+      if (!normalizedPointName) {
+        return res.status(400).json({
+          status: "error",
+          message: "point_name is required",
+        });
+      }
 
-    res.json({
-      status: "ok",
-      point: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Deactivate patrol point error:", err);
+      let normalizedInterval = null;
 
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
+      if (
+        expected_interval_minutes !== undefined &&
+        expected_interval_minutes !== null &&
+        expected_interval_minutes !== ""
+      ) {
+        normalizedInterval = Number(expected_interval_minutes);
 
-app.post("/settings/patrol-points/:id/generate-qr", async (req, res) => {
-  try {
-    const { id } = req.params;
+        if (
+          !Number.isInteger(normalizedInterval) ||
+          normalizedInterval <= 0
+        ) {
+          return res.status(400).json({
+            status: "error",
+            message:
+              "expected_interval_minutes must be a positive integer",
+          });
+        }
+      }
 
-    const qrToken = crypto.randomUUID();
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-    const result = await pool.query(
-      `
-      UPDATE patrol_points
-      SET qr_token = $1
-      WHERE id = $2
-      RETURNING *
-      `,
-      [qrToken, id]
-    );
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
 
-    res.json({
-      status: "ok",
-      point: result.rows[0],
-    });
-  } catch (err) {
-    console.error("Generate QR error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
-  }
-});
-
-app.put("/settings/patrol-points/:id/schedule", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const {
-      expected_interval_minutes,
-    } = req.body;
-
-    if (!expected_interval_minutes) {
-      return res.status(400).json({
-        status: "error",
-        message: "expected_interval_minutes is required",
-      });
-    }
-
-    const result = await pool.query(
-      `
-      UPDATE patrol_points
-      SET expected_interval_minutes = $1
-      WHERE id = $2
-      RETURNING *
-      `,
-      [expected_interval_minutes, id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Patrol point not found",
-      });
-    }
-
-    res.json({
-      status: "ok",
-      point: result.rows[0],
-    });
-  } catch (err) {
-    console.error("Update patrol point schedule error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
-  }
-});
-
-app.post("/settings/sites/:siteId/patrol-schedules/manual", async (req, res) => {
-  try {
-    const { siteId } = req.params;
-
-    const {
-      scheduled_date,
-      scheduled_time,
-      reminder_minutes_before = 5,
-      created_by_admin_id,
-      created_by_username,
-      created_by_role,
-    } = req.body;
-
-    if (!scheduled_date || !scheduled_time) {
-      return res.status(400).json({
-        status: "error",
-        message: "scheduled_date and scheduled_time are required",
-      });
-    }
-
-    if (!created_by_username) {
-      return res.status(400).json({
-        status: "error",
-        message: "created_by_username is required",
-      });
-    }
-
-    const pointsResult = await pool.query(
-      `
-      SELECT id
-      FROM patrol_points
-      WHERE site_id = $1
-        AND active = true
-      ORDER BY id ASC
-      `,
-      [siteId]
-    );
-
-    if (pointsResult.rows.length === 0) {
-      return res.status(400).json({
-        status: "error",
-        message: "No active patrol points found for this site",
-      });
-    }
-
-    const inserted = [];
-
-    for (const point of pointsResult.rows) {
       const result = await pool.query(
         `
-        INSERT INTO patrol_schedules (
+        INSERT INTO patrol_points (
           site_id,
-          patrol_point_id,
-          schedule_type,
-          scheduled_date,
-          scheduled_time,
-          reminder_minutes_before,
+          point_name,
+          point_description,
+          expected_interval_minutes,
           active,
-          created_at,
-          created_by_admin_id,
-          created_by_username,
-          created_by_role,
-          manual_status
+          created_at
         )
-        VALUES ($1,$2,'manual',$3,$4,$5,true,NOW(),$6,$7,$8,'pending')
+        VALUES ($1,$2,$3,$4,true,NOW())
         RETURNING *
         `,
         [
           siteId,
-          point.id,
-          scheduled_date,
-          scheduled_time,
-          reminder_minutes_before,
-          created_by_admin_id || null,
-          created_by_username,
-          created_by_role || "admin",
+          normalizedPointName,
+          normalizedPointDescription || null,
+          normalizedInterval,
         ]
       );
 
-      inserted.push(result.rows[0]);
-    }
+      return res.status(201).json({
+        status: "ok",
+        point: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Create patrol point error:", err);
 
-    res.json({
-      status: "ok",
-      message: "Manual patrol schedule added",
-      schedules: inserted,
-    });
-  } catch (err) {
-    console.error("Manual patrol schedule error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
-  }
-});
-
-app.post("/settings/sites/:siteId/patrol-schedules/recurring", async (req, res) => {
-  try {
-    const { siteId } = req.params;
-
-    const {
-  interval_hours,
-  start_time,
-  reminder_minutes_before = 5,
-  schedule_scope = "24_7",
-  created_by_admin_id,
-  created_by_username,
-  created_by_role,
-} = req.body;
-
-    if (!interval_hours) {
-      return res.status(400).json({
+      return res.status(500).json({
         status: "error",
-        message: "interval_hours is required",
+        message: "Failed to create patrol point",
       });
     }
-
-    if (!start_time) {
-  return res.status(400).json({
-    status: "error",
-    message: "start_time is required",
-  });
-}
-
-if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start_time)) {
-  return res.status(400).json({
-    status: "error",
-    message: "start_time must be in HH:mm format",
-  });
-}
-
-if (!created_by_username) {
-  return res.status(400).json({
-    status: "error",
-    message: "created_by_username is required",
-  });
-}
-
-    const intervalMinutes = Number(interval_hours) * 60;
-
-    const updatePointsResult = await pool.query(
-  `
-  UPDATE patrol_points
-  SET expected_interval_minutes = $1
-  WHERE site_id = $2
-    AND active = true
-  RETURNING id, point_name, expected_interval_minutes
-  `,
-  [intervalMinutes, siteId]
+  }
 );
 
-    await pool.query(
-      `
-      UPDATE patrol_schedules
-      SET active = false
-      WHERE site_id = $1
-        AND schedule_type = 'recurring'
-      `,
-      [siteId]
-    );
+app.put(
+  "/settings/patrol-points/:id/deactivate",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const pointId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const pointsResult = await pool.query(
-      `
-      SELECT id
-      FROM patrol_points
-      WHERE site_id = $1
-        AND active = true
-      ORDER BY id ASC
-      `,
-      [siteId]
-    );
+      if (!Number.isInteger(pointId) || pointId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid patrol point ID",
+        });
+      }
 
-    const inserted = [];
-
-    for (const point of pointsResult.rows) {
       const result = await pool.query(
         `
-        INSERT INTO patrol_schedules (
-  site_id,
-  patrol_point_id,
-  schedule_type,
-  interval_hours,
-  start_time,
-  reminder_minutes_before,
-  active,
-  created_at,
-  created_by_admin_id,
-  created_by_username,
-  created_by_role
-)
-VALUES ($1,$2,'recurring',$3,$4,$5,true,NOW(),$6,$7,$8)
-RETURNING *
+        UPDATE patrol_points pp
+        SET active = false
+        FROM sites s
+        WHERE pp.id = $1
+          AND s.id = pp.site_id
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        RETURNING pp.*
         `,
         [
-  siteId,
-  point.id,
-  Number(interval_hours),
-  start_time,
-  Number(reminder_minutes_before),
-  created_by_admin_id || null,
-  created_by_username,
-  created_by_role || "admin",
-]
+          pointId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
       );
 
-      inserted.push(result.rows[0]);
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Patrol point not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        point: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Deactivate patrol point error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to deactivate patrol point",
+      });
     }
-
-    res.json({
-      status: "ok",
-      message: "Recurring patrol schedule saved for site",
-      interval_minutes: intervalMinutes,
-      schedule_scope,
-      updated_points_count: updatePointsResult.rowCount,
-updated_points: updatePointsResult.rows,
-      schedules: inserted,
-    });
-  } catch (err) {
-    console.error("Recurring patrol schedule error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: "Failed to save recurring patrol schedule",
-      detail: err.message,
-    });
   }
-});
+);
+
+app.post(
+  "/settings/patrol-points/:id/generate-qr",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const pointId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(pointId) || pointId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid patrol point ID",
+        });
+      }
+
+      const qrToken = crypto.randomUUID();
+
+      const result = await pool.query(
+        `
+        UPDATE patrol_points pp
+        SET qr_token = $1
+        FROM sites s
+        WHERE pp.id = $2
+          AND s.id = pp.site_id
+          AND (
+            $3::boolean = true
+            OR s.company_id = $4
+          )
+        RETURNING pp.*
+        `,
+        [
+          qrToken,
+          pointId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Patrol point not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        point: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Generate QR error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to generate QR token",
+      });
+    }
+  }
+);
+
+app.put(
+  "/settings/patrol-points/:id/schedule",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const pointId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const normalizedInterval = Number(
+        req.body.expected_interval_minutes
+      );
+
+      if (!Number.isInteger(pointId) || pointId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid patrol point ID",
+        });
+      }
+
+      if (
+        !Number.isInteger(normalizedInterval) ||
+        normalizedInterval <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "expected_interval_minutes must be a positive integer",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE patrol_points pp
+        SET expected_interval_minutes = $1
+        FROM sites s
+        WHERE pp.id = $2
+          AND s.id = pp.site_id
+          AND (
+            $3::boolean = true
+            OR s.company_id = $4
+          )
+        RETURNING pp.*
+        `,
+        [
+          normalizedInterval,
+          pointId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Patrol point not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        point: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Update patrol schedule error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to update patrol schedule",
+      });
+    }
+  }
+);
+
+app.post(
+  "/settings/sites/:siteId/patrol-schedules/manual",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.siteId);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const {
+        scheduled_date,
+        scheduled_time,
+        reminder_minutes_before = 5,
+      } = req.body;
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site ID",
+        });
+      }
+
+      if (!scheduled_date || !scheduled_time) {
+        return res.status(400).json({
+          status: "error",
+          message: "scheduled_date and scheduled_time are required",
+        });
+      }
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(scheduled_date)) {
+        return res.status(400).json({
+          status: "error",
+          message: "scheduled_date must be in YYYY-MM-DD format",
+        });
+      }
+
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(scheduled_time)) {
+        return res.status(400).json({
+          status: "error",
+          message: "scheduled_time must be in HH:mm format",
+        });
+      }
+
+      const normalizedReminder = Number(reminder_minutes_before);
+
+      if (
+        !Number.isInteger(normalizedReminder) ||
+        normalizedReminder < 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "reminder_minutes_before must be a non-negative integer",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const pointsResult = await pool.query(
+        `
+        SELECT id
+        FROM patrol_points
+        WHERE site_id = $1
+          AND active = true
+        ORDER BY id ASC
+        `,
+        [siteId]
+      );
+
+      if (pointsResult.rows.length === 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "No active patrol points found for this site",
+        });
+      }
+
+      const inserted = [];
+
+      for (const point of pointsResult.rows) {
+        const result = await pool.query(
+          `
+          INSERT INTO patrol_schedules (
+            site_id,
+            patrol_point_id,
+            schedule_type,
+            scheduled_date,
+            scheduled_time,
+            reminder_minutes_before,
+            active,
+            created_at,
+            created_by_admin_id,
+            created_by_username,
+            created_by_role,
+            manual_status
+          )
+          VALUES ($1,$2,'manual',$3,$4,$5,true,NOW(),$6,$7,$8,'pending')
+          RETURNING *
+          `,
+          [
+            siteId,
+            point.id,
+            scheduled_date,
+            scheduled_time,
+            normalizedReminder,
+            req.auth.user_id,
+            req.auth.username,
+            req.auth.role,
+          ]
+        );
+
+        inserted.push(result.rows[0]);
+      }
+
+      return res.status(201).json({
+        status: "ok",
+        message: "Manual patrol schedule added",
+        schedules: inserted,
+      });
+    } catch (err) {
+      console.error("Manual patrol schedule error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to add manual patrol schedule",
+      });
+    }
+  }
+);
+
+app.post(
+  "/settings/sites/:siteId/patrol-schedules/recurring",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const siteId = Number(req.params.siteId);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const {
+        interval_hours,
+        start_time,
+        reminder_minutes_before = 5,
+        schedule_scope = "24_7",
+      } = req.body;
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site ID",
+        });
+      }
+
+      const normalizedIntervalHours = Number(interval_hours);
+
+      if (
+        !Number.isInteger(normalizedIntervalHours) ||
+        normalizedIntervalHours <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "interval_hours must be a positive integer",
+        });
+      }
+
+      if (
+        typeof start_time !== "string" ||
+        !/^([01]\d|2[0-3]):[0-5]\d$/.test(start_time)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "start_time must be in HH:mm format",
+        });
+      }
+
+      const normalizedReminder = Number(reminder_minutes_before);
+
+      if (
+        !Number.isInteger(normalizedReminder) ||
+        normalizedReminder < 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "reminder_minutes_before must be a non-negative integer",
+        });
+      }
+
+      if (!["24_7", "custom"].includes(schedule_scope)) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid schedule_scope",
+        });
+      }
+
+      const siteResult = await client.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const pointsResult = await client.query(
+        `
+        SELECT id
+        FROM patrol_points
+        WHERE site_id = $1
+          AND active = true
+        ORDER BY id ASC
+        `,
+        [siteId]
+      );
+
+      if (pointsResult.rows.length === 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "No active patrol points found for this site",
+        });
+      }
+
+      const intervalMinutes = normalizedIntervalHours * 60;
+
+      await client.query("BEGIN");
+
+      const updatePointsResult = await client.query(
+        `
+        UPDATE patrol_points
+        SET expected_interval_minutes = $1
+        WHERE site_id = $2
+          AND active = true
+        RETURNING
+          id,
+          point_name,
+          expected_interval_minutes
+        `,
+        [
+          intervalMinutes,
+          siteId,
+        ]
+      );
+
+      await client.query(
+        `
+        UPDATE patrol_schedules
+        SET active = false
+        WHERE site_id = $1
+          AND schedule_type = 'recurring'
+        `,
+        [siteId]
+      );
+
+      const inserted = [];
+
+      for (const point of pointsResult.rows) {
+        const result = await client.query(
+          `
+          INSERT INTO patrol_schedules (
+            site_id,
+            patrol_point_id,
+            schedule_type,
+            interval_hours,
+            start_time,
+            reminder_minutes_before,
+            active,
+            created_at,
+            created_by_admin_id,
+            created_by_username,
+            created_by_role
+          )
+          VALUES (
+            $1,
+            $2,
+            'recurring',
+            $3,
+            $4,
+            $5,
+            true,
+            NOW(),
+            $6,
+            $7,
+            $8
+          )
+          RETURNING *
+          `,
+          [
+            siteId,
+            point.id,
+            normalizedIntervalHours,
+            start_time,
+            normalizedReminder,
+            req.auth.user_id,
+            req.auth.username,
+            req.auth.role,
+          ]
+        );
+
+        inserted.push(result.rows[0]);
+      }
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        status: "ok",
+        message: "Recurring patrol schedule saved for site",
+        interval_minutes: intervalMinutes,
+        schedule_scope,
+        updated_points_count: updatePointsResult.rowCount,
+        updated_points: updatePointsResult.rows,
+        schedules: inserted,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      console.error("Recurring patrol schedule error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to save recurring patrol schedule",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
 
 app.get("/settings/sites/:siteId/patrol-schedules", async (req, res) => {
   try {
@@ -9978,79 +10536,116 @@ res.setHeader(
   }
 });
 
-app.put("/patrols/manual/:scheduleId/cancel", async (req, res) => {
-  try {
-    const { scheduleId } = req.params;
+app.put(
+  "/patrols/manual/:scheduleId/cancel",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const scheduleId = Number(req.params.scheduleId);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const {
-      cancelled_by_username,
-      cancel_reason = "Cancelled by admin",
-    } = req.body;
+      const cancelReason =
+        typeof req.body.cancel_reason === "string" &&
+        req.body.cancel_reason.trim()
+          ? req.body.cancel_reason.trim()
+          : "Cancelled by admin";
 
-    if (!cancelled_by_username) {
-      return res.status(400).json({
+      if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid schedule ID",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE patrol_schedules ps
+        SET
+          active = false,
+          manual_status = 'cancelled',
+          cancelled_at = NOW(),
+          cancelled_by_username = $1,
+          cancel_reason = $2
+        FROM sites s
+        WHERE ps.id = $3
+          AND ps.schedule_type = 'manual'
+          AND ps.cancelled_at IS NULL
+          AND s.id = ps.site_id
+          AND (
+            $4::boolean = true
+            OR s.company_id = $5
+          )
+        RETURNING ps.*
+        `,
+        [
+          req.auth.username,
+          cancelReason,
+          scheduleId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Manual patrol not found or already cancelled",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        message: "Manual patrol cancelled",
+        manual_patrol: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Manual patrol cancel error:", err);
+
+      return res.status(500).json({
         status: "error",
-        message: "cancelled_by_username is required",
+        message: "Failed to cancel manual patrol",
       });
     }
-
-    const result = await pool.query(
-      `
-      UPDATE patrol_schedules
-      SET
-        active = false,
-        manual_status = 'cancelled',
-        cancelled_at = NOW(),
-        cancelled_by_username = $2,
-        cancel_reason = $3
-      WHERE id = $1
-        AND schedule_type = 'manual'
-        AND cancelled_at IS NULL
-      RETURNING *
-      `,
-      [
-        scheduleId,
-        cancelled_by_username,
-        cancel_reason,
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Manual patrol not found or already cancelled",
-      });
-    }
-
-    res.json({
-      status: "ok",
-      message: "Manual patrol cancelled",
-      manual_patrol: result.rows[0],
-    });
-  } catch (err) {
-    console.error("Manual patrol cancel error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: "Failed to cancel manual patrol",
-      detail: err.message,
-    });
   }
-});
+);
 
-app.get("/patrols/manual-history", async (req, res) => {
-  try {
-    const { site_id } = req.query;
+app.get(
+  "/patrols/manual-history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const values = [];
-    let whereClause = `
-      WHERE ps.schedule_type = 'manual'
-    `;
+      const values = [
+        isSystemOwner,
+        req.auth.company_id,
+      ];
 
-    if (site_id) {
-      values.push(Number(site_id));
-      whereClause += ` AND ps.site_id = $${values.length}`;
-    }
+      let whereClause = `
+        WHERE ps.schedule_type = 'manual'
+          AND (
+            $1::boolean = true
+            OR s.company_id = $2
+          )
+      `;
+
+      if (
+        req.query.site_id !== undefined &&
+        req.query.site_id !== null &&
+        req.query.site_id !== ""
+      ) {
+        const siteId = Number(req.query.site_id);
+
+        if (!Number.isInteger(siteId) || siteId <= 0) {
+          return res.status(400).json({
+            status: "error",
+            message: "Invalid site ID",
+          });
+        }
+
+        values.push(siteId);
+        whereClause += ` AND ps.site_id = $${values.length}`;
+      }
 
     const result = await pool.query(
       `
