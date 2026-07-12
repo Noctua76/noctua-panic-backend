@@ -1708,31 +1708,67 @@ app.put("/admin/users/:id/reset-password", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/auth/change-password", async (req, res) => {
+app.post("/auth/change-password", requireAuth, async (req, res) => {
   try {
-    const { user_id, current_password, new_password } = req.body;
+    const authenticatedUserId = Number(req.auth.user_id);
+    const { current_password, new_password } = req.body;
 
-    if (!user_id || !current_password || !new_password) {
+    if (!Number.isInteger(authenticatedUserId) || authenticatedUserId <= 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid authenticated session",
+      });
+    }
+
+    if (
+      typeof current_password !== "string" ||
+      typeof new_password !== "string" ||
+      !current_password ||
+      !new_password
+    ) {
       return res.status(400).json({
         status: "error",
-        message: "user_id, current_password and new_password are required"
+        message: "current_password and new_password are required",
+      });
+    }
+
+    if (new_password.length < 8) {
+      return res.status(400).json({
+        status: "error",
+        message: "New password must be at least 8 characters long",
+      });
+    }
+
+    if (current_password === new_password) {
+      return res.status(400).json({
+        status: "error",
+        message: "New password must be different from the current password",
       });
     }
 
     const userResult = await pool.query(
       `
-      SELECT *
+      SELECT
+        id,
+        full_name,
+        username,
+        email,
+        phone,
+        role,
+        status,
+        password_hash,
+        must_change_password
       FROM users
       WHERE id = $1
         AND status = 'active'
       `,
-      [user_id]
+      [authenticatedUserId]
     );
 
     if (userResult.rows.length === 0) {
-      return res.status(404).json({
+      return res.status(401).json({
         status: "error",
-        message: "User not found or inactive"
+        message: "Authenticated user not found or inactive",
       });
     }
 
@@ -1746,7 +1782,7 @@ app.post("/auth/change-password", async (req, res) => {
     if (!validPassword) {
       return res.status(401).json({
         status: "error",
-        message: "Current password is incorrect"
+        message: "Current password is incorrect",
       });
     }
 
@@ -1757,8 +1793,10 @@ app.post("/auth/change-password", async (req, res) => {
       UPDATE users
       SET
         password_hash = $1,
-        must_change_password = false
+        must_change_password = false,
+        updated_at = NOW()
       WHERE id = $2
+        AND status = 'active'
       RETURNING
         id,
         full_name,
@@ -1767,22 +1805,30 @@ app.post("/auth/change-password", async (req, res) => {
         phone,
         role,
         status,
-        must_change_password
+        must_change_password,
+        updated_at
       `,
-      [newPasswordHash, user_id]
+      [newPasswordHash, authenticatedUserId]
     );
 
-    res.json({
+    if (updateResult.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Password change could not be completed",
+      });
+    }
+
+    return res.json({
       status: "ok",
       message: "Password changed successfully",
-      user: updateResult.rows[0]
+      user: updateResult.rows[0],
     });
   } catch (err) {
     console.error("Change password error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: "Unable to change password",
     });
   }
 });
