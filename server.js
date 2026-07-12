@@ -1073,73 +1073,167 @@ app.post("/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    const result = await pool.query(
-      "SELECT * FROM users WHERE username = $1",
-      [username]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({
+    if (!username || !password) {
+      return res.status(400).json({
         status: "error",
-        message: "Invalid credentials"
+        message: "Username and password are required",
       });
     }
 
-    const user = result.rows[0];
-    
+    const userResult = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.full_name,
+        u.username,
+        u.email,
+        u.role,
+        u.status,
+        u.company_id,
+        u.password_hash,
+        u.must_change_password,
+        c.name AS company_name,
+        c.status AS company_status,
+        c.tenant_type
+      FROM users u
+      LEFT JOIN companies c
+        ON c.id = u.company_id
+      WHERE u.username = $1
+      `,
+      [username]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Invalid credentials",
+      });
+    }
+
+    const user = userResult.rows[0];
 
     if (user.status !== "active") {
-  return res.status(403).json({
-    status: "error",
-    message: "User account is inactive"
-  });
-}
-const validPassword = await bcrypt.compare(
-  password,
-  user.password_hash
-);
+      return res.status(403).json({
+        status: "error",
+        message: "User account is inactive",
+      });
+    }
+
+    if (!user.company_id) {
+      return res.status(403).json({
+        status: "error",
+        message: "User is not assigned to a company",
+      });
+    }
+
+    if (!user.company_name) {
+      return res.status(403).json({
+        status: "error",
+        message: "User company was not found",
+      });
+    }
+
+    if (
+      user.role !== "system_owner" &&
+      !["pilot", "active"].includes(user.company_status)
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Company account is not active",
+      });
+    }
+
+    const validPassword = await bcrypt.compare(
+      password,
+      user.password_hash
+    );
 
     if (!validPassword) {
       return res.status(401).json({
         status: "error",
-        message: "Invalid credentials"
+        message: "Invalid credentials",
       });
     }
-    await pool.query(
-`
-INSERT INTO admin_sessions (
-  user_id,
-  username,
-  role,
-  login_time,
-  last_seen,
-  is_active
-)
-VALUES ($1,$2,$3,NOW(),NOW(),true)
-`,
-[
-  user.id,
-  user.username,
-  user.role
-]
-);
 
-    res.json({
+    const sessionToken = crypto.randomBytes(32).toString("hex");
+
+    const sessionResult = await pool.query(
+      `
+      INSERT INTO admin_sessions (
+        user_id,
+        username,
+        role,
+        company_id,
+        session_token,
+        login_time,
+        last_seen,
+        is_active
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        NOW(),
+        NOW(),
+        true
+      )
+      RETURNING
+        id,
+        user_id,
+        username,
+        role,
+        company_id,
+        session_token,
+        login_time,
+        last_seen,
+        is_active
+      `,
+      [
+        user.id,
+        user.username,
+        user.role,
+        user.company_id,
+        sessionToken,
+      ]
+    );
+
+    const session = sessionResult.rows[0];
+
+    return res.json({
       status: "ok",
       message: "Login successful",
+
+      session: {
+        id: session.id,
+        token: session.session_token,
+        login_time: session.login_time,
+      },
+
       user: {
         id: user.id,
         full_name: user.full_name,
         username: user.username,
+        email: user.email,
         role: user.role,
-        must_change_password: user.must_change_password
-      }
+        company_id: user.company_id,
+        company_name: user.company_name,
+        company_status: user.company_status,
+        tenant_type: user.tenant_type,
+        access_scope:
+          user.role === "system_owner"
+            ? "platform"
+            : "company",
+        must_change_password: user.must_change_password,
+      },
     });
-
   } catch (err) {
-    res.status(500).json({
+    console.error("Admin login error:", err);
+
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
