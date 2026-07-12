@@ -816,9 +816,22 @@ app.post("/admin/users/create", async (req, res) => {
 // ADMIN USERS MANAGEMENT
 // ----------------------------------------------------------
 
-app.get("/admin/users", async (req, res) => {
+app.get("/admin/users", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const {
+      companyId,
+      error,
+    } = resolveAdminUsersCompanyScope(req);
+
+    if (error) {
+      return res.status(400).json({
+        status: "error",
+        message: error,
+      });
+    }
+
+    const result = await pool.query(
+      `
       SELECT
         id,
         full_name,
@@ -834,26 +847,51 @@ app.get("/admin/users", async (req, res) => {
         company_id,
         created_at
       FROM users
+      WHERE company_id = $1
       ORDER BY id ASC
-    `);
+      `,
+      [companyId]
+    );
 
-    res.json({
+    return res.json({
       status: "ok",
-      users: result.rows
+      company_id: companyId,
+      users: result.rows,
     });
   } catch (err) {
     console.error("Fetch admin users error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
 
-app.get("/admin/users/:id", async (req, res) => {
+app.get("/admin/users/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+
+    const userId = Number(id);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user id",
+      });
+    }
+
+    const {
+      companyId,
+      error,
+    } = resolveAdminUsersCompanyScope(req);
+
+    if (error) {
+      return res.status(400).json({
+        status: "error",
+        message: error,
+      });
+    }
 
     const result = await pool.query(
       `
@@ -873,27 +911,29 @@ app.get("/admin/users/:id", async (req, res) => {
         created_at
       FROM users
       WHERE id = $1
+        AND company_id = $2
       `,
-      [id]
+      [userId, companyId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({
         status: "error",
-        message: "User not found"
+        message: "User not found",
       });
     }
 
-    res.json({
+    return res.json({
       status: "ok",
-      user: result.rows[0]
+      company_id: companyId,
+      user: result.rows[0],
     });
   } catch (err) {
     console.error("Fetch admin user error:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
@@ -1249,6 +1289,48 @@ app.post("/auth/login", async (req, res) => {
     });
   }
 });
+
+function resolveAdminUsersCompanyScope(req) {
+  // Customer users are always restricted to their authenticated company.
+  if (req.auth.role !== "system_owner") {
+    return {
+      companyId: req.auth.company_id,
+      error: null,
+    };
+  }
+
+  // Until the System Owner Control Panel provides a selected company,
+  // default to the company stored in the authenticated session.
+  const requestedCompanyId = req.query.company_id;
+
+  if (
+    requestedCompanyId === undefined ||
+    requestedCompanyId === null ||
+    requestedCompanyId === ""
+  ) {
+    return {
+      companyId: req.auth.company_id,
+      error: null,
+    };
+  }
+
+  const parsedCompanyId = Number(requestedCompanyId);
+
+  if (
+    !Number.isInteger(parsedCompanyId) ||
+    parsedCompanyId <= 0
+  ) {
+    return {
+      companyId: null,
+      error: "Invalid company_id",
+    };
+  }
+
+  return {
+    companyId: parsedCompanyId,
+    error: null,
+  };
+}
 
 // ----------------------------------------------------------
 // AUTHENTICATED SESSION CONTEXT
