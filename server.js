@@ -407,35 +407,42 @@ ${message}
 // ACTIVE ADMINS
 // --------------------------------------------------
 
-app.get("/admin/active", async (req, res) => {
+app.get("/admin/active", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const isSystemOwner = req.auth.role === "system_owner";
+
+    const result = await pool.query(
+      `
       SELECT DISTINCT ON (username)
+        username,
+        role,
+        login_time,
+        last_seen
+      FROM admin_sessions
+      WHERE is_active = true
+        AND last_seen > NOW() - INTERVAL '90 seconds'
+        AND (
+          $1::boolean = true
+          OR company_id = $2
+        )
+      ORDER BY username, last_seen DESC
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    );
 
-username,
-role,
-login_time,
-last_seen
-
-FROM admin_sessions
-
-WHERE is_active=true
-
-AND last_seen >
-NOW() - INTERVAL '90 seconds'
-
-ORDER BY username,last_seen DESC
-    `);
-
-    res.json({
+    return res.json({
       status: "ok",
-      admins: result.rows
+      admins: result.rows,
     });
-
   } catch (err) {
-    res.status(500).json({
+    console.error("Active admins error:", err);
+
+    return res.status(500).json({
       status: "error",
-      message: err.message
+      message: err.message,
     });
   }
 });
@@ -534,69 +541,82 @@ app.post("/admin/logout", requireAuth, async (req, res) => {
 // ADMIN LOGIN HISTORY
 // --------------------------------------------------
 
-app.get("/admin/sessions/history", async (req,res)=>{
+app.get("/admin/sessions/history", requireAuth, async (req, res) => {
+  try {
+    const { user, from, to, active } = req.query;
 
-try{
+    const isSystemOwner = req.auth.role === "system_owner";
 
-const { user, from, to, active } = req.query;
+    let query = `
+      SELECT
+        id,
+        username,
+        role,
+        login_time,
+        last_seen,
+        logout_time,
+        is_active,
+        session_duration_seconds,
 
-let query = `
-SELECT
-id,
-username,
-role,
-login_time,
-last_seen,
-logout_time,
-is_active,
-session_duration_seconds,
+        (
+          is_active = true
+          AND last_seen > NOW() - INTERVAL '90 seconds'
+        ) AS is_currently_online
 
-(is_active = true AND last_seen > NOW() - INTERVAL '90 seconds') AS is_currently_online
+      FROM admin_sessions
+      WHERE (
+        $1::boolean = true
+        OR company_id = $2
+      )
+    `;
 
-FROM admin_sessions
-WHERE 1=1
-`;
+    const values = [
+      isSystemOwner,
+      req.auth.company_id,
+    ];
 
-const values = [];
+    if (user) {
+      values.push(user);
+      query += ` AND username = $${values.length}`;
+    }
 
-if(user){
-values.push(user);
-query += ` AND username = $${values.length}`;
-}
+    if (from) {
+      values.push(from);
+      query += `
+        AND COALESCE(logout_time, last_seen, login_time)
+        >= $${values.length}::date
+      `;
+    }
 
-if(from){
-  values.push(from);
-  query += ` AND COALESCE(logout_time, last_seen, login_time) >= $${values.length}::date`;
-}
+    if (to) {
+      values.push(to);
+      query += `
+        AND COALESCE(logout_time, last_seen, login_time)
+        < ($${values.length}::date + INTERVAL '1 day')
+      `;
+    }
 
-if(to){
-  values.push(to);
-  query += ` AND COALESCE(logout_time, last_seen, login_time) < ($${values.length}::date + INTERVAL '1 day')`;
-}
+    if (active === "true" || active === "false") {
+      values.push(active === "true");
+      query += ` AND is_active = $${values.length}`;
+    }
 
-if(active === "true" || active === "false"){
-values.push(active === "true");
-query += ` AND is_active = $${values.length}`;
-}
+    query += ` ORDER BY login_time DESC`;
 
-query += ` ORDER BY login_time DESC`;
+    const result = await pool.query(query, values);
 
-const result = await pool.query(query, values);
+    return res.json({
+      status: "ok",
+      sessions: result.rows,
+    });
+  } catch (err) {
+    console.error("Admin session history error:", err);
 
-res.json({
-status:"ok",
-sessions:result.rows
-});
-
-}catch(err){
-
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
 });
 
 
@@ -604,92 +624,114 @@ message:err.message
 // ADMIN LOGIN EXPORT CSV
 // --------------------------------------------------
 
-app.get("/admin/sessions/export", async (req,res)=>{
+app.get("/admin/sessions/export", requireAuth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
 
-try{
+    const isSystemOwner = req.auth.role === "system_owner";
 
-const result = await pool.query(
-`
-SELECT
+    let query = `
+      SELECT
+        username,
+        role,
+        login_time,
+        last_seen,
+        logout_time,
+        is_active,
+        session_duration_seconds,
 
-username,
-role,
-login_time,
-last_seen,
-logout_time,
-is_active,
-session_duration_seconds,
+        (
+          is_active = true
+          AND last_seen > NOW() - INTERVAL '90 seconds'
+        ) AS is_currently_online
 
-(is_active = true AND last_seen > NOW() - INTERVAL '90 seconds') AS is_currently_online
+      FROM admin_sessions
+      WHERE (
+        $1::boolean = true
+        OR company_id = $2
+      )
+    `;
 
-FROM admin_sessions
+    const values = [
+      isSystemOwner,
+      req.auth.company_id,
+    ];
 
-ORDER BY login_time DESC
-`
-);
+    if (from) {
+      values.push(from);
 
-result.rows.forEach(row => {
+      query += `
+        AND COALESCE(logout_time, last_seen, login_time)
+        >= $${values.length}::date
+      `;
+    }
 
-row.login_time = row.login_time
-? new Date(row.login_time).toLocaleString(
-"el-GR",
-{ timeZone: "Europe/Athens" }
-)
-: "";
+    if (to) {
+      values.push(to);
 
-row.last_seen = row.last_seen
-? new Date(row.last_seen).toLocaleString(
-"el-GR",
-{ timeZone: "Europe/Athens" }
-)
-: "";
+      query += `
+        AND COALESCE(logout_time, last_seen, login_time)
+        < ($${values.length}::date + INTERVAL '1 day')
+      `;
+    }
 
-row.logout_time = row.logout_time
-? new Date(row.logout_time).toLocaleString(
-"el-GR",
-{ timeZone: "Europe/Athens" }
-)
-: "";
+    query += ` ORDER BY login_time DESC`;
 
-});
+    const result = await pool.query(query, values);
 
-let csv =
-"username;role;login_time;last_seen;logout_time;is_active;session_duration_seconds\n";
+    result.rows.forEach((row) => {
+      row.login_time = row.login_time
+        ? new Date(row.login_time).toLocaleString("el-GR", {
+            timeZone: "Europe/Athens",
+          })
+        : "";
 
-result.rows.forEach(row=>{
+      row.last_seen = row.last_seen
+        ? new Date(row.last_seen).toLocaleString("el-GR", {
+            timeZone: "Europe/Athens",
+          })
+        : "";
 
-csv +=
-`${row.username};`+
-`${row.role};`+
-`${row.login_time};`+
-`${row.last_seen};`+
-`${row.logout_time || ""};`+
-`${row.is_active};`+
-`${row.session_duration_seconds || ""}\n`;
+      row.logout_time = row.logout_time
+        ? new Date(row.logout_time).toLocaleString("el-GR", {
+            timeZone: "Europe/Athens",
+          })
+        : "";
+    });
 
-});
+    let csv =
+      "username;role;login_time;last_seen;logout_time;is_active;session_duration_seconds\n";
 
-res.setHeader(
-"Content-Type",
-"text/csv"
-);
+    result.rows.forEach((row) => {
+      csv +=
+        `${row.username};` +
+        `${row.role};` +
+        `${row.login_time};` +
+        `${row.last_seen};` +
+        `${row.logout_time || ""};` +
+        `${row.is_active};` +
+        `${row.session_duration_seconds || ""}\n`;
+    });
 
-res.setHeader(
-"Content-Disposition",
-"attachment; filename=admin_sessions.csv"
-);
+    res.setHeader(
+      "Content-Type",
+      "text/csv"
+    );
 
-res.send(csv);
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=admin_sessions.csv"
+    );
 
-}catch(err){
+    return res.send(csv);
+  } catch (err) {
+    console.error("Admin session export error:", err);
 
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
 });
 
 // ---------------------------------------------------------------------
@@ -769,46 +811,6 @@ app.post("/setup/users-table", async (req, res) => {
   } catch (err) {
     console.error("Users table setup error:", err);
     res.status(500).json({ status: "error", message: err.message });
-  }
-});
-
-app.post("/admin/users/create", async (req, res) => {
-  try {
-    const { full_name, username, email, phone, role, password } = req.body;
-
-    if (!full_name || !username || !password) {
-      return res.status(400).json({
-        status: "error",
-        message: "full_name, username and password are required"
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const result = await pool.query(
-      `
-      INSERT INTO users (
-        full_name, username, email, phone, role,
-        password_hash, status, must_change_password
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, 'active', true)
-      RETURNING id, full_name, username, email, phone, role, status, must_change_password, created_at
-      `,
-      [full_name, username, email || null, phone || null, role || "guard", passwordHash]
-    );
-
-    res.json({
-      status: "ok",
-      message: "User created",
-      user: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Create user error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
 });
 
