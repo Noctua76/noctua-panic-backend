@@ -1366,6 +1366,17 @@ async function requireAuth(req, res, next) {
 }
 
 // ----------------------------------------------------------
+// AUTH CONTEXT TEST
+// ----------------------------------------------------------
+
+app.get("/auth/context", requireAuth, async (req, res) => {
+  return res.json({
+    status: "ok",
+    auth: req.auth,
+  });
+});
+
+// ----------------------------------------------------------
 // USER PASSWORD MANAGEMENT
 // ----------------------------------------------------------
 
