@@ -938,7 +938,7 @@ app.get("/admin/users/:id", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/admin/users", async (req, res) => {
+app.post("/admin/users", requireAuth, async (req, res) => {
   try {
     const {
       full_name,
@@ -950,13 +950,86 @@ app.post("/admin/users", async (req, res) => {
       backup_phone,
       role = "supervisor",
       status = "active",
-      company_id = 1
+      company_id
     } = req.body;
 
-    if (!full_name || !username) {
+    const normalizedFullName =
+      typeof full_name === "string" ? full_name.trim() : "";
+
+    const normalizedUsername =
+      typeof username === "string" ? username.trim() : "";
+
+    if (!normalizedFullName || !normalizedUsername) {
       return res.status(400).json({
         status: "error",
         message: "full_name and username are required"
+      });
+    }
+
+    const allowedRoles = ["guard", "supervisor", "system_owner"];
+    const allowedStatuses = ["active", "inactive"];
+
+    if (!allowedRoles.includes(role)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user role"
+      });
+    }
+
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user status"
+      });
+    }
+
+    if (
+      req.auth.role !== "system_owner" &&
+      role === "system_owner"
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Only the system owner can create a system owner user"
+      });
+    }
+
+    let targetCompanyId = req.auth.company_id;
+
+    if (req.auth.role === "system_owner") {
+      const requestedCompanyId =
+        company_id ?? req.auth.company_id;
+
+      const parsedCompanyId = Number(requestedCompanyId);
+
+      if (
+        !Number.isInteger(parsedCompanyId) ||
+        parsedCompanyId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid company_id"
+        });
+      }
+
+      targetCompanyId = parsedCompanyId;
+    }
+
+    const companyResult = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        status
+      FROM companies
+      WHERE id = $1
+      `,
+      [targetCompanyId]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Company not found"
       });
     }
 
@@ -966,7 +1039,10 @@ app.post("/admin/users", async (req, res) => {
       .replace(/[+/=]/g, "")
       .slice(0, 12);
 
-    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    const passwordHash = await bcrypt.hash(
+      temporaryPassword,
+      10
+    );
 
     const result = await pool.query(
       `
@@ -986,8 +1062,19 @@ app.post("/admin/users", async (req, res) => {
         created_at
       )
       VALUES (
-        $1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),
-        NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,true,NOW()
+        $1,
+        $2,
+        NULLIF($3, ''),
+        NULLIF($4, ''),
+        NULLIF($5, ''),
+        NULLIF($6, ''),
+        NULLIF($7, ''),
+        $8,
+        $9,
+        $10,
+        $11,
+        true,
+        NOW()
       )
       RETURNING
         id,
@@ -1005,8 +1092,8 @@ app.post("/admin/users", async (req, res) => {
         created_at
       `,
       [
-        full_name,
-        username,
+        normalizedFullName,
+        normalizedUsername,
         email,
         secondary_email,
         phone,
@@ -1014,12 +1101,12 @@ app.post("/admin/users", async (req, res) => {
         backup_phone,
         role,
         status,
-        company_id,
+        targetCompanyId,
         passwordHash
       ]
     );
 
-    res.json({
+    return res.status(201).json({
       status: "ok",
       message: "User created successfully",
       temporary_password: temporaryPassword,
@@ -1028,7 +1115,14 @@ app.post("/admin/users", async (req, res) => {
   } catch (err) {
     console.error("Create admin user error:", err);
 
-    res.status(500).json({
+    if (err.code === "23505") {
+      return res.status(409).json({
+        status: "error",
+        message: "Username already exists"
+      });
+    }
+
+    return res.status(500).json({
       status: "error",
       message: err.message
     });
