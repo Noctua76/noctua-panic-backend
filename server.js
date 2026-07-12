@@ -1129,9 +1129,18 @@ app.post("/admin/users", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/admin/users/:id", async (req, res) => {
+app.put("/admin/users/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+
+    const userId = Number(id);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user id"
+      });
+    }
 
     const {
       full_name,
@@ -1142,9 +1151,47 @@ app.put("/admin/users/:id", async (req, res) => {
       mobile_phone,
       backup_phone,
       role,
-      status,
-      company_id
+      status
     } = req.body;
+
+    const allowedRoles = ["guard", "supervisor", "system_owner"];
+    const allowedStatuses = ["active", "inactive"];
+
+    if (role && !allowedRoles.includes(role)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user role"
+      });
+    }
+
+    if (status && !allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid user status"
+      });
+    }
+
+    if (
+      req.auth.role !== "system_owner" &&
+      role === "system_owner"
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Only the system owner can assign the system owner role"
+      });
+    }
+
+    const {
+      companyId,
+      error
+    } = resolveAdminUsersCompanyScope(req);
+
+    if (error) {
+      return res.status(400).json({
+        status: "error",
+        message: error
+      });
+    }
 
     const result = await pool.query(
       `
@@ -1159,9 +1206,9 @@ app.put("/admin/users/:id", async (req, res) => {
         backup_phone = NULLIF($7, ''),
         role = COALESCE(NULLIF($8, ''), role),
         status = COALESCE(NULLIF($9, ''), status),
-        company_id = COALESCE($10, company_id),
         updated_at = NOW()
-      WHERE id = $11
+      WHERE id = $10
+        AND company_id = $11
       RETURNING
         id,
         full_name,
@@ -1188,8 +1235,8 @@ app.put("/admin/users/:id", async (req, res) => {
         backup_phone,
         role,
         status,
-        company_id || null,
-        id
+        userId,
+        companyId
       ]
     );
 
@@ -1200,7 +1247,7 @@ app.put("/admin/users/:id", async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       status: "ok",
       message: "User updated successfully",
       user: result.rows[0]
@@ -1208,7 +1255,14 @@ app.put("/admin/users/:id", async (req, res) => {
   } catch (err) {
     console.error("Update admin user error:", err);
 
-    res.status(500).json({
+    if (err.code === "23505") {
+      return res.status(409).json({
+        status: "error",
+        message: "Username already exists"
+      });
+    }
+
+    return res.status(500).json({
       status: "error",
       message: err.message
     });
