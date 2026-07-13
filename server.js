@@ -3936,27 +3936,32 @@ function getAlertRecipients() {
     .filter(Boolean);
 }
 
-async function getAlertRecipientsFromDatabase() {
+async function getAlertRecipientsFromDatabase(companyId) {
   await ensureAlertRecipientsTable();
 
-  const result = await pool.query(`
+  const result = await pool.query(
+    `
     SELECT
       id,
       full_name,
       phone,
       sms_enabled,
       voice_enabled,
-      active
+      active,
+      company_id
     FROM alert_recipients
     WHERE active = true
+      AND company_id = $1
     ORDER BY id ASC
-  `);
+    `,
+    [companyId]
+  );
 
   return result.rows;
 }
 
-async function getEffectiveAlertRecipients() {
-  const dbRecipients = await getAlertRecipientsFromDatabase();
+async function getEffectiveAlertRecipients(companyId) {
+  const dbRecipients = await getAlertRecipientsFromDatabase(companyId);
 
   const envPhones = getAlertRecipients();
 
@@ -3967,7 +3972,7 @@ async function getEffectiveAlertRecipients() {
     sms_enabled: true,
     voice_enabled: true,
     active: true,
-    source: "env"
+    source: "env",
   }));
 
   const combined = [...dbRecipients, ...envRecipients];
@@ -3977,12 +3982,12 @@ async function getEffectiveAlertRecipients() {
   combined.forEach((recipient) => {
     if (!recipient.phone) return;
 
-    const normalizedPhone = recipient.phone.replace(/\s+/g, "");
+    const normalizedPhone = recipient.phone.trim();
 
     if (!uniqueByPhone.has(normalizedPhone)) {
       uniqueByPhone.set(normalizedPhone, {
         ...recipient,
-        phone: normalizedPhone
+        phone: normalizedPhone,
       });
     }
   });
@@ -4027,33 +4032,24 @@ async function ensureIncidentGuardResponsesTable() {
 // ALERT RECIPIENTS API
 // ----------------------------------------------------------
 
-app.get("/settings/alert-recipients", async (req,res)=>{
+app.get("/settings/alert-recipients", requireAuth, async (req, res) => {
+  try {
+    const recipients = await getEffectiveAlertRecipients(
+      req.auth.company_id
+    );
 
-try{
+    return res.json({
+      status: "ok",
+      recipients,
+    });
+  } catch (err) {
+    console.error("Alert recipients GET error:", err);
 
-const recipients =
-await getEffectiveAlertRecipients();
-
-res.json({
-status:"ok",
-recipients
-});
-
-}catch(err){
-
-console.error(
-"Alert recipients GET error:",
-err
-);
-
-res.status(500).json({
-status:"error",
-message:
-err.message || String(err)
-});
-
-}
-
+    return res.status(500).json({
+      status: "error",
+      message: err.message || String(err),
+    });
+  }
 });
 
 
@@ -4104,75 +4100,88 @@ app.post("/settings/alert-recipients", requireAuth, async (req, res) => {
 });
 
 app.put(
-"/settings/alert-recipients/:id/toggle",
-async (req,res)=>{
+  "/settings/alert-recipients/:id/toggle",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-try{
+      const result = await pool.query(
+        `
+        UPDATE alert_recipients
+        SET active = NOT active
+        WHERE id = $1
+          AND company_id = $2
+        RETURNING *
+        `,
+        [
+          id,
+          req.auth.company_id,
+        ]
+      );
 
-const { id } = req.params;
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Alert recipient not found",
+        });
+      }
 
-const result =
-await pool.query(
-`
-UPDATE alert_recipients
+      return res.json({
+        status: "ok",
+        recipient: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Alert recipient toggle error:", err);
 
-SET active =
-NOT active
-
-WHERE id=$1
-
-RETURNING *
-`,
-[id]
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
 );
-
-res.json({
-status:"ok",
-recipient:
-result.rows[0]
-});
-
-}catch(err){
-
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
-});
 
 app.delete(
-"/settings/alert-recipients/:id",
-async (req,res)=>{
+  "/settings/alert-recipients/:id",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-try{
+      const result = await pool.query(
+        `
+        DELETE FROM alert_recipients
+        WHERE id = $1
+          AND company_id = $2
+        RETURNING id
+        `,
+        [
+          id,
+          req.auth.company_id,
+        ]
+      );
 
-const { id } = req.params;
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Alert recipient not found",
+        });
+      }
 
-await pool.query(
-`
-DELETE FROM alert_recipients
-WHERE id=$1
-`,
-[id]
+      return res.json({
+        status: "ok",
+      });
+    } catch (err) {
+      console.error("Alert recipient DELETE error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
 );
-
-res.json({
-status:"ok"
-});
-
-}catch(err){
-
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
-});
 
 // ----------------------------------------------------------
 // SETTINGS - SITES MANAGEMENT
