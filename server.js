@@ -4745,48 +4745,64 @@ app.put(
 // SETTINGS - GUARDS MANAGEMENT
 // ----------------------------------------------------------
 
-app.get("/settings/guards", async (req, res) => {
-  try {
-    const result = await pool.query(`
-  SELECT
-    g.id,
-    g.full_name,
-    g.username,
-    g.phone,
-    g.role,
-    g.site_id,
-    g.active,
-    g.created_at,
-    g.mobile_phone,
-    g.landline_phone,
-    g.tax_id,
-    g.home_address,
-    g.education_level,
-    g.foreign_languages,
-    g.security_experience_range,
-    g.guard_notes,
-    g.assignment_status,
-    g.employment_status,
-    s.name AS site_name
-  FROM guards g
-  LEFT JOIN sites s
-    ON s.id = g.site_id
-  ORDER BY g.id ASC
-`);
+app.get(
+  "/settings/guards",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    res.json({
-      status: "ok",
-      guards: result.rows
-    });
-  } catch (err) {
-    console.error("Settings guards GET error:", err);
+      const result = await pool.query(
+        `
+        SELECT
+          g.id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.role,
+          g.site_id,
+          g.active,
+          g.created_at,
+          g.mobile_phone,
+          g.landline_phone,
+          g.tax_id,
+          g.home_address,
+          g.education_level,
+          g.foreign_languages,
+          g.security_experience_range,
+          g.guard_notes,
+          g.assignment_status,
+          g.employment_status,
+          s.name AS site_name
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+        ORDER BY g.id ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
+      return res.json({
+        status: "ok",
+        guards: result.rows,
+      });
+    } catch (err) {
+      console.error("Settings guards GET error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
   }
-});
+);
 
 app.post("/settings/guards", async (req, res) => {
   try {
