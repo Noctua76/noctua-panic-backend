@@ -5110,48 +5110,63 @@ app.put(
   }
 );
 
-app.put("/settings/guards/:id/toggle-active", async (req, res) => {
-  try {
-    const { id } = req.params;
+app.put(
+  "/settings/guards/:id/toggle-active",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const result = await pool.query(
-      `
-      UPDATE guards
-      SET active = NOT active
-      WHERE id = $1
-      RETURNING
-        id,
-        full_name,
-        username,
-        phone,
-        role,
-        site_id,
-        active,
-        created_at
-      `,
-      [id]
-    );
+      const result = await pool.query(
+        `
+        UPDATE guards g
+        SET active = NOT g.active
+        FROM sites s
+        WHERE g.id = $1
+          AND s.id = g.site_id
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        RETURNING
+          g.id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.role,
+          g.site_id,
+          g.active,
+          g.created_at
+        `,
+        [
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Settings guard toggle error:", err);
+
+      return res.status(500).json({
         status: "error",
-        message: "Guard not found"
+        message: err.message,
       });
     }
-
-    res.json({
-      status: "ok",
-      guard: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Settings guard toggle error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
 app.put("/settings/guards/:id/reset-password", async (req, res) => {
   try {
