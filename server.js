@@ -4902,63 +4902,138 @@ app.post(
   }
 );
 
-app.put("/settings/guards/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { full_name, username, phone, role, site_id, active } = req.body;
+app.put(
+  "/settings/guards/:id",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
 
-    const result = await pool.query(
-      `
-      UPDATE guards
-      SET
-        full_name = COALESCE($1, full_name),
-        username = COALESCE($2, username),
-        phone = COALESCE($3, phone),
-        role = COALESCE($4, role),
-        site_id = COALESCE($5, site_id),
-        active = COALESCE($6, active)
-      WHERE id = $7
-      RETURNING
-        id,
+    try {
+      const { id } = req.params;
+      const {
         full_name,
         username,
         phone,
         role,
         site_id,
         active,
-        created_at
-      `,
-      [
-        full_name || null,
-        username || null,
-        phone || null,
-        role || null,
-        site_id || null,
-        typeof active === "boolean" ? active : null,
-        id
-      ]
-    );
+      } = req.body;
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Guard not found"
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      await client.query("BEGIN");
+
+      const guardResult = await client.query(
+        `
+        SELECT
+          g.id,
+          g.site_id
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE g.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        FOR UPDATE
+        `,
+        [
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (guardResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      if (site_id !== undefined && site_id !== null) {
+        const siteResult = await client.query(
+          `
+          SELECT id
+          FROM sites
+          WHERE id = $1
+            AND (
+              $2::boolean = true
+              OR company_id = $3
+            )
+          `,
+          [
+            site_id,
+            isSystemOwner,
+            req.auth.company_id,
+          ]
+        );
+
+        if (siteResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            status: "error",
+            message: "Site not found",
+          });
+        }
+      }
+
+      const result = await client.query(
+        `
+        UPDATE guards
+        SET
+          full_name = COALESCE($1, full_name),
+          username = COALESCE($2, username),
+          phone = COALESCE($3, phone),
+          role = COALESCE($4, role),
+          site_id = COALESCE($5, site_id),
+          active = COALESCE($6, active)
+        WHERE id = $7
+        RETURNING
+          id,
+          full_name,
+          username,
+          phone,
+          role,
+          site_id,
+          active,
+          created_at
+        `,
+        [
+          full_name || null,
+          username || null,
+          phone || null,
+          role || null,
+          site_id ?? null,
+          typeof active === "boolean" ? active : null,
+          id,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
       });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      console.error("Settings guard PUT error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    } finally {
+      client.release();
     }
-
-    res.json({
-      status: "ok",
-      guard: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Settings guard PUT error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
 app.put("/settings/guards/:id/toggle-active", async (req, res) => {
   try {
