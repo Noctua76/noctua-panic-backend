@@ -5538,6 +5538,10 @@ const recipients = allRecipients.map((r) => r.phone);
       `Source: Dashboard Settings\n` +
       `Time: ${new Date().toISOString()}`;
 
+      console.log("TEST ALERT COMPANY:", req.auth.company_id);
+console.log("TEST ALERT SMS RECIPIENTS:", smsRecipients);
+console.log("TEST ALERT VOICE RECIPIENTS:", voiceRecipients);
+
     const smsResults = await Promise.allSettled(
       smsRecipients.map((to) => sendVonageSms(to, text))
     );
@@ -5587,12 +5591,12 @@ message:callErr.message
       },
 
       voice: {
-        attempted: recipients.length,
-        status:
-          Array.isArray(callResults) && callResults.length > 0
-            ? "online"
-            : "error",
-      },
+  attempted: voiceRecipients.length,
+  status:
+    Array.isArray(callResults) && callResults.length > 0
+      ? "online"
+      : "error",
+},
     };
 
     await ensureAlertEventsTable();
@@ -5618,8 +5622,8 @@ await pool.query(
     recipients.length,
     smsSent,
     smsFailed,
-    recipients.length,
-    lastAlertTestResult.voice.status,
+    voiceRecipients.length,
+lastAlertTestResult.voice.status,
   ]
 );
 
