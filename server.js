@@ -4057,62 +4057,50 @@ err.message || String(err)
 });
 
 
-app.post("/settings/alert-recipients", async (req,res)=>{
+app.post("/settings/alert-recipients", requireAuth, async (req, res) => {
+  try {
+    await ensureAlertRecipientsTable();
 
-try{
+    const {
+      full_name,
+      phone,
+      sms_enabled = true,
+      voice_enabled = true,
+    } = req.body;
 
-await ensureAlertRecipientsTable();
+    const result = await pool.query(
+      `
+      INSERT INTO alert_recipients (
+        company_id,
+        full_name,
+        phone,
+        sms_enabled,
+        voice_enabled
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+      `,
+      [
+        req.auth.company_id,
+        full_name,
+        phone,
+        sms_enabled,
+        voice_enabled,
+      ]
+    );
 
-const {
+    return res.json({
+      status: "ok",
+      recipient: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Alert recipient POST error:", err);
 
-full_name,
-phone,
-sms_enabled=true,
-voice_enabled=true
-
-}=req.body;
-
-const result =
-await pool.query(
-`
-INSERT INTO alert_recipients(
-
-full_name,
-phone,
-sms_enabled,
-voice_enabled
-
-)
-
-VALUES(
-$1,$2,$3,$4
-)
-
-RETURNING *
-`,
-[
-full_name,
-phone,
-sms_enabled,
-voice_enabled
-]
-);
-
-res.json({
-status:"ok",
-recipient:
-result.rows[0]
-});
-
-}catch(err){
-
-res.status(500).json({
-status:"error",
-message:err.message
-});
-
-}
-
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
 });
 
 app.put(
