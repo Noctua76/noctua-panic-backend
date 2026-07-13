@@ -3791,9 +3791,12 @@ app.put(
 // ----------------------------------------------------------
 // ALL SITES
 // ----------------------------------------------------------
-app.get("/sites", async (req, res) => {
+app.get("/sites", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const isSystemOwner = req.auth.role === "system_owner";
+
+const result = await pool.query(
+  `
   SELECT
     s.id,
     s.company_id,
@@ -3870,9 +3873,18 @@ END AS status_class
   ) active_guard ON true
 
   WHERE s.status <> 'archived'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
 
-  ORDER BY s.id ASC
-`);
+ORDER BY s.id ASC
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
 
     res.json({
       status: "ok",
