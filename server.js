@@ -4804,72 +4804,103 @@ app.get(
   }
 );
 
-app.post("/settings/guards", async (req, res) => {
-  try {
-    const {
-      full_name,
-      username,
-      phone,
-      password,
-      role = "guard",
-      site_id
-    } = req.body;
+app.post(
+  "/settings/guards",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const {
+        full_name,
+        username,
+        phone,
+        password,
+        role = "guard",
+        site_id,
+      } = req.body;
 
-    if (!full_name || !username || !password || !site_id) {
-      return res.status(400).json({
+      if (!full_name || !username || !password || !site_id) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "full_name, username, password and site_id are required",
+        });
+      }
+
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          site_id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10);
+
+      const result = await pool.query(
+        `
+        INSERT INTO guards (
+          full_name,
+          username,
+          phone,
+          role,
+          site_id,
+          active,
+          password_hash,
+          created_at
+        )
+        VALUES ($1,$2,$3,$4,$5,true,$6,NOW())
+        RETURNING
+          id,
+          full_name,
+          username,
+          phone,
+          role,
+          site_id,
+          active,
+          created_at
+        `,
+        [
+          full_name,
+          username,
+          phone || "",
+          role,
+          site_id,
+          passwordHash,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Settings guard POST error:", err);
+
+      return res.status(500).json({
         status: "error",
-        message: "full_name, username, password and site_id are required"
+        message: err.message,
       });
     }
-
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const result = await pool.query(
-      `
-      INSERT INTO guards (
-        full_name,
-        username,
-        phone,
-        role,
-        site_id,
-        active,
-        password_hash,
-        created_at
-      )
-      VALUES ($1,$2,$3,$4,$5,true,$6,NOW())
-      RETURNING
-        id,
-        full_name,
-        username,
-        phone,
-        role,
-        site_id,
-        active,
-        created_at
-      `,
-      [
-        full_name,
-        username,
-        phone || "",
-        role,
-        site_id,
-        passwordHash
-      ]
-    );
-
-    res.json({
-      status: "ok",
-      guard: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Settings guard POST error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
 app.put("/settings/guards/:id", async (req, res) => {
   try {
