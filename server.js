@@ -5510,9 +5510,11 @@ app.get("/analytics/summary", async (req, res) => {
 // ----------------------------------------------------------
 // DASHBOARD TEST ALERT
 // ----------------------------------------------------------
-app.post("/alerts/test", async (req, res) => {
+app.post("/alerts/test", requireAuth, async (req, res) => {
   try {
-    const allRecipients = await getEffectiveAlertRecipients();
+    const allRecipients = await getAlertRecipientsFromDatabase(
+  req.auth.company_id
+);
 
 const smsRecipients = allRecipients
   .filter((r) => r.sms_enabled)
