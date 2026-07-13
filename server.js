@@ -3303,12 +3303,18 @@ events.sort((a, b) => {
 // GUARD SHIFT HISTORY
 // Event Logs source of truth: scheduled_shifts
 // ----------------------------------------------------------
-app.get("/guards/shifts/history", async (req, res) => {
-  try {
-    const result = await pool.query(`
+app.get(
+  "/guards/shifts/history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
       SELECT
         ss.id,
-        NULL AS company_id,
+        s.company_id,
 
         ss.guard_id,
         COALESCE(g.full_name, g.username, 'No Login') AS full_name,
@@ -3542,14 +3548,23 @@ END
         ON s.id = ss.site_id
 
         WHERE
-  ss.scheduled_end > to_char((NOW() AT TIME ZONE 'Europe/Athens')::date, 'YYYY-MM-DD')::timestamp
+  (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+  AND ss.scheduled_end > to_char((NOW() AT TIME ZONE 'Europe/Athens')::date, 'YYYY-MM-DD')::timestamp
   AND ss.scheduled_start < (
     to_char((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day', 'YYYY-MM-DD')::timestamp
     + INTERVAL '7 hours'
   )
 
-      ORDER BY ss.scheduled_start ASC
-    `);
+ORDER BY ss.scheduled_start ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
     res.json({
       status: "ok",
