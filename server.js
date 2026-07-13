@@ -3601,45 +3601,16 @@ ORDER BY g.full_name ASC
 // ----------------------------------------------------------
 // UPDATE GUARD PROFILE
 // ----------------------------------------------------------
-app.put("/guards/:id/profile", async (req, res) => {
-  try {
-    const { id } = req.params;
+app.put(
+  "/guards/:id/profile",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
 
-    const {
-      full_name,
-      username,
-      mobile_phone,
-      landline_phone,
-      tax_id,
-      home_address,
-      education_level,
-      foreign_languages,
-      security_experience_range,
-      guard_notes,
-      site_id,
-      assignment_status,
-    } = req.body;
+    try {
+      const { id } = req.params;
 
-    const result = await pool.query(
-      `
-      UPDATE guards
-      SET
-        full_name = $1,
-        username = $2,
-        mobile_phone = $3,
-        landline_phone = $4,
-        tax_id = $5,
-        home_address = $6,
-        education_level = $7,
-        foreign_languages = $8,
-        security_experience_range = $9,
-        guard_notes = $10,
-        site_id = $11,
-        assignment_status = $12
-      WHERE id = $13
-      RETURNING *
-      `,
-      [
+      const {
         full_name,
         username,
         mobile_phone,
@@ -3652,23 +3623,127 @@ app.put("/guards/:id/profile", async (req, res) => {
         guard_notes,
         site_id,
         assignment_status,
-        id,
-      ]
-    );
+      } = req.body;
 
-    res.json({
-      status: "ok",
-      guard: result.rows[0],
-    });
-  } catch (err) {
-    console.error("Guard profile update error:", err);
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
+      await client.query("BEGIN");
+
+      const guardResult = await client.query(
+        `
+        SELECT
+          g.id,
+          g.site_id
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE g.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        FOR UPDATE
+        `,
+        [
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (guardResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      if (site_id !== undefined && site_id !== null) {
+        const siteResult = await client.query(
+          `
+          SELECT id
+          FROM sites
+          WHERE id = $1
+            AND (
+              $2::boolean = true
+              OR company_id = $3
+            )
+          `,
+          [
+            site_id,
+            isSystemOwner,
+            req.auth.company_id,
+          ]
+        );
+
+        if (siteResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            status: "error",
+            message: "Site not found",
+          });
+        }
+      }
+
+      const result = await client.query(
+        `
+        UPDATE guards
+        SET
+          full_name = $1,
+          username = $2,
+          mobile_phone = $3,
+          landline_phone = $4,
+          tax_id = $5,
+          home_address = $6,
+          education_level = $7,
+          foreign_languages = $8,
+          security_experience_range = $9,
+          guard_notes = $10,
+          site_id = $11,
+          assignment_status = $12
+        WHERE id = $13
+        RETURNING *
+        `,
+        [
+          full_name,
+          username,
+          mobile_phone,
+          landline_phone,
+          tax_id,
+          home_address,
+          education_level,
+          foreign_languages,
+          security_experience_range,
+          guard_notes,
+          site_id,
+          assignment_status,
+          id,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      console.error("Guard profile update error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 // ----------------------------------------------------------
 // ALL SITES
