@@ -2922,75 +2922,143 @@ app.get(
   }
 );
 
-app.get("/dashboard/metrics", async (req, res) => {
+app.get("/dashboard/metrics", requireAuth, async (req, res) => {
   try {
+    const isSystemOwner = req.auth.role === "system_owner";
 
-    // Active guards
-    const guardsResult = await pool.query(`
-  SELECT COUNT(*)::int AS count
-  FROM guard_sessions
-  WHERE logout_time IS NULL
-`);
-
-    // Active incidents (προς το παρόν δεν υπάρχουν)
-    const incidentsResult = await pool.query(`
+    const guardsResult = await pool.query(
+      `
       SELECT COUNT(*)::int AS count
-      FROM incidents
-      WHERE status = 'active'
-    `).catch(() => ({ rows: [{ count: 0 }] }));
+      FROM guard_sessions gs
+      INNER JOIN sites s
+        ON s.id = gs.site_id
+      WHERE gs.logout_time IS NULL
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    );
 
-    // Alerts today
-    const alertsTodayResult = await pool.query(`
+    const incidentsResult = await pool.query(
+      `
       SELECT COUNT(*)::int AS count
-      FROM incidents
-      WHERE DATE(created_at) = CURRENT_DATE
-    `).catch(() => ({ rows: [{ count: 0 }] }));
+      FROM incidents i
+      INNER JOIN sites s
+        ON s.id = i.site_id
+      WHERE i.status IN ('active', 'in_progress')
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    ).catch(() => ({
+      rows: [{ count: 0 }],
+    }));
 
-    const responseTimeResult = await pool.query(`
-  SELECT
-    trigger_time,
-    resolved_time,
-    EXTRACT(EPOCH FROM (resolved_time - trigger_time))::int AS duration_seconds
-  FROM incidents
-  WHERE status = 'resolved'
-    AND trigger_time IS NOT NULL
-    AND resolved_time IS NOT NULL
-  ORDER BY resolved_time DESC
-  LIMIT 1
-`).catch(() => ({
-  rows: [{ duration_seconds: null }]
-}));
+    const alertsTodayResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM incidents i
+      INNER JOIN sites s
+        ON s.id = i.site_id
+      WHERE DATE(i.created_at) = CURRENT_DATE
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    ).catch(() => ({
+      rows: [{ count: 0 }],
+    }));
 
-let responseTime = "0s";
+    const responseTimeResult = await pool.query(
+      `
+      SELECT
+        i.trigger_time,
+        i.resolved_time,
+        EXTRACT(
+          EPOCH FROM (
+            i.resolved_time - i.trigger_time
+          )
+        )::int AS duration_seconds
+      FROM incidents i
+      INNER JOIN sites s
+        ON s.id = i.site_id
+      WHERE i.status = 'resolved'
+        AND i.trigger_time IS NOT NULL
+        AND i.resolved_time IS NOT NULL
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      ORDER BY i.resolved_time DESC
+      LIMIT 1
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    ).catch(() => ({
+      rows: [{ duration_seconds: null }],
+    }));
 
-const durationSeconds =
-  responseTimeResult.rows[0]?.duration_seconds;
+    let responseTime = "0s";
 
-if (durationSeconds !== null && durationSeconds !== undefined) {
-  const hours = Math.floor(durationSeconds / 3600);
-  const minutes = Math.floor((durationSeconds % 3600) / 60);
-  const seconds = durationSeconds % 60;
+    const durationSeconds =
+      responseTimeResult.rows[0]?.duration_seconds;
 
-  responseTime =
-    hours > 0
-      ? `${hours}h ${minutes}m ${seconds}s`
-      : minutes > 0
-      ? `${minutes}m ${seconds}s`
-      : `${seconds}s`;
-}
+    if (
+      durationSeconds !== null &&
+      durationSeconds !== undefined
+    ) {
+      const hours = Math.floor(durationSeconds / 3600);
+      const minutes = Math.floor(
+        (durationSeconds % 3600) / 60
+      );
+      const seconds = durationSeconds % 60;
 
-    res.json({
-      activeIncidents: incidentsResult.rows[0]?.count || 0,
-      alertsToday: alertsTodayResult.rows[0]?.count || 0,
+      responseTime =
+        hours > 0
+          ? `${hours}h ${minutes}m ${seconds}s`
+          : minutes > 0
+          ? `${minutes}m ${seconds}s`
+          : `${seconds}s`;
+    }
+
+    return res.json({
+      activeIncidents:
+        incidentsResult.rows[0]?.count || 0,
+
+      alertsToday:
+        alertsTodayResult.rows[0]?.count || 0,
+
       responseTime,
-      guardsOnDuty: guardsResult.rows[0]?.count || 0,
+
+      guardsOnDuty:
+        guardsResult.rows[0]?.count || 0,
     });
-
   } catch (err) {
-    console.error("Dashboard metrics error:", err);
+    console.error(
+      "Dashboard metrics error:",
+      err
+    );
 
-    res.status(500).json({
-      error: "Failed to load metrics"
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load metrics",
     });
   }
 });
@@ -2999,39 +3067,57 @@ if (durationSeconds !== null && durationSeconds !== undefined) {
 // DASHBOARD INCIDENT TIMELINE
 // Uses real alert_events for the latest active / recent incident
 // ----------------------------------------------------------
-app.get("/dashboard/incident-timeline", async (req, res) => {
+app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
   try {
+    const isSystemOwner = req.auth.role === "system_owner";
     await ensureAlertEventsTable();
 
-    const incidentResult = await pool.query(`
-      SELECT
-        i.id,
-        i.incident_ref,
-        i.status,
-        i.priority,
-        i.trigger_time,
-        i.resolved_time,
-        s.name AS site_name,
-        s.location AS site_location,
-        COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name
-      FROM incidents i
-      LEFT JOIN sites s ON s.id = i.site_id
-      LEFT JOIN guards g ON g.id = i.guard_ref
-      WHERE
-        i.status IN ('active', 'in_progress')
-        OR (
-          i.status = 'resolved'
-          AND i.resolved_time > NOW() - INTERVAL '1 hour'
-        )
-      ORDER BY
-        CASE
-          WHEN i.status IN ('active', 'in_progress') THEN 1
-          WHEN i.status = 'resolved' THEN 2
-          ELSE 3
-        END,
-        i.trigger_time DESC
-      LIMIT 1
-    `);
+    const incidentResult = await pool.query(
+  `
+  SELECT
+    i.id,
+    i.incident_ref,
+    i.status,
+    i.priority,
+    i.trigger_time,
+    i.resolved_time,
+    s.name AS site_name,
+    s.location AS site_location,
+    COALESCE(
+      g.full_name,
+      g.username,
+      'Unknown guard'
+    ) AS guard_name
+  FROM incidents i
+  INNER JOIN sites s
+    ON s.id = i.site_id
+  LEFT JOIN guards g
+    ON g.id = i.guard_ref
+  WHERE (
+      i.status IN ('active', 'in_progress')
+      OR (
+        i.status = 'resolved'
+        AND i.resolved_time > NOW() - INTERVAL '1 hour'
+      )
+    )
+    AND (
+      $1::boolean = true
+      OR s.company_id = $2
+    )
+  ORDER BY
+    CASE
+      WHEN i.status IN ('active', 'in_progress') THEN 1
+      WHEN i.status = 'resolved' THEN 2
+      ELSE 3
+    END,
+    i.trigger_time DESC
+  LIMIT 1
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
 
     if (incidentResult.rows.length === 0) {
       return res.json({
@@ -6288,44 +6374,56 @@ app.post("/incidents/create", async (req, res) => {
   }
 });
 
-app.get("/incidents/live", async (req, res) => {
+app.get("/incidents/live", requireAuth, async (req, res) => {
 
   try {
+    const isSystemOwner = req.auth.role === "system_owner";
 
-    const result = await pool.query(`
-      SELECT
-        i.id,
-        i.incident_ref,
-        i.status,
-        i.priority,
-        i.trigger_time,
-        i.resolved_time,
-        i.ai_summary,
-        i.needs_support,
-        i.incident_latitude,
-i.incident_longitude,
-i.incident_accuracy,
-i.incident_battery_level,
-i.incident_address,
-i.incident_location_timestamp,
+    const result = await pool.query(
+  `
+  SELECT
+    i.id,
+    i.incident_ref,
+    i.status,
+    i.priority,
+    i.trigger_time,
+    i.resolved_time,
+    i.ai_summary,
+    i.needs_support,
+    i.incident_latitude,
+    i.incident_longitude,
+    i.incident_accuracy,
+    i.incident_battery_level,
+    i.incident_address,
+    i.incident_location_timestamp,
 
-        s.name AS site_name,
+    s.name AS site_name,
 
-        COALESCE(
-          g.full_name,
-          g.username
-        ) AS guard_name
+    COALESCE(
+      g.full_name,
+      g.username
+    ) AS guard_name
 
-      FROM incidents i
+  FROM incidents i
 
-      LEFT JOIN sites s
-      ON s.id = i.site_id
+  INNER JOIN sites s
+    ON s.id = i.site_id
 
-      LEFT JOIN guards g
-      ON g.id = i.guard_ref
+  LEFT JOIN guards g
+    ON g.id = i.guard_ref
 
-      ORDER BY i.trigger_time DESC
-    `);
+  WHERE (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+
+  ORDER BY i.trigger_time DESC
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
 
     res.json(result.rows);
 
@@ -6339,18 +6437,32 @@ i.incident_location_timestamp,
 
 });
 
-app.get("/incidents/site-monitoring", async (req, res) => {
+app.get("/incidents/site-monitoring", requireAuth, async (req, res) => {
   try {
-    await pool.query(`
-  UPDATE incidents
-SET
-  status = 'in_progress'
-WHERE status = 'active'
-  AND auto_reset_time IS NOT NULL
-  AND auto_reset_time <= NOW()
-`);
+    const isSystemOwner = req.auth.role === "system_owner";
+    await pool.query(
+  `
+  UPDATE incidents i
+  SET
+    status = 'in_progress'
+  FROM sites s
+  WHERE s.id = i.site_id
+    AND i.status = 'active'
+    AND i.auto_reset_time IS NOT NULL
+    AND i.auto_reset_time <= NOW()
+    AND (
+      $1::boolean = true
+      OR s.company_id = $2
+    )
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
 
-    const result = await pool.query(`
+    const result = await pool.query(
+  `
       SELECT
         s.id AS site_id,
         s.name AS site_name,
@@ -6464,9 +6576,17 @@ END AS display_status
   ORDER BY ae.created_at DESC
   LIMIT 1
 ) ae ON true
-
+WHERE (
+  $1::boolean = true
+  OR s.company_id = $2
+)
       ORDER BY s.id ASC
-    `);
+      `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
 
     const cards = result.rows.map((row) => ({
       siteId: row.site_id,
