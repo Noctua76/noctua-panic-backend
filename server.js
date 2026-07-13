@@ -6798,11 +6798,15 @@ app.post("/incidents/:id/resolve", async (req, res) => {
   }
 });
 
-app.get("/incidents/resolved", async (req, res) => {
+app.get("/incidents/resolved", requireAuth, async (req, res) => {
   try {
+    const isSystemOwner = req.auth.role === "system_owner";
     const { date, site_id } = req.query;
 
-    const values = [];
+    const values = [
+  isSystemOwner,
+  req.auth.company_id,
+];
     let query = `
       SELECT
         i.id,
@@ -6856,6 +6860,10 @@ i.incident_location_timestamp,
       ) ira ON true
 
       WHERE i.status = 'resolved'
+      AND (
+  $1::boolean = true
+  OR s.company_id = $2
+)
     `;
 
     if (date) {
