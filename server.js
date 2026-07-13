@@ -5168,50 +5168,73 @@ app.put(
   }
 );
 
-app.put("/settings/guards/:id/reset-password", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { password } = req.body;
+app.put(
+  "/settings/guards/:id/reset-password",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { password } = req.body;
 
-    if (!password) {
-      return res.status(400).json({
+      if (!password) {
+        return res.status(400).json({
+          status: "error",
+          message: "Password is required",
+        });
+      }
+
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const passwordHash = await bcrypt.hash(password, 10);
+
+      const result = await pool.query(
+        `
+        UPDATE guards g
+        SET password_hash = $1
+        FROM sites s
+        WHERE g.id = $2
+          AND s.id = g.site_id
+          AND (
+            $3::boolean = true
+            OR s.company_id = $4
+          )
+        RETURNING
+          g.id,
+          g.full_name,
+          g.username
+        `,
+        [
+          passwordHash,
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      console.error(
+        "Settings guard reset password error:",
+        err
+      );
+
+      return res.status(500).json({
         status: "error",
-        message: "Password is required"
+        message: err.message,
       });
     }
-
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const result = await pool.query(
-      `
-      UPDATE guards
-      SET password_hash = $1
-      WHERE id = $2
-      RETURNING id, full_name, username
-      `,
-      [passwordHash, id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Guard not found"
-      });
-    }
-
-    res.json({
-      status: "ok",
-      guard: result.rows[0]
-    });
-  } catch (err) {
-    console.error("Settings guard reset password error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
 // ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
