@@ -2849,66 +2849,78 @@ setInterval(autoCloseStaleGuardSessions, 30000);
 // ----------------------------------------------------------
 // ACTIVE GUARDS
 // ----------------------------------------------------------
-app.get("/guards/active", async (req, res) => {
-  try {
+app.get(
+  "/guards/active",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
 
-    const result = await pool.query(`
-      SELECT
-        s.id AS site_id,
-        s.name AS site_name,
-        s.location AS site_location,
+      const result = await pool.query(
+        `
+        SELECT
+          s.id AS site_id,
+          s.name AS site_name,
+          s.location AS site_location,
 
-        g.id AS guard_id,
-g.full_name,
-g.username,
-g.phone,
-g.mobile_phone,
+          g.id AS guard_id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.mobile_phone,
 
-        gs.login_time,
-        gs.login_time AS check_in_time,
-        gs.last_heartbeat,
-        gs.last_heartbeat AS last_seen,
-        gs.status,
+          gs.login_time,
+          gs.login_time AS check_in_time,
+          gs.last_heartbeat,
+          gs.last_heartbeat AS last_seen,
+          gs.status,
 
-        (
-  gs.id IS NOT NULL
-  AND gs.logout_time IS NULL
-) AS is_currently_online,
+          (
+            gs.id IS NOT NULL
+            AND gs.logout_time IS NULL
+          ) AS is_currently_online,
 
-(
-  gs.id IS NOT NULL
-  AND gs.logout_time IS NULL
-  AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
-) AS has_recent_heartbeat
+          (
+            gs.id IS NOT NULL
+            AND gs.logout_time IS NULL
+            AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
+          ) AS has_recent_heartbeat
 
-      FROM sites s
+        FROM sites s
 
-      LEFT JOIN guard_sessions gs
-        ON gs.site_id = s.id
-        AND gs.logout_time IS NULL
+        LEFT JOIN guard_sessions gs
+          ON gs.site_id = s.id
+          AND gs.logout_time IS NULL
 
-      LEFT JOIN guards g
-        ON g.id = gs.guard_id
+        LEFT JOIN guards g
+          ON g.id = gs.guard_id
 
-      ORDER BY s.id ASC
-    `);
+        WHERE
+          $1::boolean = true
+          OR s.company_id = $2
 
-    res.json({
-      status: "ok",
-      guards: result.rows
-    });
+        ORDER BY s.id ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-  } catch (err) {
+      return res.json({
+        status: "ok",
+        guards: result.rows,
+      });
+    } catch (err) {
+      console.error("Active guards error:", err);
 
-    console.error("Active guards error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
   }
-});
+);
 
 app.get("/dashboard/metrics", async (req, res) => {
   try {
