@@ -6754,58 +6754,56 @@ app.get(
   }
 );
 
-app.post("/incidents/:id/resolve", async (req, res) => {
-  try {
-    const incidentId = req.params.id;
+app.post(
+  "/incidents/:id/resolve",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const incidentId = Number(req.params.id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
 
-    const {
-      supervisor_notified,
-      supervisor_name,
-      supervisor_notes,
+      if (
+        !Number.isInteger(incidentId) ||
+        incidentId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid incident id",
+        });
+      }
 
-      guard_contacted,
-      guard_contacted_name,
-      guard_notes,
+      const incidentResult = await pool.query(
+        `
+        SELECT
+          i.id
+        FROM incidents i
+        INNER JOIN sites s
+          ON s.id = i.site_id
+        WHERE i.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        `,
+        [
+          incidentId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-      residence_contacted,
-      residence_contacted_name,
-      residence_notes,
+      if (incidentResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Incident not found",
+        });
+      }
 
-      admin_notes,
-      approved_by,
-    } = req.body;
-
-    await pool.query(
-      `
-      INSERT INTO incident_resolution_actions (
-        incident_id,
+      const {
         supervisor_notified,
         supervisor_name,
         supervisor_notes,
-        guard_contacted,
-        guard_contacted_name,
-        guard_notes,
-        residence_contacted,
-        residence_contacted_name,
-        residence_notes,
-        admin_notes,
-        approved_by,
-        approved_at
-      )
-      VALUES (
-        $1,$2,$3,$4,
-        $5,$6,$7,
-        $8,$9,$10,
-        $11,$12,
-        NOW()
-      )
-      `,
-      [
-        incidentId,
-
-        supervisor_notified,
-        supervisor_name,
-        supervisor_notes,
 
         guard_contacted,
         guard_contacted_name,
@@ -6817,34 +6815,78 @@ app.post("/incidents/:id/resolve", async (req, res) => {
 
         admin_notes,
         approved_by,
-      ]
-    );
+      } = req.body;
 
-    await pool.query(
-      `
-      UPDATE incidents
-      SET
-        status = 'resolved',
-        resolved_time = NOW()
-      WHERE id = $1
-      `,
-      [incidentId]
-    );
+      await pool.query(
+        `
+        INSERT INTO incident_resolution_actions (
+          incident_id,
+          supervisor_notified,
+          supervisor_name,
+          supervisor_notes,
+          guard_contacted,
+          guard_contacted_name,
+          guard_notes,
+          residence_contacted,
+          residence_contacted_name,
+          residence_notes,
+          admin_notes,
+          approved_by,
+          approved_at
+        )
+        VALUES (
+          $1,$2,$3,$4,
+          $5,$6,$7,
+          $8,$9,$10,
+          $11,$12,
+          NOW()
+        )
+        `,
+        [
+          incidentId,
 
-    res.json({
-      status: "ok",
-      message: "Incident resolved",
-    });
+          supervisor_notified,
+          supervisor_name,
+          supervisor_notes,
 
-  } catch (err) {
-    console.error(err);
+          guard_contacted,
+          guard_contacted_name,
+          guard_notes,
 
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
+          residence_contacted,
+          residence_contacted_name,
+          residence_notes,
+
+          admin_notes,
+          approved_by,
+        ]
+      );
+
+      await pool.query(
+        `
+        UPDATE incidents
+        SET
+          status = 'resolved',
+          resolved_time = NOW()
+        WHERE id = $1
+        `,
+        [incidentId]
+      );
+
+      return res.json({
+        status: "ok",
+        message: "Incident resolved",
+      });
+    } catch (err) {
+      console.error(err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
   }
-});
+);
 
 app.get("/incidents/resolved", requireAuth, async (req, res) => {
   try {
