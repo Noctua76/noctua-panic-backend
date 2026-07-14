@@ -6663,48 +6663,96 @@ aiStatus: row.incident_id
   }
 });
 
-app.get("/incidents/:id/guard-responses", async (req, res) => {
-  try {
-    await ensureIncidentGuardResponsesTable();
+app.get(
+  "/incidents/:id/guard-responses",
+  requireAuth,
+  async (req, res) => {
+    try {
+      await ensureIncidentGuardResponsesTable();
 
-    const incidentId = req.params.id;
+      const incidentId = Number(req.params.id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
 
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        incident_id,
-        guard_id,
-        site_id,
-        session_id,
-        question_key,
-        question_text,
-        answer,
-        created_at
-      FROM incident_guard_responses
-      WHERE incident_id = $1
-      ORDER BY created_at ASC
-      `,
-      [incidentId]
-    );
+      if (
+        !Number.isInteger(incidentId) ||
+        incidentId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid incident id",
+        });
+      }
 
-    res.json({
-      status: "ok",
-      responses: result.rows,
-      guard_notes: result.rows
-        .map((row) => `${row.question_text}\n${row.answer}`)
-        .join("\n\n")
-    });
+      const incidentResult = await pool.query(
+        `
+        SELECT
+          i.id
+        FROM incidents i
+        INNER JOIN sites s
+          ON s.id = i.site_id
+        WHERE i.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        `,
+        [
+          incidentId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-  } catch (err) {
-    console.error("Guard responses error:", err);
+      if (incidentResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Incident not found",
+        });
+      }
 
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
+      const result = await pool.query(
+        `
+        SELECT
+          igr.id,
+          igr.incident_id,
+          igr.guard_id,
+          igr.site_id,
+          igr.session_id,
+          igr.question_key,
+          igr.question_text,
+          igr.answer,
+          igr.created_at
+        FROM incident_guard_responses igr
+        WHERE igr.incident_id = $1
+        ORDER BY igr.created_at ASC
+        `,
+        [incidentId]
+      );
+
+      return res.json({
+        status: "ok",
+        responses: result.rows,
+        guard_notes: result.rows
+          .map(
+            (row) =>
+              `${row.question_text}\n${row.answer}`
+          )
+          .join("\n\n"),
+      });
+    } catch (err) {
+      console.error(
+        "Guard responses error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
   }
-});
+);
 
 app.post("/incidents/:id/resolve", async (req, res) => {
   try {
