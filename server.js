@@ -7487,8 +7487,11 @@ if (
   });
 }
 
+const forwardedProtocol =
+  req.get("x-forwarded-proto") || req.protocol;
+
 const reportResponse = await fetch(
-  `${req.protocol}://${req.get("host")}/incidents/${incidentId}/report`,
+  `${forwardedProtocol}://${req.get("host")}/incidents/${incidentId}/report`,
   {
     headers: {
       Authorization: req.headers.authorization,
