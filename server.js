@@ -7128,10 +7128,23 @@ function formatReportTime(value) {
   });
 }
 
-app.get("/incidents/:id/report", async (req, res) => {
+app.get(
+  "/incidents/:id/report",
+  requireAuth,
+  async (req, res) => {
   try {
-    const incidentId = req.params.id;
+  const incidentId = Number(req.params.id);
+const isSystemOwner = req.auth.role === "system_owner";
 
+if (
+  !Number.isInteger(incidentId) ||
+  incidentId <= 0
+) {
+  return res.status(400).json({
+    status: "error",
+    message: "Invalid incident id",
+  });
+}
     const incidentResult = await pool.query(
       `
       SELECT
@@ -7157,8 +7170,16 @@ i.incident_location_timestamp,
       LEFT JOIN sites s ON s.id = i.site_id
       LEFT JOIN guards g ON g.id = i.guard_ref
       WHERE i.id = $1
+  AND (
+    $2::boolean = true
+    OR s.company_id = $3
+  )
       `,
-      [incidentId]
+      [
+  incidentId,
+  isSystemOwner,
+  req.auth.company_id,
+]
     );
 
     if (incidentResult.rows.length === 0) {
@@ -7447,15 +7468,33 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
-app.get("/incidents/:id/report/pdf", async (req, res) => {
+app.get(
+  "/incidents/:id/report/pdf",
+  requireAuth,
+  async (req, res) => {
   let browser;
 
   try {
-    const incidentId = req.params.id;
+    const incidentId = Number(req.params.id);
 
-    const reportResponse = await fetch(
-      `${req.protocol}://${req.get("host")}/incidents/${incidentId}/report`
-    );
+if (
+  !Number.isInteger(incidentId) ||
+  incidentId <= 0
+) {
+  return res.status(400).json({
+    status: "error",
+    message: "Invalid incident id",
+  });
+}
+
+const reportResponse = await fetch(
+  `${req.protocol}://${req.get("host")}/incidents/${incidentId}/report`,
+  {
+    headers: {
+      Authorization: req.headers.authorization,
+    },
+  }
+);
 
     const data = await reportResponse.json();
 
