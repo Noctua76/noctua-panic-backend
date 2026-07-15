@@ -9895,8 +9895,10 @@ app.get(
   }
 );
 
-app.get("/patrols/sites", async (req, res) => {
+app.get("/patrols/sites", requireAuth, async (req, res) => {
   try {
+    const isSystemOwner = req.auth.role === "system_owner";
+
     const result = await pool.query(`
       WITH site_summary AS (
         SELECT
@@ -9919,8 +9921,10 @@ app.get("/patrols/sites", async (req, res) => {
         LEFT JOIN patrol_points pp
           ON pp.site_id = s.id
 
-        LEFT JOIN patrol_logs pl
+                LEFT JOIN patrol_logs pl
           ON pl.site_id = s.id
+
+        WHERE ($1::boolean = true OR s.company_id = $2)
 
         GROUP BY
           s.id,
@@ -10161,8 +10165,8 @@ END AS patrol_status,
 
       WHERE ss.active_points > 0
 
-      ORDER BY ss.site_id ASC
-    `);
+            ORDER BY ss.site_id ASC
+    `, [isSystemOwner, req.auth.company_id]);
 
     res.json({
       status: "ok",
