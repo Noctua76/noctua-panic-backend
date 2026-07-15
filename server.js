@@ -10672,48 +10672,76 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
 
     const result = await pool.query(
       `
-      WITH last_patrol_per_point AS (
-        SELECT DISTINCT ON (pp.id)
-          pp.id AS point_id,
-          pp.site_id,
-          pp.point_name,
-          pp.expected_interval_minutes,
-          pl.patrol_time AS last_patrol_time
-        FROM patrol_points pp
-        LEFT JOIN patrol_logs pl
-          ON pl.point_id = pp.id
-        WHERE pp.active = true
-        ORDER BY pp.id, pl.patrol_time DESC NULLS LAST
-      ),
-      recurring_missed AS (
-        SELECT
-          CONCAT(
-            'recurring-missed-',
-            lpp.point_id,
-            '-',
-            EXTRACT(EPOCH FROM generated_at)
-          ) AS id,
-          lpp.site_id,
-          s.name AS site_name,
-          s.location AS site_location,
-          lpp.point_id,
-          lpp.point_name,
-          generated_at AS scheduled_at,
-          'recurring' AS schedule_type,
-          'missed' AS status,
-          NULL::text AS guard_name
-        FROM last_patrol_per_point lpp
-        CROSS JOIN LATERAL generate_series(
-          lpp.last_patrol_time + (lpp.expected_interval_minutes || ' minutes')::interval,
-          NOW(),
-          (lpp.expected_interval_minutes || ' minutes')::interval
-        ) AS generated_at
-        LEFT JOIN sites s
-          ON s.id = lpp.site_id
-        WHERE lpp.last_patrol_time IS NOT NULL
-          AND lpp.expected_interval_minutes IS NOT NULL
-          AND generated_at < NOW()
-      ),
+      WITH recurring_missed AS (
+  SELECT
+    CONCAT(
+      'recurring-missed-',
+      ps.id,
+      '-',
+      EXTRACT(EPOCH FROM gs.expected_slot)
+    ) AS id,
+
+    ps.site_id,
+    s.name AS site_name,
+    s.location AS site_location,
+
+    ps.patrol_point_id AS point_id,
+    pp.point_name,
+
+    gs.expected_slot AS scheduled_at,
+
+    'recurring' AS schedule_type,
+    'missed' AS status,
+    NULL::text AS guard_name
+
+  FROM patrol_schedules ps
+
+  INNER JOIN patrol_points pp
+    ON pp.id = ps.patrol_point_id
+    AND pp.active = true
+
+  INNER JOIN sites s
+    ON s.id = ps.site_id
+
+  CROSS JOIN LATERAL (
+    SELECT
+      (
+        (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+        + ps.start_time
+      ) AS anchor_time
+  ) anchor
+
+  CROSS JOIN LATERAL generate_series(
+    anchor.anchor_time,
+    NOW() AT TIME ZONE 'Europe/Athens',
+    (ps.interval_hours || ' hours')::interval
+  ) AS gs(expected_slot)
+
+  WHERE ps.schedule_type = 'recurring'
+    AND ps.active = true
+    AND ps.start_time IS NOT NULL
+    AND ps.interval_hours IS NOT NULL
+
+    AND gs.expected_slot <
+      (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
+
+    AND NOT EXISTS (
+      SELECT 1
+      FROM patrol_logs pl
+      WHERE pl.site_id = ps.site_id
+        AND pl.point_id = ps.patrol_point_id
+        AND (
+          pl.scheduled_at = gs.expected_slot
+          OR (
+            pl.scheduled_at IS NULL
+            AND pl.patrol_time >=
+              gs.expected_slot - INTERVAL '10 minutes'
+            AND pl.patrol_time <=
+              gs.expected_slot + INTERVAL '30 minutes'
+          )
+        )
+    )
+),
       manual_missed AS (
         SELECT
           CONCAT('manual-missed-', ps.id) AS id,
