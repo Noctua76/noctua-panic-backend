@@ -10188,8 +10188,29 @@ END AS patrol_status,
   }
 });
 
-app.get("/patrols/sites/:siteId/details", async (req, res) => {
+app.get(
+  "/patrols/sites/:siteId/details",
+  requireAuth,
+  async (req, res) => {
   const { siteId } = req.params;
+  const isSystemOwner = req.auth.role === "system_owner";
+
+const siteResult = await pool.query(
+  `
+  SELECT id
+  FROM sites
+  WHERE id = $1
+    AND ($2::boolean = true OR company_id = $3)
+  `,
+  [siteId, isSystemOwner, req.auth.company_id]
+);
+
+if (siteResult.rows.length === 0) {
+  return res.status(404).json({
+    status: "error",
+    message: "Site not found",
+  });
+}
 
   try {
     const siteResult = await pool.query(
