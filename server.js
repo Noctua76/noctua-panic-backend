@@ -10844,7 +10844,10 @@ res.json({
   }
 });
 
-app.get("/patrols/missed-history/report/pdf", async (req, res) => {
+app.get(
+  "/patrols/missed-history/report/pdf",
+  requireAuth,
+  async (req, res) => {
   let browser;
 
   try {
@@ -10858,9 +10861,24 @@ app.get("/patrols/missed-history/report/pdf", async (req, res) => {
     if (point_id) params.append("point_id", point_id);
     if (type) params.append("type", type);
 
-    const historyResponse = await fetch(
-      `${req.protocol}://${req.get("host")}/patrols/missed-history?${params.toString()}`
-    );
+    const forwardedProtocol =
+  req.get("x-forwarded-proto") || req.protocol;
+
+const historyResponse = await fetch(
+  `${forwardedProtocol}://${req.get("host")}/patrols/missed-history?${params.toString()}`,
+  {
+    headers: {
+      Authorization: req.get("authorization"),
+    },
+  }
+);
+
+if (!historyResponse.ok) {
+  return res.status(historyResponse.status).json({
+    status: "error",
+    message: "Failed to load missed patrol history",
+  });
+}
 
     const data = await historyResponse.json();
 
@@ -11147,7 +11165,7 @@ res.setHeader(
 
     console.error("Missed patrol history PDF error:", err);
 
-    res.status(500).json({
+        res.status(500).json({
       status: "error",
       message: "Failed to generate missed patrol PDF report",
       error: err.message,
