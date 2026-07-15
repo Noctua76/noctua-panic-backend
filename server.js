@@ -9924,8 +9924,6 @@ app.get("/patrols/sites", requireAuth, async (req, res) => {
                 LEFT JOIN patrol_logs pl
           ON pl.site_id = s.id
 
-        WHERE ($1::boolean = true OR s.company_id = $2)
-
         GROUP BY
           s.id,
           s.name,
@@ -10163,7 +10161,14 @@ END AS patrol_status,
       LEFT JOIN upcoming_json uj
         ON uj.site_id = ss.site_id
 
-      WHERE ss.active_points > 0
+      WHERE
+  ss.active_points > 0
+  AND ($1::boolean = true OR EXISTS (
+    SELECT 1
+    FROM sites s
+    WHERE s.id = ss.site_id
+      AND s.company_id = $2
+  ))
 
             ORDER BY ss.site_id ASC
     `, [isSystemOwner, req.auth.company_id]);
