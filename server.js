@@ -10664,9 +10664,11 @@ function resolveShiftLabel(site, scheduledAtValue) {
   }
 }
 
-app.get("/patrols/missed-history", async (req, res) => {
+app.get("/patrols/missed-history", requireAuth, async (req, res) => {
   try {
     const { site_id, point_id, from, to, type = "all" } = req.query;
+
+    const isSystemOwner = req.auth.role === "system_owner";
 
     const result = await pool.query(
       `
@@ -10756,8 +10758,17 @@ app.get("/patrols/missed-history", async (req, res) => {
       )
       SELECT *
       FROM combined
-      WHERE ($1::int IS NULL OR site_id = $1::int)
+            WHERE ($1::int IS NULL OR site_id = $1::int)
         AND ($2::int IS NULL OR point_id = $2::int)
+        AND (
+          $6::boolean = true
+          OR EXISTS (
+            SELECT 1
+            FROM sites tenant_site
+            WHERE tenant_site.id = combined.site_id
+              AND tenant_site.company_id = $7
+          )
+        )
         AND (
   $3::date IS NULL
   OR (scheduled_at AT TIME ZONE 'Europe/Athens')::date >= $3::date
@@ -10774,12 +10785,14 @@ AND (
       LIMIT 300
       `,
       [
-        site_id ? Number(site_id) : null,
-        point_id ? Number(point_id) : null,
-        from || null,
-        to || null,
-        type || "all",
-      ]
+  site_id ? Number(site_id) : null,
+  point_id ? Number(point_id) : null,
+  from || null,
+  to || null,
+  type || "all",
+  isSystemOwner,
+  req.auth.company_id,
+]
     );
 
     const siteIds = [
