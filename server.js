@@ -9869,7 +9869,8 @@ app.get(
           ps.cancel_reason
         FROM patrol_schedules ps
         LEFT JOIN patrol_points pp
-          ON pp.id = ps.patrol_point_id
+  ON pp.id = ps.patrol_point_id
+ AND pp.site_id = ps.site_id
         WHERE ps.site_id = $1
         ORDER BY
           ps.active DESC,
@@ -11443,217 +11444,309 @@ app.get(
   }
 });
 
-app.get("/patrols/history", async (req, res) => {
-  try {
-    const countResult = await pool.query(`
-  SELECT
-    site_id,
-    COUNT(*) AS total
-  FROM patrol_logs
-  WHERE patrol_time >= NOW() - INTERVAL '24 hours'
-  GROUP BY site_id
-`);
-    const result = await pool.query(`
-      SELECT
-  pl.id,
-  pl.patrol_time,
-  pl.scheduled_at,
-  pl.delay_minutes,
-  pl.completion_status,
-  pl.was_missed,
+app.get(
+  "/patrols/history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
 
-  s.name AS site_name,
-
-  pp.point_name,
-
-  g.full_name AS guard_name,
-
-  pl.latitude,
-  pl.longitude,
-  pl.accuracy
-
-FROM patrol_logs pl
-
-LEFT JOIN sites s
-  ON s.id = pl.site_id
-
-LEFT JOIN patrol_points pp
-  ON pp.id = pl.point_id
-
-LEFT JOIN guards g
-  ON g.id = pl.guard_id
-
-ORDER BY pl.patrol_time DESC
-LIMIT 50
-    `);
-
-    res.json({
-  status: "ok",
-  history: result.rows,
-  completed_by_site: countResult.rows,
-});
-  } catch (err) {
-    console.error("Patrol history load error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: "Failed to load patrol history",
-      detail: err.message,
-    });
-  }
-});
-
-app.get("/patrols/completed-history", async (req, res) => {
-  try {
-    const {
-      site_id,
-      point_id,
-      from,
-      to,
-      type = "all",
-      status = "all",
-    } = req.query;
-
-    const result = await pool.query(
-      `
-      SELECT
-        pl.id,
-        pl.site_id,
-        s.name AS site_name,
-        s.location AS site_location,
-
-        pl.point_id,
-        pp.point_name,
-
-        pl.guard_id,
-        g.full_name AS guard_name,
-
-        pl.patrol_time,
-        pl.scheduled_at,
-        pl.delay_minutes,
-        pl.completion_status,
-        pl.was_missed,
-        COALESCE(pl.schedule_type, 'recurring') AS schedule_type,
-
-        pl.latitude,
-        pl.longitude,
-        pl.accuracy
-
-      FROM patrol_logs pl
-
-      LEFT JOIN sites s
-        ON s.id = pl.site_id
-
-      LEFT JOIN patrol_points pp
-        ON pp.id = pl.point_id
-
-      LEFT JOIN guards g
-        ON g.id = pl.guard_id
-
-      WHERE 1=1
-
-        AND ($1::int IS NULL OR pl.site_id = $1::int)
-        AND ($2::int IS NULL OR pl.point_id = $2::int)
-
-        AND (
-          $3::date IS NULL
-          OR (pl.patrol_time AT TIME ZONE 'Europe/Athens')::date >= $3::date
-        )
-
-        AND (
-          $4::date IS NULL
-          OR (pl.patrol_time AT TIME ZONE 'Europe/Athens')::date <= $4::date
-        )
-
-        AND (
-          $5::text = 'all'
-          OR COALESCE(pl.schedule_type, 'recurring') = $5::text
-        )
-
-        
-      ORDER BY pl.patrol_time DESC
-      LIMIT 300
-      `,
-      [
-        site_id ? Number(site_id) : null,
-        point_id ? Number(point_id) : null,
-        from || null,
-        to || null,
-        type || "all",        
-      ]
-    );
-
-    const siteIds = [
-      ...new Set(result.rows.map((row) => row.site_id).filter(Boolean)),
-    ];
-
-    let sitesById = {};
-
-    if (siteIds.length > 0) {
-      const sitesResult = await pool.query(
+      const countResult = await pool.query(
         `
         SELECT
-          id,
-          coverage_type,
-          shift_rules
-        FROM sites
-        WHERE id = ANY($1::int[])
+          pl.site_id,
+          COUNT(*)::int AS total
+        FROM patrol_logs pl
+        INNER JOIN sites s
+          ON s.id = pl.site_id
+        WHERE pl.patrol_time >= NOW() - INTERVAL '24 hours'
+          AND (
+            $1::boolean = true
+            OR s.company_id = $2
+          )
+        GROUP BY pl.site_id
         `,
-        [siteIds]
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
       );
 
-      sitesById = sitesResult.rows.reduce((acc, site) => {
-        acc[site.id] = site;
-        return acc;
-      }, {});
+      const result = await pool.query(
+        `
+        SELECT
+          pl.id,
+          pl.site_id,
+          pl.patrol_time,
+          pl.scheduled_at,
+          pl.delay_minutes,
+          pl.completion_status,
+          pl.was_missed,
+
+          s.name AS site_name,
+
+          pp.point_name,
+
+          g.full_name AS guard_name,
+
+          pl.latitude,
+          pl.longitude,
+          pl.accuracy
+
+        FROM patrol_logs pl
+
+        INNER JOIN sites s
+          ON s.id = pl.site_id
+
+        LEFT JOIN patrol_points pp
+          ON pp.id = pl.point_id
+          AND pp.site_id = pl.site_id
+
+        LEFT JOIN guards g
+          ON g.id = pl.guard_id
+          AND g.site_id = pl.site_id
+
+        WHERE (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+
+        ORDER BY pl.patrol_time DESC
+        LIMIT 50
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        history: result.rows,
+        completed_by_site: countResult.rows,
+      });
+    } catch (err) {
+      console.error("Patrol history load error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to load patrol history",
+        detail: err.message,
+      });
     }
-
-    const historyWithShift = result.rows.map((row) => {
-  const site = sitesById[row.site_id];
-
-  let displayStatus = "completed";
-
-  if (row.was_missed === true) {
-    displayStatus = "missed_completed_late";
-  } else if (row.completion_status === "completed_late") {
-    displayStatus = "completed_late";
-  } else if (row.completion_status === "missed_completed_late") {
-    displayStatus = "missed_completed_late";
-  } else {
-    displayStatus = "completed";
   }
+);
 
-  return {
-    ...row,
-    display_status: displayStatus,
-    shift_label: resolveShiftLabel(site, row.patrol_time),
-  };
-});
+app.get(
+  "/patrols/completed-history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const {
+        site_id,
+        point_id,
+        from,
+        to,
+        type = "all",
+        status = "all",
+      } = req.query;
 
-let filteredHistory = historyWithShift;
+      const isSystemOwner = req.auth.role === "system_owner";
 
-if (status && status !== "all") {
-  filteredHistory = historyWithShift.filter(
-    (row) => row.display_status === status
-  );
-}
+      const parsedSiteId = site_id ? Number(site_id) : null;
+      const parsedPointId = point_id ? Number(point_id) : null;
 
-    res.json({
-      status: "ok",
-      history: filteredHistory,
-    });
-  } catch (err) {
-    console.error("Completed patrol history load error:", err);
+      if (
+        parsedSiteId !== null &&
+        (!Number.isInteger(parsedSiteId) || parsedSiteId <= 0)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site_id",
+        });
+      }
 
-    res.status(500).json({
-      status: "error",
-      message: "Failed to load completed patrol history",
-      detail: err.message,
-    });
+      if (
+        parsedPointId !== null &&
+        (!Number.isInteger(parsedPointId) || parsedPointId <= 0)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid point_id",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          pl.id,
+          pl.site_id,
+          s.name AS site_name,
+          s.location AS site_location,
+
+          pl.point_id,
+          pp.point_name,
+
+          pl.guard_id,
+          g.full_name AS guard_name,
+
+          pl.patrol_time,
+          pl.scheduled_at,
+          pl.delay_minutes,
+          pl.completion_status,
+          pl.was_missed,
+          COALESCE(pl.schedule_type, 'recurring') AS schedule_type,
+
+          pl.latitude,
+          pl.longitude,
+          pl.accuracy
+
+        FROM patrol_logs pl
+
+        INNER JOIN sites s
+          ON s.id = pl.site_id
+
+        LEFT JOIN patrol_points pp
+          ON pp.id = pl.point_id
+          AND pp.site_id = pl.site_id
+
+        LEFT JOIN guards g
+          ON g.id = pl.guard_id
+          AND g.site_id = pl.site_id
+
+        WHERE (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+
+          AND ($3::int IS NULL OR pl.site_id = $3::int)
+          AND ($4::int IS NULL OR pl.point_id = $4::int)
+
+          AND (
+            $5::date IS NULL
+            OR (pl.patrol_time AT TIME ZONE 'Europe/Athens')::date >= $5::date
+          )
+
+          AND (
+            $6::date IS NULL
+            OR (pl.patrol_time AT TIME ZONE 'Europe/Athens')::date <= $6::date
+          )
+
+          AND (
+            $7::text = 'all'
+            OR COALESCE(pl.schedule_type, 'recurring') = $7::text
+          )
+
+        ORDER BY pl.patrol_time DESC
+        LIMIT 300
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+          parsedSiteId,
+          parsedPointId,
+          from || null,
+          to || null,
+          type || "all",
+        ]
+      );
+
+      const siteIds = [
+        ...new Set(
+          result.rows
+            .map((row) => row.site_id)
+            .filter(Boolean)
+        ),
+      ];
+
+      let sitesById = {};
+
+      if (siteIds.length > 0) {
+        const sitesResult = await pool.query(
+          `
+          SELECT
+            id,
+            coverage_type,
+            shift_rules
+          FROM sites
+          WHERE id = ANY($1::int[])
+            AND (
+              $2::boolean = true
+              OR company_id = $3
+            )
+          `,
+          [
+            siteIds,
+            isSystemOwner,
+            req.auth.company_id,
+          ]
+        );
+
+        sitesById = sitesResult.rows.reduce((acc, site) => {
+          acc[site.id] = site;
+          return acc;
+        }, {});
+      }
+
+      const historyWithShift = result.rows.map((row) => {
+        const site = sitesById[row.site_id];
+
+        let displayStatus = "completed";
+
+        if (row.was_missed === true) {
+          displayStatus = "missed_completed_late";
+        } else if (
+          row.completion_status === "completed_late"
+        ) {
+          displayStatus = "completed_late";
+        } else if (
+          row.completion_status === "missed_completed_late"
+        ) {
+          displayStatus = "missed_completed_late";
+        }
+
+        return {
+          ...row,
+          display_status: displayStatus,
+          shift_label: resolveShiftLabel(
+            site,
+            row.patrol_time
+          ),
+        };
+      });
+
+      let filteredHistory = historyWithShift;
+
+      if (status && status !== "all") {
+        filteredHistory = historyWithShift.filter(
+          (row) => row.display_status === status
+        );
+      }
+
+      return res.json({
+        status: "ok",
+        history: filteredHistory,
+      });
+    } catch (err) {
+      console.error(
+        "Completed patrol history load error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message:
+          "Failed to load completed patrol history",
+        detail: err.message,
+      });
+    }
   }
-});
+);
 
-app.get("/patrols/completed-history/report/pdf", async (req, res) => {
+app.get(
+  "/patrols/completed-history/report/pdf",
+  requireAuth,
+  async (req, res) => {
   let browser;
 
   try {
@@ -11675,9 +11768,24 @@ app.get("/patrols/completed-history/report/pdf", async (req, res) => {
     if (type) params.append("type", type);
     if (status) params.append("status", status);
 
-    const historyResponse = await fetch(
-      `${req.protocol}://${req.get("host")}/patrols/completed-history?${params.toString()}`
-    );
+    const forwardedProtocol =
+  req.get("x-forwarded-proto") || req.protocol;
+
+const historyResponse = await fetch(
+  `${forwardedProtocol}://${req.get("host")}/patrols/completed-history?${params.toString()}`,
+  {
+    headers: {
+      Authorization: req.get("authorization"),
+    },
+  }
+);
+
+if (!historyResponse.ok) {
+  return res.status(historyResponse.status).json({
+    status: "error",
+    message: "Failed to load completed patrol history",
+  });
+}
 
     const data = await historyResponse.json();
 
