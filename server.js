@@ -2505,32 +2505,85 @@ await syncScheduledShiftsForSession(sessionResult.rows[0].id);
   }
 });
 
-app.post("/admin/scheduled-shifts/generate", async (req, res) => {
-  try {
-    const { site_id, date } = req.body;
+app.post(
+  "/admin/scheduled-shifts/generate",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { site_id, date } = req.body;
 
-    if (!site_id || !date) {
-      return res.status(400).json({
+      const parsedSiteId = Number(site_id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
+
+      if (
+        !Number.isInteger(parsedSiteId) ||
+        parsedSiteId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site_id",
+        });
+      }
+
+      if (
+        typeof date !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid date format",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          parsedSiteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const created =
+        await generateScheduledShiftsForSite(
+          parsedSiteId,
+          date
+        );
+
+      return res.json({
+        status: "ok",
+        created_count: created.length,
+        scheduled_shifts: created,
+      });
+    } catch (err) {
+      console.error(
+        "Generate scheduled shifts error:",
+        err
+      );
+
+      return res.status(500).json({
         status: "error",
-        message: "site_id and date are required"
+        message: err.message,
       });
     }
-
-    const created = await generateScheduledShiftsForSite(site_id, date);
-
-    res.json({
-      status: "ok",
-      created_count: created.length,
-      scheduled_shifts: created
-    });
-  } catch (err) {
-    console.error("Generate scheduled shifts error:", err);
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
   }
-});
+);
 
 // ----------------------------------------------------------
 // GUARD LOGOUT
@@ -5377,151 +5430,188 @@ app.put(
 // ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
 // ----------------------------------------------------------
-app.get("/settings/alert-configuration", async (req, res) => {
-  try {
-    const recipients = getAlertRecipients();
+app.post(
+  "/admin/scheduled-shifts/generate",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { site_id, date } = req.body;
 
-    const smsConfigured = Boolean(
-      process.env.VONAGE_API_KEY &&
-      process.env.VONAGE_API_SECRET &&
-      process.env.VONAGE_SMS_FROM
-    );
+      const parsedSiteId = Number(site_id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
 
-    const voiceConfigured = Boolean(
-      process.env.VONAGE_APPLICATION_ID &&
-      process.env.VONAGE_PRIVATE_KEY &&
-      process.env.VONAGE_FROM_NUMBER
-    );
+      if (
+        !Number.isInteger(parsedSiteId) ||
+        parsedSiteId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site_id",
+        });
+      }
 
-    await ensureAlertEventsTable();
+      if (
+        typeof date !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid date format",
+        });
+      }
 
-const lastTestResult = await pool.query(`
-  SELECT *
-  FROM alert_events
-  WHERE event_type = 'test_alert'
-  ORDER BY created_at DESC
-  LIMIT 1
-`);
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          parsedSiteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
 
-    res.json({
-      status: "ok",
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
 
-      sms: {
-        status: smsConfigured ? "online" : "error",
-        configured: smsConfigured,
-        recipients_count: recipients.length,
-      },
+      const created =
+        await generateScheduledShiftsForSite(
+          parsedSiteId,
+          date
+        );
 
-      voice: {
-        status: voiceConfigured ? "online" : "error",
-        configured: voiceConfigured,
-        recipients_count: recipients.length,
-      },
+      return res.json({
+        status: "ok",
+        created_count: created.length,
+        scheduled_shifts: created,
+      });
+    } catch (err) {
+      console.error(
+        "Generate scheduled shifts error:",
+        err
+      );
 
-      escalation: {
-        status: recipients.length > 0 ? "online" : "error",
-        order: recipients.length > 0 ? "configured" : "not configured",
-      },
-
-      last_test: lastTestResult.rows[0]
-  ? {
-      tested_at: lastTestResult.rows[0].created_at,
-      recipients_count: lastTestResult.rows[0].recipients_count,
-      sms: {
-        sent: lastTestResult.rows[0].sms_sent,
-        failed: lastTestResult.rows[0].sms_failed,
-        status: lastTestResult.rows[0].sms_failed === 0 ? "online" : "error",
-      },
-      voice: {
-        attempted: lastTestResult.rows[0].voice_attempted,
-        status: lastTestResult.rows[0].voice_status,
-      },
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
     }
-  : null,
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
   }
-});
+);
 
-app.get("/event-logs", async (req, res) => {
-  try {
-    await ensureAlertEventsTable();
+app.get(
+  "/event-logs",
+  requireAuth,
+  async (req, res) => {
+    try {
+      await ensureAlertEventsTable();
 
-    const result = await pool.query(`
-      SELECT *
-      FROM alert_events
-      ORDER BY created_at DESC
-      LIMIT 50
-    `);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
 
-    res.json({
-      status: "ok",
-      logs: result.rows,
-    });
-  } catch (err) {
-    console.error("Event logs error:", err);
-    res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM alert_events
+        WHERE
+          $1::boolean = true
+          OR company_id = $2
+        ORDER BY created_at DESC
+        LIMIT 50
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        logs: result.rows,
+      });
+    } catch (err) {
+      console.error("Event logs error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
   }
-});
+);
 
 // ----------------------------------------------------------
 // ANALYTICS SUMMARY
 // ----------------------------------------------------------
-app.get("/analytics/summary", async (req, res) => {
+app.get(
+  "/analytics/summary",
+  requireAuth,
+  async (req, res) => {
   try {
-    const siteId = 1;
+    const companyId = req.auth.company_id;
+const isSystemOwner =
+  req.auth.role === "system_owner";
 
     const siteResult = await pool.query(
       `
       SELECT
-        id,
-        name,
-        location,
-        required_shifts
-      FROM sites
-      WHERE id = $1
+  COUNT(*)::int AS total_sites,
+  COALESCE(SUM(required_shifts), 0)::int AS required_shifts
+FROM sites
+WHERE
+  ($1::boolean = true OR company_id = $2)
       `,
-      [siteId]
+      [
+    isSystemOwner,
+    companyId,
+  ]
     );
 
-    if (siteResult.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Site not found"
-      });
-    }
-
-    const site = siteResult.rows[0];
+    
+    const companySummary = siteResult.rows[0];
 
     const alertsResult = await pool.query(
       `
       SELECT COUNT(*)::int AS alerts_count
       FROM alert_events
-      WHERE site_id = $1
+      WHERE
+  ($1::boolean = true OR company_id = $2)
       `,
-      [siteId]
+      [
+  isSystemOwner,
+  companyId,
+]
     );
 
     const guardsResult = await pool.query(
       `
       SELECT COUNT(*)::int AS assigned_guards
       FROM guards
-      WHERE site_id = $1
-      AND active = true
+      WHERE
+  active = true
+  AND ($1::boolean = true OR company_id = $2)
       `,
-      [siteId]
+      [
+  isSystemOwner,
+  companyId,
+]
     );
 
     const alertsCount = alertsResult.rows[0].alerts_count;
     const assignedGuards = guardsResult.rows[0].assigned_guards;
-    const requiredShifts = site.required_shifts;
+    const requiredShifts =
+  companySummary.required_shifts;
 
     let riskLevel = "No Data";
 
@@ -5554,11 +5644,10 @@ app.get("/analytics/summary", async (req, res) => {
       status: "ok",
       updated_at: new Date().toISOString(),
 
-      site: {
-        id: site.id,
-        name: site.name,
-        location: site.location
-      },
+      company: {
+  total_sites:
+    companySummary.total_sites,
+},
 
       alerts: {
         count: alertsCount,
