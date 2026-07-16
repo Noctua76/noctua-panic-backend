@@ -10929,13 +10929,21 @@ if (siteIds.length > 0) {
   const sitesResult = await pool.query(
     `
     SELECT
-      id,
-      coverage_type,
-      shift_rules
-    FROM sites
-    WHERE id = ANY($1::int[])
+  id,
+  coverage_type,
+  shift_rules
+FROM sites
+WHERE id = ANY($1::int[])
+  AND (
+    $2::boolean = true
+    OR company_id = $3
+  )
     `,
-    [siteIds]
+    [
+  siteIds,
+  isSystemOwner,
+  req.auth.company_id,
+]
   );
 
   sitesById = sitesResult.rows.reduce((acc, site) => {
