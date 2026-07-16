@@ -5597,18 +5597,20 @@ WHERE
 );
 
     const guardsResult = await pool.query(
-      `
-      SELECT COUNT(*)::int AS assigned_guards
-      FROM guards
-      WHERE
-  active = true
-  AND ($1::boolean = true OR company_id = $2)
-      `,
-      [
-  isSystemOwner,
-  companyId,
-]
-    );
+  `
+  SELECT COUNT(*)::int AS assigned_guards
+  FROM guards g
+  INNER JOIN sites s
+    ON s.id = g.site_id
+  WHERE
+    g.active = true
+    AND ($1::boolean = true OR s.company_id = $2)
+  `,
+  [
+    isSystemOwner,
+    companyId,
+  ]
+);
 
     const alertsCount = alertsResult.rows[0].alerts_count;
     const assignedGuards = guardsResult.rows[0].assigned_guards;
