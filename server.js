@@ -10528,29 +10528,44 @@ try {
   }
 });
 
-app.get("/guards/live-locations", async (req, res) => {
+app.get(
+  "/guards/live-locations",
+  requireAuth,
+  async (req, res) => {
   try {
+    const isSystemOwner =
+  req.auth.role === "system_owner";
     const result = await pool.query(`
       SELECT
-  gs.id AS session_id,
-  g.id,
-  g.full_name,
-  g.site_id,
-  s.name AS site_name,
-  gs.last_latitude,
-  gs.last_longitude,
-  gs.last_location_accuracy,
-  gs.last_location_at,
-  gs.last_battery_level,
-  gs.last_location_address
-FROM guard_sessions gs
-JOIN guards g
-  ON g.id = gs.guard_id
-LEFT JOIN sites s
-  ON s.id = g.site_id
-WHERE gs.logout_time IS NULL
-ORDER BY g.full_name ASC
-    `);
+    gs.id AS session_id,
+    g.id,
+    g.full_name,
+    g.site_id,
+    s.name AS site_name,
+    gs.last_latitude,
+    gs.last_longitude,
+    gs.last_location_accuracy,
+    gs.last_location_at,
+    gs.last_battery_level,
+    gs.last_location_address
+  FROM guard_sessions gs
+  JOIN guards g
+    ON g.id = gs.guard_id
+  LEFT JOIN sites s
+    ON s.id = g.site_id
+  WHERE
+    gs.logout_time IS NULL
+    AND (
+      $1::boolean = true
+      OR s.company_id = $2
+    )
+  ORDER BY g.full_name ASC
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
 
     res.json({
       status: "ok",
