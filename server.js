@@ -5582,17 +5582,19 @@ WHERE
     const companySummary = siteResult.rows[0];
 
     const alertsResult = await pool.query(
-      `
-      SELECT COUNT(*)::int AS alerts_count
-      FROM alert_events
-      WHERE
-  ($1::boolean = true OR company_id = $2)
-      `,
-      [
-  isSystemOwner,
-  companyId,
-]
-    );
+  `
+  SELECT COUNT(*)::int AS alerts_count
+  FROM alert_events ae
+  INNER JOIN sites s
+    ON s.id = ae.site_id
+  WHERE
+    ($1::boolean = true OR s.company_id = $2)
+  `,
+  [
+    isSystemOwner,
+    companyId,
+  ]
+);
 
     const guardsResult = await pool.query(
       `
