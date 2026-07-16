@@ -5522,13 +5522,15 @@ app.get(
 
       const result = await pool.query(
         `
-        SELECT *
-        FROM alert_events
-        WHERE
-          $1::boolean = true
-          OR company_id = $2
-        ORDER BY created_at DESC
-        LIMIT 50
+        SELECT ae.*
+FROM alert_events ae
+JOIN sites s
+  ON s.id = ae.site_id
+WHERE
+  $1::boolean = true
+  OR s.company_id = $2
+ORDER BY ae.created_at DESC
+LIMIT 50
         `,
         [
           isSystemOwner,
