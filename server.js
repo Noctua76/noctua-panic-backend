@@ -10238,34 +10238,6 @@ app.get(
 // ----------------------------------------------------------
 const PORT = process.env.PORT || 5000;
 
-app.get("/debug/site-shift-rules/:siteId", async (req, res) => {
-  const { siteId } = req.params;
-
-  try {
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        name,
-        coverage_type,
-        shift_rules
-      FROM sites
-      WHERE id = $1
-      `,
-      [siteId]
-    );
-
-    res.json({
-      status: "ok",
-      site: result.rows[0],
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: "error",
-      detail: err.message,
-    });
-  }
-});
 app.get("/debug/guard-sessions", async (req, res) => {
   try {
     const result = await pool.query(`
