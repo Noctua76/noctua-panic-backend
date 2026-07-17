@@ -298,16 +298,19 @@ async function processIncidentLog(message) {
 // ----------------------------------------------------------
 // Endpoint: δέχεται incident logs από το webapp
 // ----------------------------------------------------------
-app.post('/incident-log', async (req, res) => {
+app.post('/incident-log', requireGuardAuth, async (req, res) => {
   try {
     const {
-  guardId,
-  siteId,
-  sessionId,
   timestamp,
   message,
   incidentAnswers
 } = req.body;
+
+const {
+  guard_id: guardId,
+  session_id: sessionId,
+  site_id: siteId
+} = req.guard;
 
     if (!message) {
       return res
@@ -364,14 +367,14 @@ app.post('/incident-log', async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
       `,
       [
-        incidentId,
-        guardId || null,
-        siteId || null,
-        sessionId || null,
-        questionKey,
-        questionLabels[questionKey] || questionKey,
-        answer || ""
-      ]
+  incidentId,
+  guardId,
+  siteId,
+  sessionId,
+  questionKey,
+  questionLabels[questionKey] || questionKey,
+  answer || ""
+]
     );
   }
 }
@@ -379,8 +382,8 @@ app.post('/incident-log', async (req, res) => {
     // 2) Περνάμε το log στον Assistant για περίληψη / δομημένη καταγραφή
     const assistantLog = await processIncidentLog(
       `
-Guard ID: ${guardId || 'N/A'}
-Site ID: ${siteId || 'N/A'}
+Guard ID: ${guardId}
+Site ID: ${siteId}
 Time: ${timestamp || new Date().toISOString()}
 
 Incident description:
@@ -1587,6 +1590,57 @@ async function requireAuth(req, res, next) {
   }
 }
 
+async function requireGuardAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({
+        status: "error",
+        message: "Unauthorized",
+      });
+    }
+
+    const sessionToken = authHeader.substring(7);
+
+    const result = await pool.query(
+      `
+      SELECT
+        gs.id AS session_id,
+        gs.guard_id,
+        g.site_id,
+        g.full_name
+      FROM guard_sessions gs
+      JOIN guards g
+        ON g.id = gs.guard_id
+      WHERE
+        gs.session_token = $1
+        AND gs.logout_time IS NULL
+      LIMIT 1
+      `,
+      [sessionToken]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        status: "error",
+        message: "Unauthorized",
+      });
+    }
+
+    req.guard = result.rows[0];
+
+    next();
+  } catch (err) {
+    console.error("Guard auth failed:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Authentication failed",
+    });
+  }
+}
+
 // ----------------------------------------------------------
 // AUTH CONTEXT TEST
 // ----------------------------------------------------------
@@ -2361,6 +2415,7 @@ app.post("/guard/login", async (req, res) => {
     }
 
     const guard = result.rows[0];
+    const sessionToken = crypto.randomBytes(32).toString("hex");
 
     let validPassword = false;
 
@@ -2419,6 +2474,7 @@ const scheduledShift =
     login_time,
     last_heartbeat,
     status,
+    session_token,
     device_info,
     ip_address,
     created_at,
@@ -2434,22 +2490,24 @@ const scheduledShift =
   'online',
   $3,
   $4,
+  $5,
   (NOW() AT TIME ZONE 'Europe/Athens'),
-  $5::timestamp,
   $6::timestamp,
-  $7
+  $7::timestamp,
+  $8
 )
   RETURNING *
   `,
   [
-    guard.id,
-    guard.site_id,
-    device_info || null,
-    req.ip || null,
-    scheduledShift?.start || null,
-scheduledShift?.end || null,
-scheduledShift?.label || null
-  ]
+  guard.id,
+  guard.site_id,
+  sessionToken,
+  device_info || null,
+  req.ip || null,
+  scheduledShift?.start || null,
+  scheduledShift?.end || null,
+  scheduledShift?.label || null
+]
 );
 
 console.log("NEW SESSION:", sessionResult.rows[0]);
@@ -2463,6 +2521,7 @@ await syncScheduledShiftsForSession(sessionResult.rows[0].id);
     res.json({
       status: "ok",
       message: "Guard login successful",
+      guard_session_token: sessionToken,
       guard: {
         id: guard.id,
         full_name: guard.full_name,
@@ -2566,16 +2625,9 @@ app.post(
 // ----------------------------------------------------------
 // GUARD LOGOUT
 // ----------------------------------------------------------
-app.post("/guard/logout", async (req, res) => {
+app.post("/guard/logout", requireGuardAuth, async (req, res) => {
   try {
-    const { guard_id, session_id } = req.body;
-
-    if (!guard_id || !session_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id and session_id are required"
-      });
-    }
+    const { guard_id, session_id } = req.guard;
 
     const logoutResult = await pool.query(
   `
@@ -6116,12 +6168,10 @@ results.push({ to, response: r });
 }
 
 // === ALERT ENDPOINT used by the WebApp ===
-app.post('/alert', async (req, res) => {
+app.post('/alert', requireGuardAuth, async (req, res) => {
   console.log('ALERT ENDPOINT HIT:', req.body);
 
   const {
-  siteId,
-  guardId,
   triggeredAt,
   source,
   latitude,
@@ -6130,6 +6180,12 @@ app.post('/alert', async (req, res) => {
   battery,
   locationAddress
 } = req.body || {};
+
+const {
+  guard_id: guardId,
+  session_id: sessionId,
+  site_id: siteId
+} = req.guard;
 
   const recipientsEnv =
     process.env.ALERT_RECIPIENTS || process.env.ALERT_TARGET || '';
@@ -6205,8 +6261,8 @@ app.post('/alert', async (req, res) => {
   `,
   [
     incidentRef,
-    siteId || 1,
-    guardId || null,
+    siteId,
+    guardId,
     alertTime,
     'Panic alert triggered from web app.',
     latitude || null,
@@ -6231,8 +6287,8 @@ app.post('/alert', async (req, res) => {
     try {
       callResults = await startVoiceCalls(recipients, {
   incidentId: incident.id,
-  siteId: siteId || 1,
-  guardId: guardId || null
+  siteId,
+  guardId
 });
     } catch (callErr) {
       console.error('Voice call failed (non-blocking):', callErr);
@@ -6266,8 +6322,8 @@ await pool.query(
     "submitted",
 
     incident.id,
-    siteId || 1,
-    guardId || null,
+    siteId,
+    guardId,
 
     recipients.length,
     results.length,
@@ -10109,18 +10165,18 @@ console.log("SHORT ADDRESS:", shortAddress);
   }
 }
 
-app.post("/guard/location", async (req, res) => {
+app.post("/guard/location", requireGuardAuth, async (req, res) => {
   console.log("GPS REQUEST BODY:", req.body);
   try {
     const {
-  guard_id,
-  session_id,
   latitude,
   longitude,
   accuracy,
   speed,
   battery
 } = req.body;
+
+const { guard_id, session_id } = req.guard;
 
     if (!guard_id || !session_id || !latitude || !longitude) {
   return res.status(400).json({
