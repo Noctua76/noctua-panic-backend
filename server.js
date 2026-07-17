@@ -7066,35 +7066,6 @@ i.incident_location_timestamp,
 });
 
 
-app.post("/setup/sites-profile-upgrade", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE sites
-      ADD COLUMN IF NOT EXISTS full_address TEXT,
-      ADD COLUMN IF NOT EXISTS site_phone VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS shift_schedule TEXT,
-      ADD COLUMN IF NOT EXISTS residence_contact_name VARCHAR(255),
-      ADD COLUMN IF NOT EXISTS residence_contact_phone VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS supervisor_contact_name VARCHAR(255),
-      ADD COLUMN IF NOT EXISTS supervisor_contact_phone VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS operational_notes TEXT,
-      ADD COLUMN IF NOT EXISTS sop_text TEXT,
-      ADD COLUMN IF NOT EXISTS sop_file_url TEXT
-    `);
-
-    res.json({
-      status: "ok",
-      message: "Sites profile fields added"
-    });
-  } catch (err) {
-    console.error("Sites profile upgrade error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
 
 app.post("/setup/sites-shift-rules-upgrade", async (req, res) => {
   try {
