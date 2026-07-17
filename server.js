@@ -7816,33 +7816,6 @@ const reportResponse = await fetch(
 
 
 
-
-
-app.get("/setup/patrol-log-lifecycle-upgrade", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE patrol_logs
-      ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS delay_minutes INTEGER,
-      ADD COLUMN IF NOT EXISTS completion_status TEXT DEFAULT 'completed',
-      ADD COLUMN IF NOT EXISTS was_missed BOOLEAN DEFAULT false;
-    `);
-
-    res.json({
-      status: "ok",
-      message: "patrol_logs lifecycle columns added",
-    });
-  } catch (err) {
-    console.error("Patrol log lifecycle upgrade error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: "Failed to upgrade patrol_logs lifecycle",
-      detail: err.message,
-    });
-  }
-});
-
 app.get("/setup/patrol-scan-window-upgrade", async (req, res) => {
   try {
     await pool.query(`
