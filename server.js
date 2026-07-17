@@ -7065,35 +7065,6 @@ i.incident_location_timestamp,
   }
 });
 
-app.post("/setup/alert-events-upgrade", async (req, res) => {
-  try {
-    await ensureAlertEventsTable();
-
-    await pool.query(`
-      ALTER TABLE alert_events
-      ADD COLUMN IF NOT EXISTS incident_id INTEGER,
-      ADD COLUMN IF NOT EXISTS site_id INTEGER,
-      ADD COLUMN IF NOT EXISTS guard_id INTEGER,
-      ADD COLUMN IF NOT EXISTS recipient_phone VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS provider VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS provider_message_id TEXT,
-      ADD COLUMN IF NOT EXISTS provider_call_uuid TEXT,
-      ADD COLUMN IF NOT EXISTS event_payload JSONB
-    `);
-
-    res.json({
-      status: "ok",
-      message: "alert_events upgraded"
-    });
-  } catch (err) {
-    console.error("Alert events upgrade error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
 
 app.post("/setup/sites-profile-upgrade", async (req, res) => {
   try {
