@@ -7066,33 +7066,6 @@ i.incident_location_timestamp,
 });
 
 
-
-
-app.post("/setup/sites-operational-notes-upgrade", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE sites
-      ADD COLUMN IF NOT EXISTS general_notes TEXT,
-      ADD COLUMN IF NOT EXISTS access_instructions TEXT,
-      ADD COLUMN IF NOT EXISTS patrol_instructions TEXT,
-      ADD COLUMN IF NOT EXISTS emergency_instructions TEXT,
-      ADD COLUMN IF NOT EXISTS special_warnings TEXT
-    `);
-
-    res.json({
-      status: "ok",
-      message: "Site operational notes fields added"
-    });
-  } catch (err) {
-    console.error("Site operational notes upgrade error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
-
 function formatDuration(ms) {
   if (!ms || ms < 0) return "N/A";
 
