@@ -790,29 +790,7 @@ app.get("/db-test", async (req, res) => {
     });
   }
 });
-app.post("/setup/users-table", async (req, res) => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        full_name VARCHAR(255) NOT NULL,
-        username VARCHAR(100) UNIQUE NOT NULL,
-        email VARCHAR(255),
-        phone VARCHAR(50),
-        role VARCHAR(50) NOT NULL DEFAULT 'guard',
-        password_hash TEXT NOT NULL,
-        status VARCHAR(50) NOT NULL DEFAULT 'active',
-        must_change_password BOOLEAN NOT NULL DEFAULT true,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
 
-    res.json({ status: "ok", message: "Users table ready" });
-  } catch (err) {
-    console.error("Users table setup error:", err);
-    res.status(500).json({ status: "error", message: err.message });
-  }
-});
 
 // ----------------------------------------------------------
 // ADMIN USERS MANAGEMENT
