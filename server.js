@@ -7815,31 +7815,6 @@ const reportResponse = await fetch(
 });
 
 
-app.get("/setup/incident-location-upgrade", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE incidents
-      ADD COLUMN IF NOT EXISTS incident_latitude DECIMAL(10,8),
-      ADD COLUMN IF NOT EXISTS incident_longitude DECIMAL(11,8),
-      ADD COLUMN IF NOT EXISTS incident_accuracy INTEGER,
-      ADD COLUMN IF NOT EXISTS incident_battery_level INTEGER,
-      ADD COLUMN IF NOT EXISTS incident_address TEXT,
-      ADD COLUMN IF NOT EXISTS incident_location_timestamp TIMESTAMP;
-    `);
-
-    res.json({
-      status: "ok",
-      message: "Incident GPS snapshot fields added"
-    });
-  } catch (err) {
-    console.error("Incident location upgrade failed:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
 
 app.get("/setup/patrol-system", async (req, res) => {
   try {
