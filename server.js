@@ -7814,32 +7814,6 @@ const reportResponse = await fetch(
   }
 });
 
-app.get("/setup/guard-location-upgrade", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE guard_sessions
-      ADD COLUMN IF NOT EXISTS last_latitude DECIMAL(10,8),
-      ADD COLUMN IF NOT EXISTS last_longitude DECIMAL(11,8),
-      ADD COLUMN IF NOT EXISTS last_location_accuracy INTEGER,
-      ADD COLUMN IF NOT EXISTS last_location_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS last_speed DECIMAL(8,2),
-      ADD COLUMN IF NOT EXISTS last_battery_level INTEGER,
-      ADD COLUMN IF NOT EXISTS last_location_address TEXT;
-    `);
-
-    res.json({
-      status: "ok",
-      message: "Guard location fields added to guard_sessions"
-    });
-  } catch (err) {
-    console.error("Guard location upgrade failed:", err);
-    res.status(500).json({
-      status: "error",
-      message: "Guard location upgrade failed",
-      detail: err.message
-    });
-  }
-});
 
 app.get("/setup/incident-location-upgrade", async (req, res) => {
   try {
