@@ -7817,41 +7817,6 @@ const reportResponse = await fetch(
 
 
 
-app.post("/setup/patrol-logs-table", async (req, res) => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS patrol_logs (
-        id SERIAL PRIMARY KEY,
-
-        site_id INTEGER REFERENCES sites(id),
-        point_id INTEGER REFERENCES patrol_points(id),
-        guard_id INTEGER REFERENCES guards(id),
-
-        qr_token TEXT,
-
-        latitude NUMERIC,
-        longitude NUMERIC,
-        accuracy NUMERIC,
-
-        patrol_time TIMESTAMP DEFAULT NOW(),
-
-        created_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    res.json({
-      status: "ok",
-      message: "Patrol logs table ready"
-    });
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
 
 app.get("/setup/patrol-log-lifecycle-upgrade", async (req, res) => {
   try {
