@@ -7067,27 +7067,6 @@ i.incident_location_timestamp,
 
 
 
-app.post("/setup/sites-shift-rules-upgrade", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE sites
-      ADD COLUMN IF NOT EXISTS coverage_type VARCHAR(50) DEFAULT '24_7',
-      ADD COLUMN IF NOT EXISTS shift_rules JSONB
-    `);
-
-    res.json({
-      status: "ok",
-      message: "Site shift rules fields added"
-    });
-  } catch (err) {
-    console.error("Site shift rules upgrade error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
 
 app.post("/setup/sites-operational-notes-upgrade", async (req, res) => {
   try {
