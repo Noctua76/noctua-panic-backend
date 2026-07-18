@@ -2663,16 +2663,9 @@ for (const row of logoutResult.rows) {
 // ----------------------------------------------------------
 // GUARD SESSION HEARTBEAT
 // ----------------------------------------------------------
-app.post("/guard/heartbeat", async (req, res) => {
+app.post("/guard/heartbeat", requireGuardAuth, async (req, res) => {
   try {
-    const { guard_id, session_id } = req.body;
-
-    if (!guard_id || !session_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id and session_id are required"
-      });
-    }
+    const { guard_id, session_id } = req.guard;
 
     const result = await pool.query(
       `
