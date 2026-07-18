@@ -736,6 +736,12 @@ app.get("/admin/sessions/export", requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------
 app.post('/send-sms', requireAuth, async (req, res) => {
   try {
+    if (!isSystemOwner(req.auth)) {
+      return res.status(403).json({
+        status: "error",
+        message: "Forbidden",
+      });
+    }
     const { phone, message } = req.body;
 
     if (!phone || !message) {
@@ -5846,6 +5852,13 @@ async function sendVonageSms(to, text) {
 // Vonage SMS Test Route (χρησιμοποιεί το helper sendVonageSms)
 // ----------------------------------------------------------
 app.post('/test-sms', requireAuth, async (req, res) => {
+  if (!isSystemOwner(req.auth)) {
+    return res.status(403).json({
+      status: "error",
+      message: "Forbidden",
+    });
+  }
+
   const { to, text } = req.body;
 
   if (!to || !text) {
