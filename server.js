@@ -265,12 +265,6 @@ app.get('/', (req, res) => {
   res.send('Noctua Panic Backend is running');
 });
 
-// Temporary placeholder routes
-app.post('/trigger-alert', (req, res) => {
-  console.log('Alert received:', req.body);
-  return res.json({ status: 'ok', message: 'Alert received by backend' });
-});
-
 // --- OpenAI Assistant connection ---
 const OpenAI = require("openai");
 
@@ -740,7 +734,7 @@ app.get("/admin/sessions/export", requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------
 // GreekSMS API route
 // ---------------------------------------------------------------------
-app.post('/send-sms', async (req, res) => {
+app.post('/send-sms', requireAuth, async (req, res) => {
   try {
     const { phone, message } = req.body;
 
@@ -777,23 +771,6 @@ app.get('/health', (req, res) => {
   res.set('Expires', '0');
   res.status(200).json({ status: 'ok' });
 });
-app.get("/db-test", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT NOW()");
-    res.json({
-      status: "ok",
-      dbTime: result.rows[0]
-    });
-  } catch (err) {
-    console.error("DB test error:", err);
-
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
-
 
 // ----------------------------------------------------------
 // ADMIN USERS MANAGEMENT
@@ -2701,226 +2678,6 @@ app.post("/guard/heartbeat", requireGuardAuth, async (req, res) => {
     });
   }
 });
-
-// ----------------------------------------------------------
-// GUARD CHECK IN
-// ----------------------------------------------------------
-app.post("/guards/checkin", async (req, res) => {
-  try {
-    const { username, site_id } = req.body;
-
-    if (!username || !site_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "username and site_id are required"
-      });
-    }
-
-    const guardResult = await pool.query(
-      `
-      SELECT *
-      FROM guards
-      WHERE username = $1
-        AND active = true
-      `,
-      [username]
-    );
-
-    if (guardResult.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Guard not found or inactive"
-      });
-    }
-
-    const guard = guardResult.rows[0];
-
-    await pool.query(
-      `
-      UPDATE guard_shifts
-      SET
-        check_out_time = NOW(),
-        status = 'auto_closed',
-        online = false
-      WHERE guard_ref = $1
-        AND check_out_time IS NULL
-      `,
-      [guard.id]
-    );
-
-    const shiftResult = await pool.query(
-      `
-      INSERT INTO guard_shifts (
-        company_id,
-        guard_id,
-        guard_ref,
-        site_id,
-        check_in_time,
-        last_seen,
-        online,
-        status,
-        created_at
-      )
-      VALUES (
-        1,
-        $1,
-        $1,
-        $2,
-        NOW(),
-        NOW(),
-        true,
-        'on_duty',
-        NOW()
-      )
-      RETURNING *
-      `,
-      [guard.id, site_id]
-    );
-
-    await pool.query(
-      `
-      UPDATE sites
-      SET active_guard_id = $1
-      WHERE id = $2
-      `,
-      [guard.id, site_id]
-    );
-
-    res.json({
-      status: "ok",
-      guard,
-      shift: shiftResult.rows[0]
-    });
-
-  } catch (err) {
-    console.error("Guard checkin error:", err);
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
-
-
-// ----------------------------------------------------------
-// GUARD HEARTBEAT
-// ----------------------------------------------------------
-app.post("/guards/heartbeat", async (req, res) => {
-  try {
-    const { guard_id } = req.body;
-
-    if (!guard_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id is required"
-      });
-    }
-
-    await pool.query(
-      `
-      UPDATE guard_shifts
-      SET
-        last_seen = NOW(),
-        online = true
-      WHERE guard_ref = $1
-        AND check_out_time IS NULL
-      `,
-      [guard_id]
-    );
-
-    res.json({ status: "ok" });
-
-  } catch (err) {
-    console.error("Guard heartbeat error:", err);
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
-
-
-// ----------------------------------------------------------
-// GUARD CHECK OUT
-// ----------------------------------------------------------
-app.post("/guards/checkout", async (req, res) => {
-  try {
-    const { guard_id, site_id } = req.body;
-
-    if (!guard_id || !site_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id and site_id are required"
-      });
-    }
-
-    await pool.query(
-      `
-      UPDATE guard_shifts
-      SET
-        check_out_time = NOW(),
-        status = 'completed',
-        online = false,
-        last_seen = NOW()
-      WHERE guard_ref = $1
-        AND site_id = $2
-        AND check_out_time IS NULL
-      `,
-      [guard_id, site_id]
-    );
-
-    await pool.query(
-      `
-      UPDATE sites
-      SET active_guard_id = NULL
-      WHERE id = $1
-        AND active_guard_id = $2
-      `,
-      [site_id, guard_id]
-    );
-
-    res.json({ status: "ok" });
-
-  } catch (err) {
-    console.error("Guard checkout error:", err);
-    res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
-});
-
-// ----------------------------------------------------------
-// AUTO CLOSE STALE GUARD SESSIONS
-// ----------------------------------------------------------
-async function autoCloseStaleGuardSessions() {
-  try {
-    await pool.query(`
-      WITH stale_sessions AS (
-        UPDATE guard_shifts
-        SET
-          check_out_time = NOW(),
-          status = 'abandoned',
-          online = false,
-          last_seen = NOW()
-        WHERE check_out_time IS NULL
-          AND online = true
-          AND last_seen < NOW() - INTERVAL '90 seconds'
-        RETURNING guard_ref, site_id
-      )
-      UPDATE sites s
-      SET active_guard_id = NULL
-      FROM stale_sessions ss
-      WHERE s.id = ss.site_id
-        AND s.active_guard_id = ss.guard_ref
-    `);
-  } catch (err) {
-    console.error("Auto close stale guard sessions error:", err);
-  }
-}
-
-setInterval(autoCloseStaleGuardSessions, 30000);
-
 
 // ----------------------------------------------------------
 // ACTIVE GUARDS
@@ -6001,14 +5758,14 @@ try {
     // ACTIVE GUARDS
 
     const guards =
-      await pool.query(`
+  await pool.query(`
 SELECT COUNT(*)::int AS active_guards
 
-FROM guard_shifts
+FROM guard_sessions
 
-WHERE check_out_time IS NULL
+WHERE logout_time IS NULL
 
-AND last_seen >
+AND last_heartbeat >
 NOW() - INTERVAL '90 seconds'
 `);
 
@@ -6088,7 +5845,7 @@ async function sendVonageSms(to, text) {
 // ----------------------------------------------------------
 // Vonage SMS Test Route (χρησιμοποιεί το helper sendVonageSms)
 // ----------------------------------------------------------
-app.post('/test-sms', async (req, res) => {
+app.post('/test-sms', requireAuth, async (req, res) => {
   const { to, text } = req.body;
 
   if (!to || !text) {
@@ -6442,59 +6199,6 @@ async function eventHook(req, res) {
 
 app.get('/webhooks/event', eventHook);
 app.post('/webhooks/event', eventHook);
-app.post("/incidents/create", async (req, res) => {
-  try {
-    const {
-      site_id,
-      guard_ref,
-      priority = "high",
-      ai_summary = "",
-      needs_support = false,
-    } = req.body;
-
-    const incidentRef =
-      `INC-${Date.now()}`;
-
-    const result = await pool.query(
-      `
-      INSERT INTO incidents (
-        incident_ref,
-        site_id,
-        guard_ref,
-        status,
-        priority,
-        ai_summary,
-        needs_support,
-        auto_reset_time
-      )
-      VALUES (
-        $1,$2,$3,
-        'active',
-        $4,$5,$6,
-        NOW() + INTERVAL '2 hours'
-      )
-      RETURNING *
-      `,
-      [
-        incidentRef,
-        site_id,
-        guard_ref,
-        priority,
-        ai_summary,
-        needs_support,
-      ]
-    );
-
-    res.json(result.rows[0]);
-
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      error: "incident create failed"
-    });
-  }
-});
 
 app.get("/incidents/live", requireAuth, async (req, res) => {
 
