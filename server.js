@@ -24,9 +24,12 @@ async function getShiftDelayEmailRecipients(companyId) {
       email,
       secondary_email
     FROM users
-    WHERE company_id = $1
-      AND role = 'supervisor'
-      AND status = 'active'
+    WHERE
+(
+  (company_id = $1 AND role = 'supervisor')
+  OR role = 'system_owner'
+)
+AND status = 'active'
       AND (
   NULLIF(BTRIM(email), '') IS NOT NULL
   OR NULLIF(BTRIM(secondary_email), '') IS NOT NULL
