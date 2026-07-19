@@ -4122,44 +4122,44 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        id,
-        company_id,
-        name,
-        location,
-        status,
-        active_changed_at,
-        active_changed_by,
-        u.full_name AS active_changed_by_name,
-        u.role AS active_changed_by_role,
-        required_shifts,
-        full_address,
-        coverage_type,
-        shift_rules,
-        site_phone,
-        shift_schedule,
-        residence_contact_name,
-        residence_contact_phone,
-        supervisor_contact_name,
-        supervisor_contact_phone,
-        operational_notes,
-        sop_text,
-        sop_file_url,
-        sop_title,
-        sop_version,
-        sop_updated_at,
-        general_notes,
-        access_instructions,
-        patrol_instructions,
-        emergency_instructions,
-        special_warnings,
-        created_at
+  sites.id,
+  sites.company_id,
+  sites.name,
+  sites.location,
+  sites.status,
+  sites.active_changed_at,
+  sites.active_changed_by,
+  u.full_name AS active_changed_by_name,
+  u.role AS active_changed_by_role,
+  sites.required_shifts,
+  sites.full_address,
+  sites.coverage_type,
+  sites.shift_rules,
+  sites.site_phone,
+  sites.shift_schedule,
+  sites.residence_contact_name,
+  sites.residence_contact_phone,
+  sites.supervisor_contact_name,
+  sites.supervisor_contact_phone,
+  sites.operational_notes,
+  sites.sop_text,
+  sites.sop_file_url,
+  sites.sop_title,
+  sites.sop_version,
+  sites.sop_updated_at,
+  sites.general_notes,
+  sites.access_instructions,
+  sites.patrol_instructions,
+  sites.emergency_instructions,
+  sites.special_warnings,
+  sites.created_at
       FROM sites
       LEFT JOIN users u
       ON u.id = sites.active_changed_by
       WHERE (
-        $1::boolean = true
-        OR company_id = $2
-      )
+  $1::boolean = true
+  OR sites.company_id = $2
+)
       ORDER BY id ASC
       `,
       [
