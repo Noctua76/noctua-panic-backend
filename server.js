@@ -4127,6 +4127,10 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
         name,
         location,
         status,
+        active_changed_at,
+        active_changed_by,
+        u.full_name AS active_changed_by_name,
+        u.role AS active_changed_by_role,
         required_shifts,
         full_address,
         coverage_type,
@@ -4150,6 +4154,8 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
         special_warnings,
         created_at
       FROM sites
+      LEFT JOIN users u
+      ON u.id = sites.active_changed_by
       WHERE (
         $1::boolean = true
         OR company_id = $2
@@ -4700,23 +4706,27 @@ app.put(
       const result = await pool.query(
         `
         UPDATE sites
-        SET status =
-          CASE
-            WHEN status = 'active' THEN 'inactive'
-            ELSE 'active'
-          END
-        WHERE id = $1
-          AND (
-            $2::boolean = true
-            OR company_id = $3
-          )
-        RETURNING *
+SET
+  status =
+    CASE
+      WHEN status = 'active' THEN 'inactive'
+      ELSE 'active'
+    END,
+  active_changed_at = NOW(),
+  active_changed_by = $4
+WHERE id = $1
+  AND (
+    $2::boolean = true
+    OR company_id = $3
+  )
+RETURNING *
         `,
         [
-          siteId,
-          isSystemOwner,
-          req.auth.company_id,
-        ]
+  siteId,
+  isSystemOwner,
+  req.auth.company_id,
+  req.auth.user_id,
+]
       );
 
       if (result.rows.length === 0) {
