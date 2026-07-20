@@ -4168,8 +4168,13 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
       ]
     );
 
-    console.log(result.rows[0].active_changed_at);
-    console.log(typeof result.rows[0].active_changed_at);
+    for (const site of result.rows) {
+  if (site.active_changed_at) {
+    console.log(site.name);
+    console.log(site.active_changed_at);
+    console.log(typeof site.active_changed_at);
+  }
+}
 
     return res.json({
       status: "ok",
