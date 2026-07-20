@@ -4127,7 +4127,10 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
   sites.name,
   sites.location,
   sites.status,
+  to_char(
   sites.active_changed_at,
+  'YYYY-MM-DD HH24:MI:SS'
+) AS active_changed_at,
   sites.active_changed_by,
   u.full_name AS active_changed_by_name,
   u.role AS active_changed_by_role,
