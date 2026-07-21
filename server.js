@@ -5998,6 +5998,11 @@ const {
   }
 
   const alertTime = new Date();
+
+console.log("Server now:", alertTime);
+console.log("ISO:", alertTime.toISOString());
+console.log("Locale:", alertTime.toLocaleString("el-GR"));
+
   const incidentRef = `INC-${Date.now()}`;
 
   const text =
