@@ -6773,35 +6773,51 @@ app.get("/incidents/resolved", requireAuth, async (req, res) => {
         i.incident_ref,
         i.status,
         i.priority,
-        i.trigger_time,
-        i.resolved_time,
-        i.ai_summary,
-        i.needs_support,
-        i.incident_latitude,
+        to_char(
+  i.trigger_time,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS trigger_time,
+
+to_char(
+  i.resolved_time,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS resolved_time,
+
+i.ai_summary,
+i.needs_support,
+i.incident_latitude,
 i.incident_longitude,
 i.incident_accuracy,
 i.incident_battery_level,
 i.incident_address,
-i.incident_location_timestamp,
 
-        s.id AS site_id,
-        s.name AS site_name,
-        s.location AS site_location,
+to_char(
+  i.incident_location_timestamp,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS incident_location_timestamp,
 
-        COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name,
+s.id AS site_id,
+s.name AS site_name,
+s.location AS site_location,
 
-        ira.supervisor_notified,
-        ira.supervisor_name,
-        ira.supervisor_notes,
-        ira.guard_contacted,
-        ira.guard_contacted_name,
-        ira.guard_notes,
-        ira.residence_contacted,
-        ira.residence_contacted_name,
-        ira.residence_notes,
-        ira.admin_notes,
-        ira.approved_by,
-        ira.approved_at
+COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name,
+
+ira.supervisor_notified,
+ira.supervisor_name,
+ira.supervisor_notes,
+ira.guard_contacted,
+ira.guard_contacted_name,
+ira.guard_notes,
+ira.residence_contacted,
+ira.residence_contacted_name,
+ira.residence_notes,
+ira.admin_notes,
+ira.approved_by,
+
+to_char(
+  ira.approved_at,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS approved_at
 
       FROM incidents i
 
