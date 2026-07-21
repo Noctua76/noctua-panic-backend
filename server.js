@@ -5997,7 +5997,7 @@ const {
     });
   }
 
-  const alertTime = triggeredAt || new Date().toISOString();
+  const alertTime = new Date();
   const incidentRef = `INC-${Date.now()}`;
 
   const text =
