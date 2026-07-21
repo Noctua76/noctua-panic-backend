@@ -2711,10 +2711,25 @@ app.get(
           g.phone,
           g.mobile_phone,
 
-          gs.login_time,
-          gs.login_time AS check_in_time,
-          gs.last_heartbeat,
-          gs.last_heartbeat AS last_seen,
+          to_char(
+  gs.login_time,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS login_time,
+
+to_char(
+  gs.login_time,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS check_in_time,
+
+to_char(
+  gs.last_heartbeat,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS last_heartbeat,
+
+to_char(
+  gs.last_heartbeat,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS last_seen,
           gs.status,
 
           (
