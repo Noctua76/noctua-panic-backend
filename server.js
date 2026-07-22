@@ -6801,6 +6801,9 @@ app.post(
 app.get("/incidents/resolved", requireAuth, async (req, res) => {
   try {
     const isSystemOwner = req.auth.role === "system_owner";
+    const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
     const { date, site_id } = req.query;
 
     const values = [
@@ -6809,55 +6812,42 @@ app.get("/incidents/resolved", requireAuth, async (req, res) => {
 ];
     let query = `
       SELECT
-        i.id,
-        i.incident_ref,
-        i.status,
-        i.priority,
-        to_char(
+  i.id,
+  i.incident_ref,
+  i.status,
+  i.priority,
+
   i.trigger_time,
-  'YYYY-MM-DD"T"HH24:MI:SS.MS'
-) AS trigger_time,
-
-to_char(
   i.resolved_time,
-  'YYYY-MM-DD"T"HH24:MI:SS.MS'
-) AS resolved_time,
 
-i.ai_summary,
-i.needs_support,
-i.incident_latitude,
-i.incident_longitude,
-i.incident_accuracy,
-i.incident_battery_level,
-i.incident_address,
+  i.ai_summary,
+  i.needs_support,
+  i.incident_latitude,
+  i.incident_longitude,
+  i.incident_accuracy,
+  i.incident_battery_level,
+  i.incident_address,
 
-to_char(
   i.incident_location_timestamp,
-  'YYYY-MM-DD"T"HH24:MI:SS.MS'
-) AS incident_location_timestamp,
 
-s.id AS site_id,
-s.name AS site_name,
-s.location AS site_location,
+  s.id AS site_id,
+  s.name AS site_name,
+  s.location AS site_location,
 
-COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name,
+  COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name,
 
-ira.supervisor_notified,
-ira.supervisor_name,
-ira.supervisor_notes,
-ira.guard_contacted,
-ira.guard_contacted_name,
-ira.guard_notes,
-ira.residence_contacted,
-ira.residence_contacted_name,
-ira.residence_notes,
-ira.admin_notes,
-ira.approved_by,
-
-to_char(
-  ira.approved_at,
-  'YYYY-MM-DD"T"HH24:MI:SS.MS'
-) AS approved_at
+  ira.supervisor_notified,
+  ira.supervisor_name,
+  ira.supervisor_notes,
+  ira.guard_contacted,
+  ira.guard_contacted_name,
+  ira.guard_notes,
+  ira.residence_contacted,
+  ira.residence_contacted_name,
+  ira.residence_notes,
+  ira.admin_notes,
+  ira.approved_by,
+  ira.approved_at
 
       FROM incidents i
 
@@ -6903,10 +6893,36 @@ to_char(
 
     const result = await pool.query(query, values);
 
+    const incidents = result.rows.map((incident) => ({
+  ...incident,
+
+  trigger_time_display: formatReportTime(
+    incident.trigger_time,
+    companyTimezone
+  ),
+
+  resolved_time_display: formatReportTime(
+    incident.resolved_time,
+    companyTimezone
+  ),
+
+  incident_location_timestamp_display: formatReportTime(
+    incident.incident_location_timestamp,
+    companyTimezone
+  ),
+
+  approved_at_display: formatReportTime(
+    incident.approved_at,
+    companyTimezone
+  ),
+}));
+
+console.log(incidents[0]);
+
     res.json({
-      status: "ok",
-      incidents: result.rows,
-    });
+  status: "ok",
+  incidents,
+});
 
   } catch (err) {
     console.error("Resolved incidents error:", err);
