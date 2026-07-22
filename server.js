@@ -462,20 +462,6 @@ app.get("/admin/active", requireAuth, async (req, res) => {
       ]
     );
 
-    result.rows.forEach((row) => {
-  row.login_time = row.login_time
-    ? new Date(row.login_time).toLocaleString("el-GR", {
-        timeZone: companyTimezone,
-      })
-    : null;
-
-  row.last_seen = row.last_seen
-    ? new Date(row.last_seen).toLocaleString("el-GR", {
-        timeZone: companyTimezone,
-      })
-    : null;
-});
-
     return res.json({
       status: "ok",
       admins: result.rows,
@@ -650,26 +636,6 @@ app.get("/admin/sessions/history", requireAuth, async (req, res) => {
     query += ` ORDER BY login_time DESC`;
 
     const result = await pool.query(query, values);
-
-    result.rows.forEach((row) => {
-  row.login_time = row.login_time
-    ? new Date(row.login_time).toLocaleString("el-GR", {
-        timeZone: companyTimezone,
-      })
-    : null;
-
-  row.last_seen = row.last_seen
-    ? new Date(row.last_seen).toLocaleString("el-GR", {
-        timeZone: companyTimezone,
-      })
-    : null;
-
-  row.logout_time = row.logout_time
-    ? new Date(row.logout_time).toLocaleString("el-GR", {
-        timeZone: companyTimezone,
-      })
-    : null;
-});
 
     return res.json({
       status: "ok",
