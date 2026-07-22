@@ -6988,6 +6988,11 @@ app.get(
   async (req, res) => {
   try {
   const incidentId = Number(req.params.id);
+
+const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
+
 const isSystemOwner = req.auth.role === "system_owner";
 
 if (
@@ -7118,14 +7123,20 @@ alertEvents.forEach((event) => {
     timeline.push({
       event: "Alert Triggered",
       timestamp: event.created_at,
-      display_time: formatReportTime(event.created_at),
+      display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
     });
 
     if (Number(event.sms_sent) > 0) {
       timeline.push({
         event: `SMS Sent (${event.sms_sent})`,
         timestamp: event.created_at,
-        display_time: formatReportTime(event.created_at),
+        display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
       });
     }
 
@@ -7133,7 +7144,10 @@ alertEvents.forEach((event) => {
       timeline.push({
         event: `SMS Failed (${event.sms_failed})`,
         timestamp: event.created_at,
-        display_time: formatReportTime(event.created_at),
+        display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
       });
     }
 
@@ -7146,7 +7160,10 @@ alertEvents.forEach((event) => {
         ? `Voice Call Submitted (${event.recipient_phone})`
         : "Voice Call Submitted",
       timestamp: event.created_at,
-      display_time: formatReportTime(event.created_at),
+      display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
     });
 
     return;
@@ -7181,7 +7198,10 @@ alertEvents.forEach((event) => {
     timeline.push({
       event: label,
       timestamp: event.created_at,
-      display_time: formatReportTime(event.created_at),
+      display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
     });
   }
 });
@@ -7192,7 +7212,10 @@ if (guardResponses.length > 0) {
   timeline.push({
     event: "Guard Questions Completed",
     timestamp: lastResponse.created_at,
-    display_time: formatReportTime(lastResponse.created_at),
+    display_time: formatReportTime(
+  lastResponse.created_at,
+  companyTimezone
+),
   });
 }
 
@@ -7200,7 +7223,10 @@ if (resolution?.approved_at) {
   timeline.push({
     event: "Investigation Completed",
     timestamp: resolution.approved_at,
-    display_time: formatReportTime(resolution.approved_at),
+    display_time: formatReportTime(
+  resolution.approved_at,
+  companyTimezone
+),
   });
 }
 
@@ -7208,7 +7234,10 @@ if (incident.resolved_time) {
   timeline.push({
     event: "Incident Resolved",
     timestamp: incident.resolved_time,
-    display_time: formatReportTime(incident.resolved_time),
+    display_time: formatReportTime(
+  incident.resolved_time,
+  companyTimezone
+),
   });
 }
 
@@ -7246,7 +7275,10 @@ if (incident.resolved_time) {
       report_title: "Aegis Link Security Incident Report",
       report_id: `RPT-${incident.incident_ref || incident.id}`,
       generated_at: new Date().toISOString(),
-      generated_at_display: formatReportTime(new Date()),
+      generated_at_display: formatReportTime(
+  new Date(),
+  companyTimezone
+),
 
       incident: {
         id: incident.id,
@@ -7257,9 +7289,15 @@ if (incident.resolved_time) {
         site_location: incident.site_location,
         guard: incident.guard_name,
         trigger_time: incident.trigger_time,
-        trigger_time_display: formatReportTime(incident.trigger_time),
+        trigger_time_display: formatReportTime(
+  incident.trigger_time,
+  companyTimezone
+),
         resolved_time: incident.resolved_time,
-        resolved_time_display: formatReportTime(incident.resolved_time),
+        resolved_time_display: formatReportTime(
+  incident.resolved_time,
+  companyTimezone
+),
         duration_seconds: durationMs ? Math.floor(durationMs / 1000) : null,
         duration_display: formatDuration(durationMs),
         ai_summary: incident.ai_summary,
@@ -7271,7 +7309,8 @@ incident_battery_level: incident.incident_battery_level,
 incident_address: incident.incident_address,
 incident_location_timestamp: incident.incident_location_timestamp,
 incident_location_timestamp_display: formatReportTime(
-  incident.incident_location_timestamp
+  incident.incident_location_timestamp,
+  companyTimezone
 ),
       },
 
@@ -7282,7 +7321,10 @@ incident_location_timestamp_display: formatReportTime(
         question_text: row.question_text,
         answer: row.answer,
         created_at: row.created_at,
-        created_at_display: formatReportTime(row.created_at),
+        created_at_display: formatReportTime(
+  row.created_at,
+  companyTimezone
+),
       })),
 
       investigation: resolution
@@ -7296,7 +7338,10 @@ incident_location_timestamp_display: formatReportTime(
             admin_notes: resolution.admin_notes,
             approved_by: resolution.approved_by,
             approved_at: resolution.approved_at,
-            approved_at_display: formatReportTime(resolution.approved_at),
+            approved_at_display: formatReportTime(
+  resolution.approved_at,
+  companyTimezone
+),
           }
         : null,
     });
