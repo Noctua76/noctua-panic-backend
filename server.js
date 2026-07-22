@@ -655,6 +655,9 @@ app.get("/admin/sessions/export", requireAuth, async (req, res) => {
     const { from, to } = req.query;
 
     const isSystemOwner = req.auth.role === "system_owner";
+    const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
 
     let query = `
       SELECT
@@ -708,19 +711,19 @@ app.get("/admin/sessions/export", requireAuth, async (req, res) => {
     result.rows.forEach((row) => {
       row.login_time = row.login_time
         ? new Date(row.login_time).toLocaleString("el-GR", {
-            timeZone: "Europe/Athens",
+            timeZone: companyTimezone,
           })
         : "";
 
       row.last_seen = row.last_seen
         ? new Date(row.last_seen).toLocaleString("el-GR", {
-            timeZone: "Europe/Athens",
+            timeZone: companyTimezone,
           })
         : "";
 
       row.logout_time = row.logout_time
         ? new Date(row.logout_time).toLocaleString("el-GR", {
-            timeZone: "Europe/Athens",
+            timeZone: companyTimezone,
           })
         : "";
     });
