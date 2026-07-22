@@ -6968,11 +6968,11 @@ function formatDuration(ms) {
   return `${minutes}m ${seconds}s`;
 }
 
-function formatReportTime(value) {
+function formatReportTime(value, timezone = "Europe/Athens") {
   if (!value) return null;
 
   return new Date(value).toLocaleString("el-GR", {
-    timeZone: "Europe/Athens",
+  timeZone: timezone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
