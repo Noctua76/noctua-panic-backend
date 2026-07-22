@@ -13,7 +13,32 @@ const WebSocket = require("ws");
 const webpush = require("web-push");
 const nodemailer = require("nodemailer");
 
+// ================================
+// TIMEZONE HELPERS
+// ================================
 
+async function getCompanyTimezone(companyId) {
+  const result = await pool.query(
+    `
+    SELECT timezone
+    FROM companies
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [companyId]
+  );
+
+  if (result.rows.length === 0) {
+    throw new Error(`Company ${companyId} not found`);
+  }
+
+  return result.rows[0].timezone || "Europe/Athens";
+}
+
+
+// ================================
+// SHIFT DELAY EMAILS
+// ================================
 
 async function getShiftDelayEmailRecipients(companyId) {
   const result = await pool.query(
@@ -44,6 +69,7 @@ AND status = 'active'
 
 async function sendShiftDelayEmail(event) {
   const recipients = await getShiftDelayEmailRecipients(event.company_id);
+  const companyTimezone = await getCompanyTimezone(event.company_id);
 
   if (recipients.length === 0) {
     throw new Error(
@@ -66,7 +92,7 @@ async function sendShiftDelayEmail(event) {
   const scheduledStart = new Date(event.scheduled_start).toLocaleString(
   "el-GR",
   {
-    timeZone: "UTC",
+    timeZone: companyTimezone,
     dateStyle: "short",
     timeStyle: "short",
   }
@@ -75,7 +101,7 @@ async function sendShiftDelayEmail(event) {
 const alertThreshold = new Date(event.alert_threshold).toLocaleString(
   "el-GR",
   {
-    timeZone: "UTC",
+    timeZone: companyTimezone,
     dateStyle: "short",
     timeStyle: "short",
   }
@@ -195,7 +221,7 @@ async function processPendingShiftDelayEmails() {
           email_recipient = $1,
           email_sent_at = (NOW() AT TIME ZONE 'Europe/Athens'),
           email_error = NULL,
-          updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+          updated_at = NOW()
         WHERE id = $2
         `,
         [emailResult.recipients.join(", "), event.id]
@@ -212,7 +238,7 @@ async function processPendingShiftDelayEmails() {
         SET
           email_status = 'failed',
           email_error = $1,
-          updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+          updated_at = NOW()
         WHERE id = $2
         `,
         [err.message, event.id]
