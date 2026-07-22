@@ -436,6 +436,9 @@ ${message}
 app.get("/admin/active", requireAuth, async (req, res) => {
   try {
     const isSystemOwner = req.auth.role === "system_owner";
+    const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
 
     const result = await pool.query(
       `
@@ -458,6 +461,20 @@ app.get("/admin/active", requireAuth, async (req, res) => {
         req.auth.company_id,
       ]
     );
+
+    result.rows.forEach((row) => {
+  row.login_time = row.login_time
+    ? new Date(row.login_time).toLocaleString("el-GR", {
+        timeZone: companyTimezone,
+      })
+    : null;
+
+  row.last_seen = row.last_seen
+    ? new Date(row.last_seen).toLocaleString("el-GR", {
+        timeZone: companyTimezone,
+      })
+    : null;
+});
 
     return res.json({
       status: "ok",
