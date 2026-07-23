@@ -6962,8 +6962,18 @@ function formatDuration(ms) {
 function formatReportTime(value, timezone = "Europe/Athens") {
   if (!value) return null;
 
+  // Αν είναι ήδη formatted local timestamp (χωρίς timezone),
+  // μην κάνεις νέα timezone μετατροπή.
+  if (typeof value === "string" && !value.endsWith("Z")) {
+    const [datePart, timePart] = value.split("T");
+    if (datePart && timePart) {
+      const [y, m, d] = datePart.split("-");
+      return `${d}/${m}/${y}, ${timePart}`;
+    }
+  }
+
   return new Date(value).toLocaleString("el-GR", {
-  timeZone: timezone,
+    timeZone: timezone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -10511,10 +10521,7 @@ if (!historyResponse.ok) {
         (item) => `
           <tr>
             <td>${escapeHtml(
-              formatReportTime(
-  item.scheduled_at,
-  companyTimezone
-)
+              formatReportTime(item.scheduled_at_display)
             )}</td>
             <td>${escapeHtml(item.site_name)}</td>
             <td>${escapeHtml(item.point_name)}</td>
