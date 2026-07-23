@@ -10404,18 +10404,14 @@ WHERE id = ANY($1::int[])
 const historyWithShift = result.rows.map((row) => {
   const site = sitesById[row.site_id];
 
-  const scheduledAt = new Date(
-    row.scheduled_at.toString().replace(" ", "T")
-  );
-
   return {
-    ...row,
-    scheduled_at_display: formatReportTime(
-      scheduledAt,
-      companyTimezone
-    ),
-    shift_label: resolveShiftLabel(site, scheduledAt),
-  };
+  ...row,
+  scheduled_at_display: formatReportTime(
+    row.scheduled_at,
+    companyTimezone
+  ),
+  shift_label: resolveShiftLabel(site, row.scheduled_at),
+};
 });
 
 res.json({
