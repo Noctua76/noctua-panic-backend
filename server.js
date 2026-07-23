@@ -10349,7 +10349,7 @@ AND (
           $5::text = 'all'
           OR schedule_type = $5::text
         )
-      ORDER BY scheduled_at DESC
+      ORDER BY combined.scheduled_at DESC
       LIMIT 300
       `,
       [
