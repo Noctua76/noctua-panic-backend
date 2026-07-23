@@ -10205,6 +10205,10 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
 
     const isSystemOwner = req.auth.role === "system_owner";
 
+    const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
+
     const result = await pool.query(
       `
       WITH recurring_missed AS (
@@ -10396,6 +10400,10 @@ const historyWithShift = result.rows.map((row) => {
 
   return {
     ...row,
+    scheduled_at_display: formatReportTime(
+      row.scheduled_at,
+      companyTimezone
+    ),
     shift_label: resolveShiftLabel(site, row.scheduled_at),
   };
 });
