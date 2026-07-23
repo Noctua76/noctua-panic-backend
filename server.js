@@ -10179,16 +10179,30 @@ function resolveShiftLabel(site, scheduledAtValue) {
       return "Shift rules not configured";
     }
 
-    const scheduledAt = new Date(scheduledAtValue);
+    let currentHour;
+let currentMinute;
 
-    const athensTime = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Europe/Athens",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).format(scheduledAt);
+if (
+  typeof scheduledAtValue === "string" &&
+  !scheduledAtValue.endsWith("Z")
+) {
+  const timePart = scheduledAtValue.split("T")[1];
+  [currentHour, currentMinute] = timePart
+    .split(":")
+    .slice(0, 2)
+    .map(Number);
+} else {
+  const scheduledAt = new Date(scheduledAtValue);
 
-    const [currentHour, currentMinute] = athensTime.split(":").map(Number);
+  const athensTime = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Athens",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(scheduledAt);
+
+  [currentHour, currentMinute] = athensTime.split(":").map(Number);
+}
     const currentMinutes = currentHour * 60 + currentMinute;
 
     const matchedShift = shiftRules.shifts.find((shift) => {
@@ -10420,7 +10434,7 @@ const historyWithShift = result.rows.map((row) => {
 
   return {
     ...row,
-    shift_label: resolveShiftLabel(site, row.scheduled_at),
+    shift_label: resolveShiftLabel(site, row.scheduled_at_display),
   };
 });
 
