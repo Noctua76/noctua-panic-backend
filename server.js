@@ -10227,7 +10227,10 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
     ps.patrol_point_id AS point_id,
     pp.point_name,
 
-    gs.expected_slot AS scheduled_at,
+    to_char(
+  gs.expected_slot,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS scheduled_at,
 
     'recurring' AS schedule_type,
     'missed' AS status,
