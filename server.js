@@ -211,6 +211,13 @@ async function processPendingShiftDelayEmails() {
     }
 
     try {
+      console.log("SHIFT DELAY EVENT:");
+console.dir(event, { depth: null });
+
+console.log("scheduled_start:", event.scheduled_start);
+console.log("alert_threshold:", event.alert_threshold);
+console.log("scheduled_start ISO:", new Date(event.scheduled_start).toISOString());
+console.log("alert_threshold ISO:", new Date(event.alert_threshold).toISOString());
       const emailResult = await sendShiftDelayEmail(event);
 
       await pool.query(
