@@ -802,6 +802,15 @@ app.post('/send-sms', requireAuth, async (req, res) => {
     const data = await response.json();
     return res.json({ status: 'ok', data });
 
+    console.log("PDF RAW FIRST ROW:");
+console.dir(history[0], { depth: null });
+
+console.log("PDF FIRST 10 scheduled_at:");
+console.dir(
+  history.slice(0, 10).map((r) => r.scheduled_at),
+  { depth: null }
+);
+
   } catch (error) {
     console.error('SMS Error:', error);
     return res.status(500).json({ error: 'SMS sending failed' });
