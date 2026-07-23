@@ -10479,6 +10479,10 @@ if (!historyResponse.ok) {
     }
 
     const history = data.history || [];
+    console.log(
+  "PDF FIRST 10:",
+  history.slice(0, 10).map((r) => r.scheduled_at)
+);
 
     const totalMissed = history.length;
     const routineMissed = history.filter(
