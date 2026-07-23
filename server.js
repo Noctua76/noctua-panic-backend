@@ -10205,10 +10205,6 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
 
     const isSystemOwner = req.auth.role === "system_owner";
 
-    const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
-);
-
     const result = await pool.query(
       `
       WITH recurring_missed AS (
@@ -10323,8 +10319,13 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
         UNION ALL
         SELECT * FROM manual_missed
       )
-      SELECT *
-      FROM combined
+      SELECT
+  combined.*,
+  to_char(
+    combined.scheduled_at,
+    'YYYY-MM-DD"T"HH24:MI:SS.MS'
+  ) AS scheduled_at_display
+FROM combined
             WHERE ($1::int IS NULL OR site_id = $1::int)
         AND ($2::int IS NULL OR point_id = $2::int)
         AND (
@@ -10362,12 +10363,6 @@ AND (
 ]
     );
 
-    console.log(
-  result.rows[0].scheduled_at,
-  typeof result.rows[0].scheduled_at,
-  result.rows[0].scheduled_at instanceof Date
-);
-
     const siteIds = [
   ...new Set(result.rows.map((row) => row.site_id).filter(Boolean)),
 ];
@@ -10404,18 +10399,14 @@ WHERE id = ANY($1::int[])
 const historyWithShift = result.rows.map((row) => {
   const site = sitesById[row.site_id];
 
-  const scheduledAtRaw = formatReportTime(
-  row.scheduled_at,
-  companyTimezone
-);
-
-return {
-  ...row,
-  scheduled_at: scheduledAtRaw,
-  scheduled_at_display: scheduledAtRaw,
-  shift_label: resolveShiftLabel(site, row.scheduled_at),
-};
+  return {
+    ...row,
+    shift_label: resolveShiftLabel(site, row.scheduled_at),
+  };
 });
+
+console.log("FIRST HISTORY ROW:");
+console.dir(historyWithShift[0], { depth: null });
 
 res.json({
   status: "ok",
