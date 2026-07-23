@@ -10404,12 +10404,15 @@ WHERE id = ANY($1::int[])
 const historyWithShift = result.rows.map((row) => {
   const site = sitesById[row.site_id];
 
-  return {
+  const scheduledAtRaw = formatReportTime(
+  row.scheduled_at,
+  companyTimezone
+);
+
+return {
   ...row,
-  scheduled_at_display: formatReportTime(
-    row.scheduled_at,
-    companyTimezone
-  ),
+  scheduled_at: scheduledAtRaw,
+  scheduled_at_display: scheduledAtRaw,
   shift_label: resolveShiftLabel(site, row.scheduled_at),
 };
 });
