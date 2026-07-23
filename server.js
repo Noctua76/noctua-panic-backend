@@ -10362,6 +10362,12 @@ AND (
 ]
     );
 
+    console.log(
+  result.rows[0].scheduled_at,
+  typeof result.rows[0].scheduled_at,
+  result.rows[0].scheduled_at instanceof Date
+);
+
     const siteIds = [
   ...new Set(result.rows.map((row) => row.site_id).filter(Boolean)),
 ];
