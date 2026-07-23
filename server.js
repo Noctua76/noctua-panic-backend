@@ -10405,8 +10405,15 @@ const historyWithShift = result.rows.map((row) => {
   };
 });
 
-console.log("FIRST HISTORY ROW:");
-console.dir(historyWithShift[0], { depth: null });
+console.log("FIRST 10 HISTORY ROWS:");
+console.dir(
+  historyWithShift.slice(0, 10).map((r) => ({
+    scheduled_at: r.scheduled_at,
+    scheduled_at_display: r.scheduled_at_display,
+    shift_label: r.shift_label,
+  })),
+  { depth: null }
+);
 
 res.json({
   status: "ok",
