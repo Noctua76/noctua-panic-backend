@@ -10227,10 +10227,7 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
     ps.patrol_point_id AS point_id,
     pp.point_name,
 
-    to_char(
-  gs.expected_slot,
-  'YYYY-MM-DD"T"HH24:MI:SS.MS'
-) AS scheduled_at,
+    gs.expected_slot AS scheduled_at,
 
     'recurring' AS schedule_type,
     'missed' AS status,
@@ -10401,13 +10398,17 @@ WHERE id = ANY($1::int[])
 const historyWithShift = result.rows.map((row) => {
   const site = sitesById[row.site_id];
 
+  const scheduledAt = new Date(
+    row.scheduled_at.toString().replace(" ", "T")
+  );
+
   return {
     ...row,
     scheduled_at_display: formatReportTime(
-      row.scheduled_at,
+      scheduledAt,
       companyTimezone
     ),
-    shift_label: resolveShiftLabel(site, row.scheduled_at),
+    shift_label: resolveShiftLabel(site, scheduledAt),
   };
 });
 
