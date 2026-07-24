@@ -89,6 +89,10 @@ async function sendShiftDelayEmail(event) {
     ),
   ];
 
+  console.log("typeof scheduled_start:", typeof event.scheduled_start);
+console.log("instanceof Date:", event.scheduled_start instanceof Date);
+console.dir(event.scheduled_start);
+
   const scheduledStart = new Date(event.scheduled_start).toLocaleString(
   "el-GR",
   {
