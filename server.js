@@ -89,10 +89,7 @@ async function sendShiftDelayEmail(event) {
     ),
   ];
 
-  console.log("typeof scheduled_start:", typeof event.scheduled_start);
-console.log("instanceof Date:", event.scheduled_start instanceof Date);
-console.dir(event.scheduled_start);
-
+  
   const scheduledStart = event.scheduled_start;
   const alertThreshold = event.alert_threshold;
 
@@ -206,11 +203,6 @@ to_char(
       console.log("SHIFT DELAY EVENT:");
 console.dir(event, { depth: null });
 
-console.log("scheduled_start:", event.scheduled_start);
-console.log("alert_threshold:", event.alert_threshold);
-console.log("scheduled_start ISO:", new Date(event.scheduled_start).toISOString());
-console.log("alert_threshold ISO:", new Date(event.alert_threshold).toISOString());
-      const emailResult = await sendShiftDelayEmail(event);
 
       await pool.query(
         `
@@ -291,61 +283,6 @@ app.use(morgan('dev'));
 
 app.get('/', (req, res) => {
   res.send('Noctua Panic Backend is running');
-});
-
-app.get("/debug/test-shift-delay-email", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        oe.id,
-        oe.site_id,
-        oe.scheduled_shift_id,
-        oe.email_status,
-
-        ss.shift_label,
-
-to_char(
-  ss.scheduled_start,
-  'DD/MM/YY, HH24:MI'
-) AS scheduled_start,
-
-to_char(
-  ss.scheduled_start + INTERVAL '15 minutes',
-  'DD/MM/YY, HH24:MI'
-) AS alert_threshold,
-
-s.company_id,
-s.name AS site_name,
-s.location AS site_location
-
-FROM operational_events oe
-
-JOIN scheduled_shifts ss
-ON ss.id = oe.scheduled_shift_id
-
-JOIN sites s
-ON s.id = oe.site_id
-
-WHERE oe.id = 40
-    `);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Event not found" });
-    }
-
-    await sendShiftDelayEmail(result.rows[0]);
-
-    res.json({
-      success: true,
-      event: result.rows[0],
-    });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      error: err.message,
-    });
-  }
 });
 
 // --- OpenAI Assistant connection ---
