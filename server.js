@@ -203,6 +203,7 @@ to_char(
       console.log("SHIFT DELAY EVENT:");
 console.dir(event, { depth: null });
 
+const emailResult = await sendShiftDelayEmail(event);
 
       await pool.query(
         `
