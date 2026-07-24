@@ -303,22 +303,30 @@ app.get("/debug/test-shift-delay-email", async (req, res) => {
         oe.email_status,
 
         ss.shift_label,
-        ss.scheduled_start,
-        ss.scheduled_start + INTERVAL '15 minutes' AS alert_threshold,
 
-        s.company_id,
-        s.name AS site_name,
-        s.location AS site_location
+to_char(
+  ss.scheduled_start,
+  'DD/MM/YY, HH24:MI'
+) AS scheduled_start,
 
-      FROM operational_events oe
+to_char(
+  ss.scheduled_start + INTERVAL '15 minutes',
+  'DD/MM/YY, HH24:MI'
+) AS alert_threshold,
 
-      JOIN scheduled_shifts ss
-        ON ss.id = oe.scheduled_shift_id
+s.company_id,
+s.name AS site_name,
+s.location AS site_location
 
-      JOIN sites s
-        ON s.id = oe.site_id
+FROM operational_events oe
 
-      WHERE oe.id = 40
+JOIN scheduled_shifts ss
+ON ss.id = oe.scheduled_shift_id
+
+JOIN sites s
+ON s.id = oe.site_id
+
+WHERE oe.id = 40
     `);
 
     if (result.rows.length === 0) {
