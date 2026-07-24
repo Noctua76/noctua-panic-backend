@@ -305,6 +305,53 @@ app.get('/', (req, res) => {
   res.send('Noctua Panic Backend is running');
 });
 
+app.get("/debug/test-shift-delay-email", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        oe.id,
+        oe.site_id,
+        oe.scheduled_shift_id,
+        oe.email_status,
+
+        ss.shift_label,
+        ss.scheduled_start,
+        ss.scheduled_start + INTERVAL '15 minutes' AS alert_threshold,
+
+        s.company_id,
+        s.name AS site_name,
+        s.location AS site_location
+
+      FROM operational_events oe
+
+      JOIN scheduled_shifts ss
+        ON ss.id = oe.scheduled_shift_id
+
+      JOIN sites s
+        ON s.id = oe.site_id
+
+      WHERE oe.id = 40
+    `);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    await sendShiftDelayEmail(result.rows[0]);
+
+    res.json({
+      success: true,
+      event: result.rows[0],
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+});
+
 // --- OpenAI Assistant connection ---
 const OpenAI = require("openai");
 
