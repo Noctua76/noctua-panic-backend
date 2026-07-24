@@ -93,23 +93,8 @@ async function sendShiftDelayEmail(event) {
 console.log("instanceof Date:", event.scheduled_start instanceof Date);
 console.dir(event.scheduled_start);
 
-  const scheduledStart = new Date(event.scheduled_start).toLocaleString(
-  "el-GR",
-  {
-    timeZone: companyTimezone,
-    dateStyle: "short",
-    timeStyle: "short",
-  }
-);
-
-const alertThreshold = new Date(event.alert_threshold).toLocaleString(
-  "el-GR",
-  {
-    timeZone: companyTimezone,
-    dateStyle: "short",
-    timeStyle: "short",
-  }
-);
+  const scheduledStart = event.scheduled_start;
+  const alertThreshold = event.alert_threshold;
 
   const subject = `[Aegis Link] Shift Delay – ${event.site_name}`;
 
@@ -174,8 +159,11 @@ async function processPendingShiftDelayEmails() {
       oe.email_status,
 
       ss.shift_label,
-      ss.scheduled_start,
-      ss.scheduled_start + INTERVAL '15 minutes' AS alert_threshold,
+to_char(ss.scheduled_start, 'DD/MM/YY, HH24:MI') AS scheduled_start,
+to_char(
+    ss.scheduled_start + INTERVAL '15 minutes',
+    'DD/MM/YY, HH24:MI'
+) AS alert_threshold,
 
       s.company_id,
       s.name AS site_name,
