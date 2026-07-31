@@ -48,7 +48,7 @@ function createRuntimeRouter({ requireGuardAuth }) {
 
                     companyId: req.guard.company_id,
 
-                    guardId: req.guard.guard_id,
+                    userId: req.guard.guard_id,
 
                     sessionId: req.guard.session_id,
 

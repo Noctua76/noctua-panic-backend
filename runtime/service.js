@@ -51,7 +51,7 @@ class RuntimeService {
 
                 companyId: runtimeRequest.companyId,
 
-                userId: runtimeRequest.userId,
+                userId: runtimeRequest.guardId,
 
                 installationUuid: runtimeRequest.installationUuid,
 
