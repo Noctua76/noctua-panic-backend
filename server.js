@@ -12,6 +12,7 @@ const { createClient } = require("@supabase/supabase-js");
 const WebSocket = require("ws");
 const webpush = require("web-push");
 const nodemailer = require("nodemailer");
+const createRuntimeRouter = require("./runtime/routes");
 
 // ================================
 // TIMEZONE HELPERS
@@ -281,6 +282,10 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(morgan('dev'));
+app.use(
+  "/runtime",
+  createRuntimeRouter({ requireGuardAuth })
+);
 
 app.get('/', (req, res) => {
   res.send('Noctua Panic Backend is running');
@@ -1630,8 +1635,10 @@ async function requireGuardAuth(req, res, next) {
       SELECT
         gs.id AS session_id,
         gs.guard_id,
+        g.company_id,
         g.site_id,
-        g.full_name
+        g.full_name,
+        g.role
       FROM guard_sessions gs
       JOIN guards g
         ON g.id = gs.guard_id
