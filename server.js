@@ -1631,24 +1631,26 @@ async function requireGuardAuth(req, res, next) {
     const sessionToken = authHeader.substring(7);
 
     const result = await pool.query(
-      `
-      SELECT
-        gs.id AS session_id,
-        gs.guard_id,
-        g.company_id,
-        g.site_id,
-        g.full_name,
-        g.role
-      FROM guard_sessions gs
-      JOIN guards g
-        ON g.id = gs.guard_id
-      WHERE
-        gs.session_token = $1
-        AND gs.logout_time IS NULL
-      LIMIT 1
-      `,
-      [sessionToken]
-    );
+  `
+  SELECT
+    gs.id AS session_id,
+    gs.guard_id,
+    s.company_id,
+    gs.site_id,
+    g.full_name,
+    g.role
+  FROM guard_sessions gs
+  JOIN guards g
+    ON g.id = gs.guard_id
+  JOIN sites s
+    ON s.id = gs.site_id
+  WHERE
+    gs.session_token = $1
+    AND gs.logout_time IS NULL
+  LIMIT 1
+  `,
+  [sessionToken]
+);
 
     if (result.rows.length === 0) {
       return res.status(401).json({
