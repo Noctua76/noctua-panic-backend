@@ -32,52 +32,54 @@ class RuntimeService {
      */
     static async processRuntime(runtimeRequest) {
 
-        RuntimeValidator.validateRuntimeRequest(runtimeRequest);
+    RuntimeValidator.validateRuntimeRequest(runtimeRequest);
 
-        const installation =
-            await Handlers.InstallationHandler.processInstallation(runtimeRequest);
+    const installationResult =
+        await Handlers.InstallationHandler.processInstallation(
+            runtimeRequest
+        );
 
-        const state =
-            await Handlers.StateHandler.processStateTransition({
+    const state =
+        await Handlers.StateHandler.processStateTransition({
 
-                previousState: runtimeRequest.previousState,
+            previousState: installationResult.previousState,
 
-                newState: runtimeRequest.state
+            newState: runtimeRequest.state
 
-            });
+        });
 
-        const runtimeLog =
-            await Handlers.LogHandler.writeRuntimeLog({
+    const runtimeLog =
+        await Handlers.LogHandler.writeRuntimeLog({
 
-                companyId: runtimeRequest.companyId,
+            companyId: runtimeRequest.companyId,
 
-                userId: runtimeRequest.userId,
+            userId: runtimeRequest.userId,
 
-                installationUuid: runtimeRequest.installationUuid,
+            installationUuid: runtimeRequest.installationUuid,
 
-                eventType: runtimeRequest.event,
+            eventType: runtimeRequest.event,
 
-                previousState: state.previousState,
+            previousState: state.previousState,
 
-                newState: state.newState,
+            newState: state.newState,
 
-                runtimeVersion: runtimeRequest.runtimeVersion,
+            runtimeVersion: runtimeRequest.runtimeVersion,
 
-                details: runtimeRequest.details || {}
+            details: runtimeRequest.details || {}
 
-            });
+        });
 
-        return {
+    return {
 
-            installation,
+        installation: installationResult.installation,
 
-            state,
+        state,
 
-            runtimeLog
+        runtimeLog
 
-        };
+    };
 
-    }
+}
 
 }
 

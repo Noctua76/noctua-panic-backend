@@ -54,9 +54,9 @@ function createRuntimeRouter({ requireGuardAuth }) {
 
                     siteId: req.guard.site_id,
 
-                    ip: req.ip,
+                    lastIp: req.get("X-Real-IP") || req.ip,
 
-                    userAgent: req.get("User-Agent")
+                    lastUserAgent: req.get("User-Agent") || null
 
                 };
 

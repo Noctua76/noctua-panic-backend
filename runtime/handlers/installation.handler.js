@@ -29,28 +29,61 @@ class InstallationHandler {
      */
     static async processInstallation(installation) {
 
-        const existingInstallation =
-            await RuntimeRepository.findInstallationByUuid(
-                installation.installationUuid
-            );
+    const existingInstallation =
+        await RuntimeRepository.findInstallationByUuid(
+            installation.installationUuid
+        );
 
-        if (!existingInstallation) {
+    if (!existingInstallation) {
 
-            return RuntimeRepository.createInstallation(
+        const createdInstallation =
+            await RuntimeRepository.createInstallation(
                 installation
             );
 
-        }
+        return {
 
-        return RuntimeRepository.updateInstallation({
+            installation: createdInstallation,
+
+            previousState:
+                installation.previousState || "BOOT"
+
+        };
+
+    }
+
+    const confirmedInstalled =
+        existingInstallation.current_state === "INSTALLED" ||
+        installation.currentState === "INSTALLED";
+
+    const confirmedStandalone =
+        existingInstallation.standalone === true ||
+        installation.standalone === true;
+
+    const updatedInstallation =
+        await RuntimeRepository.updateInstallation({
 
             ...installation,
 
-            id: existingInstallation.id
+            id: existingInstallation.id,
+
+            currentState: confirmedInstalled
+                ? "INSTALLED"
+                : installation.currentState,
+
+            standalone: confirmedStandalone
 
         });
 
-    }
+    return {
+
+        installation: updatedInstallation,
+
+        previousState: existingInstallation.current_state
+
+    };
+
+}
 
 }
 
