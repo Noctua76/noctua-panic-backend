@@ -13,6 +13,8 @@ const WebSocket = require("ws");
 const webpush = require("web-push");
 const nodemailer = require("nodemailer");
 const createRuntimeRouter = require("./runtime/routes");
+const createAnonymousInstallRouter =
+  require("./runtime/anonymous-install.routes");
 
 // ================================
 // TIMEZONE HELPERS
@@ -283,13 +285,14 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(morgan('dev'));
 app.use(
+  "/runtime/install",
+  createAnonymousInstallRouter()
+);
+
+app.use(
   "/runtime",
   createRuntimeRouter({ requireGuardAuth })
 );
-
-app.get('/', (req, res) => {
-  res.send('Noctua Panic Backend is running');
-});
 
 // --- OpenAI Assistant connection ---
 const OpenAI = require("openai");
