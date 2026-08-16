@@ -1282,6 +1282,206 @@ app.put("/admin/users/:id", requireAuth, async (req, res) => {
   }
 });
 
+const ACCESS_MODE_READ_ONLY = "read_only";
+
+const READ_ONLY_SAFE_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "OPTIONS",
+]);
+
+const READ_ONLY_ADMIN_MUTATION_ALLOWLIST = new Set([
+  "/admin/heartbeat",
+  "/admin/logout",
+]);
+
+const READ_ONLY_GUARD_MUTATION_ALLOWLIST = new Set([
+  "/guard/heartbeat",
+  "/guard/logout",
+  "/runtime",
+]);
+
+function getRequestPath(req) {
+  return (req.originalUrl || req.url || "").split("?")[0];
+}
+
+function isTemporaryAccessExpired(accessExpiresAt) {
+  if (!accessExpiresAt) {
+    return false;
+  }
+
+  return new Date(accessExpiresAt).getTime() <= Date.now();
+}
+
+function getTemporaryAccountStatus({
+  enabled,
+  revokedAt,
+  startedAt,
+  expiresAt,
+}) {
+  if (!enabled || revokedAt) {
+    return "revoked";
+  }
+
+  if (isTemporaryAccessExpired(expiresAt)) {
+    return "expired";
+  }
+
+  if (startedAt) {
+    return "active";
+  }
+
+  return "pending";
+}
+
+function blockReadOnlyMutation(
+  req,
+  res,
+  accessMode,
+  allowlist
+) {
+  if (accessMode !== ACCESS_MODE_READ_ONLY) {
+    return false;
+  }
+
+  if (READ_ONLY_SAFE_METHODS.has(req.method)) {
+    return false;
+  }
+
+  if (allowlist.has(getRequestPath(req))) {
+    return false;
+  }
+
+  res.status(403).json({
+    status: "error",
+    code: "READ_ONLY_ACCESS",
+    message: "This temporary account has read-only access",
+  });
+
+  return true;
+}
+
+function createTemporaryAccessPassword() {
+  return `A${crypto.randomBytes(12).toString("base64url")}7!`;
+}
+
+function normalizeTemporaryAccessUsername(
+  value,
+  fallback
+) {
+  const normalized =
+    typeof value === "string"
+      ? value.trim().toLowerCase()
+      : fallback;
+
+  if (!/^[a-z0-9._-]{3,50}$/.test(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+async function resolveAvailableTemporaryUsername(
+  client,
+  tableName,
+  preferredUsername,
+  suffix
+) {
+  if (!["users", "guards"].includes(tableName)) {
+    throw new Error(
+      "Unsupported temporary access account type"
+    );
+  }
+
+  const existing = await client.query(
+    `SELECT 1
+     FROM ${tableName}
+     WHERE username = $1
+     LIMIT 1`,
+    [preferredUsername]
+  );
+
+  if (existing.rows.length === 0) {
+    return preferredUsername;
+  }
+
+  return `${preferredUsername}.${suffix}`;
+}
+
+async function activateTemporaryUserAccess(user) {
+  if (
+    user.access_mode !== ACCESS_MODE_READ_ONLY ||
+    !user.temporary_access_duration_hours
+  ) {
+    return user;
+  }
+
+  const result = await pool.query(
+    `
+    UPDATE users
+    SET
+      temporary_access_started_at = COALESCE(
+        temporary_access_started_at,
+        NOW()
+      ),
+      access_expires_at = COALESCE(
+        access_expires_at,
+        COALESCE(temporary_access_started_at, NOW())
+          + temporary_access_duration_hours * INTERVAL '1 hour'
+      )
+    WHERE id = $1
+    RETURNING
+      access_mode,
+      temporary_access_duration_hours,
+      temporary_access_started_at,
+      access_expires_at
+    `,
+    [user.id]
+  );
+
+  return {
+    ...user,
+    ...result.rows[0],
+  };
+}
+
+async function activateTemporaryGuardAccess(guard) {
+  if (
+    guard.access_mode !== ACCESS_MODE_READ_ONLY ||
+    !guard.temporary_access_duration_hours
+  ) {
+    return guard;
+  }
+
+  const result = await pool.query(
+    `
+    UPDATE guards
+    SET
+      temporary_access_started_at = COALESCE(
+        temporary_access_started_at,
+        NOW()
+      ),
+      access_expires_at = COALESCE(
+        access_expires_at,
+        COALESCE(temporary_access_started_at, NOW())
+          + temporary_access_duration_hours * INTERVAL '1 hour'
+      )
+    WHERE id = $1
+    RETURNING
+      access_mode,
+      temporary_access_duration_hours,
+      temporary_access_started_at,
+      access_expires_at
+    `,
+    [guard.id]
+  );
+
+  return {
+    ...guard,
+    ...result.rows[0],
+  };
+}
+
 app.post("/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -1305,7 +1505,11 @@ app.post("/auth/login", async (req, res) => {
         u.company_id,
         u.password_hash,
         u.must_change_password,
-        c.name AS company_name,
+u.access_mode,
+u.temporary_access_duration_hours,
+u.temporary_access_started_at,
+u.access_expires_at,
+c.name AS company_name,
         c.status AS company_status,
         c.tenant_type
       FROM users u
@@ -1323,7 +1527,7 @@ app.post("/auth/login", async (req, res) => {
       });
     }
 
-    const user = userResult.rows[0];
+    let user = userResult.rows[0];
 
     if (user.status !== "active") {
       return res.status(403).json({
@@ -1367,6 +1571,26 @@ app.post("/auth/login", async (req, res) => {
         message: "Invalid credentials",
       });
     }
+
+    user = await activateTemporaryUserAccess(user);
+
+if (isTemporaryAccessExpired(user.access_expires_at)) {
+  await pool.query(
+    `
+    UPDATE admin_sessions
+    SET is_active = false
+    WHERE user_id = $1
+      AND is_active = true
+    `,
+    [user.id]
+  );
+
+  return res.status(403).json({
+    status: "error",
+    code: "TEMPORARY_ACCESS_EXPIRED",
+    message: "Temporary access has expired",
+  });
+}
 
     const sessionToken = crypto.randomBytes(32).toString("hex");
 
@@ -1439,6 +1663,10 @@ app.post("/auth/login", async (req, res) => {
             ? "platform"
             : "company",
         must_change_password: user.must_change_password,
+        access_mode: user.access_mode,
+temporary_access_started_at:
+  user.temporary_access_started_at,
+access_expires_at: user.access_expires_at,
       },
     });
   } catch (err) {
@@ -1532,9 +1760,12 @@ async function requireAuth(req, res, next) {
         u.email,
         u.role,
         u.status AS user_status,
-        u.company_id,
+u.company_id,
+u.access_mode,
+u.temporary_access_started_at,
+u.access_expires_at,
 
-        c.name AS company_name,
+c.name AS company_name,
         c.status AS company_status,
         c.tenant_type
 
@@ -1568,6 +1799,23 @@ async function requireAuth(req, res, next) {
       });
     }
 
+    if (isTemporaryAccessExpired(auth.access_expires_at)) {
+  await pool.query(
+    `
+    UPDATE admin_sessions
+    SET is_active = false
+    WHERE id = $1
+    `,
+    [auth.session_id]
+  );
+
+  return res.status(403).json({
+    status: "error",
+    code: "TEMPORARY_ACCESS_EXPIRED",
+    message: "Temporary access has expired",
+  });
+}
+
     if (!auth.company_id) {
       return res.status(403).json({
         status: "error",
@@ -1599,7 +1847,11 @@ async function requireAuth(req, res, next) {
       username: auth.username,
       email: auth.email,
       role: auth.role,
-      company_id: auth.company_id,
+access_mode: auth.access_mode,
+temporary_access_started_at:
+  auth.temporary_access_started_at,
+access_expires_at: auth.access_expires_at,
+company_id: auth.company_id,
       company_name: auth.company_name,
       company_status: auth.company_status,
       tenant_type: auth.tenant_type,
@@ -1608,6 +1860,17 @@ async function requireAuth(req, res, next) {
           ? "platform"
           : "company",
     };
+
+    if (
+  blockReadOnlyMutation(
+    req,
+    res,
+    req.auth.access_mode,
+    READ_ONLY_ADMIN_MUTATION_ALLOWLIST
+  )
+) {
+  return;
+}
 
     next();
   } catch (err) {
@@ -1641,7 +1904,10 @@ async function requireGuardAuth(req, res, next) {
     s.company_id,
     gs.site_id,
     g.full_name,
-    g.role
+g.role,
+g.access_mode,
+g.temporary_access_started_at,
+g.access_expires_at
   FROM guard_sessions gs
   JOIN guards g
     ON g.id = gs.guard_id
@@ -1662,9 +1928,47 @@ async function requireGuardAuth(req, res, next) {
       });
     }
 
-    req.guard = result.rows[0];
+    const guardAuth = result.rows[0];
 
-    next();
+if (
+  isTemporaryAccessExpired(
+    guardAuth.access_expires_at
+  )
+) {
+  await pool.query(
+    `
+    UPDATE guard_sessions
+    SET
+      logout_time = NOW(),
+      status = 'temporary_access_expired',
+      last_heartbeat = NOW()
+    WHERE id = $1
+      AND logout_time IS NULL
+    `,
+    [guardAuth.session_id]
+  );
+
+  return res.status(403).json({
+    status: "error",
+    code: "TEMPORARY_ACCESS_EXPIRED",
+    message: "Temporary access has expired",
+  });
+}
+
+req.guard = guardAuth;
+
+if (
+  blockReadOnlyMutation(
+    req,
+    res,
+    req.guard.access_mode,
+    READ_ONLY_GUARD_MUTATION_ALLOWLIST
+  )
+) {
+  return;
+}
+
+next();
   } catch (err) {
     console.error("Guard auth failed:", err);
 
@@ -1685,6 +1989,598 @@ app.get("/auth/context", requireAuth, async (req, res) => {
     auth: req.auth,
   });
 });
+
+// ----------------------------------------------------------
+// TEMPORARY READ-ONLY PREVIEW ACCESS
+// ----------------------------------------------------------
+
+app.get(
+  "/admin/temporary-access",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (req.auth.role !== "system_owner") {
+        return res.status(403).json({
+          status: "error",
+          message:
+            "Only the system owner can manage temporary access",
+        });
+      }
+
+      const [usersResult, guardsResult] =
+        await Promise.all([
+          pool.query(
+            `
+            SELECT
+              u.id,
+              u.username,
+              u.company_id,
+              u.status,
+              u.temporary_access_group_id,
+              u.temporary_access_label,
+              u.temporary_access_duration_hours,
+              u.temporary_access_started_at,
+              u.access_expires_at,
+              u.temporary_access_revoked_at,
+              c.name AS company_name
+            FROM users u
+            JOIN companies c
+              ON c.id = u.company_id
+            WHERE u.access_mode = $1
+              AND u.temporary_access_group_id IS NOT NULL
+            ORDER BY u.created_at DESC
+            `,
+            [ACCESS_MODE_READ_ONLY]
+          ),
+
+          pool.query(
+            `
+            SELECT
+              g.id,
+              g.username,
+              g.site_id,
+              g.active,
+              g.temporary_access_group_id,
+              g.temporary_access_started_at,
+              g.access_expires_at,
+              g.temporary_access_revoked_at,
+              s.name AS site_name
+            FROM guards g
+            JOIN sites s
+              ON s.id = g.site_id
+            WHERE g.access_mode = $1
+              AND g.temporary_access_group_id IS NOT NULL
+            `,
+            [ACCESS_MODE_READ_ONLY]
+          ),
+        ]);
+
+      const guardsByGroup = new Map(
+        guardsResult.rows.map((guard) => [
+          guard.temporary_access_group_id,
+          guard,
+        ])
+      );
+
+      const temporaryAccess =
+        usersResult.rows.map((user) => {
+          const guard =
+            guardsByGroup.get(
+              user.temporary_access_group_id
+            ) || null;
+
+          const dashboardStatus =
+            getTemporaryAccountStatus({
+              enabled: user.status === "active",
+              revokedAt:
+                user.temporary_access_revoked_at,
+              startedAt:
+                user.temporary_access_started_at,
+              expiresAt: user.access_expires_at,
+            });
+
+          const webAppStatus = guard
+            ? getTemporaryAccountStatus({
+                enabled: guard.active === true,
+                revokedAt:
+                  guard.temporary_access_revoked_at,
+                startedAt:
+                  guard.temporary_access_started_at,
+                expiresAt: guard.access_expires_at,
+              })
+            : "revoked";
+
+          const accountStatuses = [
+            dashboardStatus,
+            webAppStatus,
+          ];
+
+          const accessStatus =
+            accountStatuses.includes("active")
+              ? "active"
+              : accountStatuses.includes("pending")
+              ? "pending"
+              : accountStatuses.every(
+                  (status) => status === "revoked"
+                )
+              ? "revoked"
+              : "expired";
+
+          return {
+            group_id:
+              user.temporary_access_group_id,
+            label: user.temporary_access_label,
+            company_id: user.company_id,
+            company_name: user.company_name,
+            site_id: guard?.site_id || null,
+            site_name: guard?.site_name || null,
+            duration_hours:
+              user.temporary_access_duration_hours,
+            status: accessStatus,
+
+            dashboard: {
+              user_id: user.id,
+              username: user.username,
+              started_at:
+                user.temporary_access_started_at,
+              expires_at: user.access_expires_at,
+              status: dashboardStatus,
+            },
+
+            web_app: guard
+              ? {
+                  guard_id: guard.id,
+                  username: guard.username,
+                  started_at:
+                    guard.temporary_access_started_at,
+                  expires_at:
+                    guard.access_expires_at,
+                  status: webAppStatus,
+                }
+              : null,
+          };
+        });
+
+      return res.json({
+        status: "ok",
+        temporary_access: temporaryAccess,
+      });
+    } catch (err) {
+      console.error(
+        "Temporary access list error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message:
+          "Unable to load temporary access",
+      });
+    }
+  }
+);
+
+app.post(
+  "/admin/temporary-access",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      if (req.auth.role !== "system_owner") {
+        return res.status(403).json({
+          status: "error",
+          message:
+            "Only the system owner can create temporary access",
+        });
+      }
+
+      const siteId = Number(req.body.site_id);
+
+      const durationHours = Number(
+        req.body.duration_hours ?? 48
+      );
+
+      const label =
+        typeof req.body.label === "string" &&
+        req.body.label.trim()
+          ? req.body.label.trim().slice(0, 120)
+          : "External Preview";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "A valid site_id is required",
+        });
+      }
+
+      if (
+        !Number.isInteger(durationHours) ||
+        durationHours < 1 ||
+        durationHours > 168
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "duration_hours must be between 1 and 168",
+        });
+      }
+
+      const preferredDashboardUsername =
+        normalizeTemporaryAccessUsername(
+          req.body.dashboard_username,
+          "preview.dashboard"
+        );
+
+      const preferredGuardUsername =
+        normalizeTemporaryAccessUsername(
+          req.body.guard_username,
+          "preview.guard"
+        );
+
+      if (
+        !preferredDashboardUsername ||
+        !preferredGuardUsername
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "Temporary usernames contain invalid characters",
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const siteResult = await client.query(
+        `
+        SELECT
+          s.id,
+          s.name,
+          s.company_id,
+          c.name AS company_name
+        FROM sites s
+        JOIN companies c
+          ON c.id = s.company_id
+        WHERE s.id = $1
+        LIMIT 1
+        `,
+        [siteId]
+      );
+
+      if (siteResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const site = siteResult.rows[0];
+      const groupId = crypto.randomUUID();
+      const usernameSuffix = groupId.slice(0, 8);
+
+      const dashboardUsername =
+        await resolveAvailableTemporaryUsername(
+          client,
+          "users",
+          preferredDashboardUsername,
+          usernameSuffix
+        );
+
+      const guardUsername =
+        await resolveAvailableTemporaryUsername(
+          client,
+          "guards",
+          preferredGuardUsername,
+          usernameSuffix
+        );
+
+      const dashboardPassword =
+        createTemporaryAccessPassword();
+
+      const guardPassword =
+        createTemporaryAccessPassword();
+
+      const [
+        dashboardPasswordHash,
+        guardPasswordHash,
+      ] = await Promise.all([
+        bcrypt.hash(dashboardPassword, 10),
+        bcrypt.hash(guardPassword, 10),
+      ]);
+
+      const userResult = await client.query(
+        `
+        INSERT INTO users (
+          full_name,
+          username,
+          role,
+          status,
+          company_id,
+          password_hash,
+          must_change_password,
+          access_mode,
+          temporary_access_duration_hours,
+          temporary_access_group_id,
+          temporary_access_label,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          'supervisor',
+          'active',
+          $3,
+          $4,
+          false,
+          $5,
+          $6,
+          $7,
+          $8,
+          NOW()
+        )
+        RETURNING
+          id,
+          username
+        `,
+        [
+          `${label} - Dashboard`,
+          dashboardUsername,
+          site.company_id,
+          dashboardPasswordHash,
+          ACCESS_MODE_READ_ONLY,
+          durationHours,
+          groupId,
+          label,
+        ]
+      );
+
+      const guardResult = await client.query(
+        `
+        INSERT INTO guards (
+          full_name,
+          username,
+          role,
+          site_id,
+          active,
+          password_hash,
+          access_mode,
+          temporary_access_duration_hours,
+          temporary_access_group_id,
+          temporary_access_label,
+          created_at
+        )
+        VALUES (
+          $1,
+          $2,
+          'guard',
+          $3,
+          true,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8,
+          NOW()
+        )
+        RETURNING
+          id,
+          username
+        `,
+        [
+          `${label} - Guard`,
+          guardUsername,
+          site.id,
+          guardPasswordHash,
+          ACCESS_MODE_READ_ONLY,
+          durationHours,
+          groupId,
+          label,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        status: "ok",
+        message:
+          "Temporary preview access created",
+        starts_on_first_login: true,
+        group_id: groupId,
+        label,
+        duration_hours: durationHours,
+
+        company: {
+          id: site.company_id,
+          name: site.company_name,
+        },
+
+        site: {
+          id: site.id,
+          name: site.name,
+        },
+
+        credentials: {
+          dashboard: {
+            user_id: userResult.rows[0].id,
+            username:
+              userResult.rows[0].username,
+            password: dashboardPassword,
+          },
+
+          web_app: {
+            guard_id: guardResult.rows[0].id,
+            username:
+              guardResult.rows[0].username,
+            password: guardPassword,
+          },
+        },
+      });
+    } catch (err) {
+      await client
+        .query("ROLLBACK")
+        .catch(() => {});
+
+      console.error(
+        "Temporary access creation error:",
+        err
+      );
+
+      if (err.code === "23505") {
+        return res.status(409).json({
+          status: "error",
+          message:
+            "A temporary username already exists",
+        });
+      }
+
+      return res.status(500).json({
+        status: "error",
+        message:
+          "Unable to create temporary access",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.post(
+  "/admin/temporary-access/:groupId/revoke",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      if (req.auth.role !== "system_owner") {
+        return res.status(403).json({
+          status: "error",
+          message:
+            "Only the system owner can revoke temporary access",
+        });
+      }
+
+      const { groupId } = req.params;
+
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          groupId
+        )
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "Invalid temporary access group id",
+        });
+      }
+
+      await client.query("BEGIN");
+
+      const usersResult = await client.query(
+        `
+        UPDATE users
+        SET
+          status = 'inactive',
+          temporary_access_revoked_at = NOW(),
+          updated_at = NOW()
+        WHERE temporary_access_group_id = $1
+          AND access_mode = $2
+        RETURNING id
+        `,
+        [groupId, ACCESS_MODE_READ_ONLY]
+      );
+
+      const guardsResult = await client.query(
+        `
+        UPDATE guards
+        SET
+          active = false,
+          temporary_access_revoked_at = NOW()
+        WHERE temporary_access_group_id = $1
+          AND access_mode = $2
+        RETURNING id
+        `,
+        [groupId, ACCESS_MODE_READ_ONLY]
+      );
+
+      if (
+        usersResult.rows.length === 0 &&
+        guardsResult.rows.length === 0
+      ) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          status: "error",
+          message:
+            "Temporary access was not found",
+        });
+      }
+
+      if (usersResult.rows.length > 0) {
+        await client.query(
+          `
+          UPDATE admin_sessions
+          SET is_active = false
+          WHERE user_id = ANY($1::int[])
+            AND is_active = true
+          `,
+          [
+            usersResult.rows.map(
+              (row) => row.id
+            ),
+          ]
+        );
+      }
+
+      if (guardsResult.rows.length > 0) {
+        await client.query(
+          `
+          UPDATE guard_sessions
+          SET
+            logout_time = NOW(),
+            last_heartbeat = NOW(),
+            status =
+              'temporary_access_revoked'
+          WHERE guard_id = ANY($1::int[])
+            AND logout_time IS NULL
+          `,
+          [
+            guardsResult.rows.map(
+              (row) => row.id
+            ),
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        status: "ok",
+        message:
+          "Temporary access revoked",
+        group_id: groupId,
+      });
+    } catch (err) {
+      await client
+        .query("ROLLBACK")
+        .catch(() => {});
+
+      console.error(
+        "Temporary access revoke error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message:
+          "Unable to revoke temporary access",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
 
 // ----------------------------------------------------------
 // USER PASSWORD MANAGEMENT
@@ -2448,7 +3344,7 @@ app.post("/guard/login", async (req, res) => {
       });
     }
 
-    const guard = result.rows[0];
+    let guard = result.rows[0];
     const sessionToken = crypto.randomBytes(32).toString("hex");
 
     let validPassword = false;
@@ -2465,6 +3361,33 @@ app.post("/guard/login", async (req, res) => {
         message: "Invalid credentials"
       });
     }
+
+    guard = await activateTemporaryGuardAccess(guard);
+
+if (
+  isTemporaryAccessExpired(
+    guard.access_expires_at
+  )
+) {
+  await pool.query(
+    `
+    UPDATE guard_sessions
+    SET
+      logout_time = NOW(),
+      status = 'temporary_access_expired',
+      last_heartbeat = NOW()
+    WHERE guard_id = $1
+      AND logout_time IS NULL
+    `,
+    [guard.id]
+  );
+
+  return res.status(403).json({
+    status: "error",
+    code: "TEMPORARY_ACCESS_EXPIRED",
+    message: "Temporary access has expired",
+  });
+}
 
     const closedSessions = await pool.query(
   `
@@ -2549,8 +3472,18 @@ console.log("NEW SESSION:", sessionResult.rows[0]);
 const athensToday = getAthensDateParts(new Date());
 const todayDate = `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
 
-await generateScheduledShiftsForSite(guard.site_id, todayDate);
-await syncScheduledShiftsForSession(sessionResult.rows[0].id);
+if (
+  guard.access_mode !== ACCESS_MODE_READ_ONLY
+) {
+  await generateScheduledShiftsForSite(
+    guard.site_id,
+    todayDate
+  );
+
+  await syncScheduledShiftsForSession(
+    sessionResult.rows[0].id
+  );
+}
 
     res.json({
       status: "ok",
@@ -2562,7 +3495,11 @@ await syncScheduledShiftsForSession(sessionResult.rows[0].id);
         username: guard.username,
         phone: guard.phone,
         role: guard.role,
-        site_id: guard.site_id
+site_id: guard.site_id,
+access_mode: guard.access_mode,
+temporary_access_started_at:
+  guard.temporary_access_started_at,
+access_expires_at: guard.access_expires_at
       },
       session: sessionResult.rows[0]
     });
@@ -7802,18 +8739,15 @@ app.get(
   }
 );
 
-app.get("/guard/patrols/board", async (req, res) => {
-  try {
-    const { guard_id, session_id } = req.query;
+app.get(
+  "/guard/patrols/board",
+  requireGuardAuth,
+  async (req, res) => {
+    try {
+      const guard_id = req.guard.guard_id;
+      const session_id = req.guard.session_id;
 
-    if (!guard_id || !session_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id and session_id are required",
-      });
-    }
-
-    const sessionResult = await pool.query(
+      const sessionResult = await pool.query(
       `
       SELECT
         gs.id AS session_id,
@@ -8117,12 +9051,20 @@ app.post("/push/subscribe", async (req, res) => {
 
     const sessionResult = await pool.query(
       `
-      SELECT id, guard_id, site_id, logout_time
-      FROM guard_sessions
-      WHERE id = $1
-        AND guard_id = $2
-        AND logout_time IS NULL
-      LIMIT 1
+      SELECT
+  gs.id,
+  gs.guard_id,
+  gs.site_id,
+  gs.logout_time,
+  g.access_mode,
+  g.access_expires_at
+FROM guard_sessions gs
+JOIN guards g
+  ON g.id = gs.guard_id
+WHERE gs.id = $1
+  AND gs.guard_id = $2
+  AND gs.logout_time IS NULL
+LIMIT 1
       `,
       [session_id, guard_id]
     );
@@ -8135,6 +9077,21 @@ app.post("/push/subscribe", async (req, res) => {
     }
 
     const activeSession = sessionResult.rows[0];
+
+    if (
+  activeSession.access_mode ===
+    ACCESS_MODE_READ_ONLY ||
+  isTemporaryAccessExpired(
+    activeSession.access_expires_at
+  )
+) {
+  return res.status(403).json({
+    status: "error",
+    code: "READ_ONLY_ACCESS",
+    message:
+      "Push subscriptions are disabled for read-only access",
+  });
+}
 
     const result = await pool.query(
       `
@@ -8573,16 +9530,20 @@ app.post("/patrol/scan", async (req, res) => {
     const sessionResult = await pool.query(
       `
       SELECT
-        gs.id AS session_id,
-        gs.guard_id,
-        gs.site_id,
-        gs.login_time,
-        gs.logout_time
-      FROM guard_sessions gs
-      WHERE gs.id = $1
-        AND gs.guard_id = $2
-        AND gs.logout_time IS NULL
-      LIMIT 1
+  gs.id AS session_id,
+  gs.guard_id,
+  gs.site_id,
+  gs.login_time,
+  gs.logout_time,
+  g.access_mode,
+  g.access_expires_at
+FROM guard_sessions gs
+JOIN guards g
+  ON g.id = gs.guard_id
+WHERE gs.id = $1
+  AND gs.guard_id = $2
+  AND gs.logout_time IS NULL
+LIMIT 1
       `,
       [session_id, guard_id]
     );
@@ -8595,6 +9556,21 @@ app.post("/patrol/scan", async (req, res) => {
     }
 
     const activeSession = sessionResult.rows[0];
+
+    if (
+  activeSession.access_mode ===
+    ACCESS_MODE_READ_ONLY ||
+  isTemporaryAccessExpired(
+    activeSession.access_expires_at
+  )
+) {
+  return res.status(403).json({
+    status: "error",
+    code: "READ_ONLY_ACCESS",
+    message:
+      "Patrol scans are disabled for read-only access",
+  });
+}
 
     const patrolResult = await pool.query(
       `
