@@ -58,6 +58,7 @@ async function getShiftDelayEmailRecipients(companyId) {
   OR role = 'system_owner'
 )
 AND status = 'active'
+AND access_mode = 'standard'
       AND (
   NULLIF(BTRIM(email), '') IS NOT NULL
   OR NULLIF(BTRIM(secondary_email), '') IS NOT NULL
@@ -450,6 +451,12 @@ app.get("/admin/active", requireAuth, async (req, res) => {
       FROM admin_sessions
       WHERE is_active = true
         AND last_seen > NOW() - INTERVAL '90 seconds'
+        AND NOT EXISTS (
+  SELECT 1
+  FROM users operational_user
+  WHERE operational_user.id = admin_sessions.user_id
+    AND operational_user.access_mode = 'read_only'
+)
         AND (
           $1::boolean = true
           OR company_id = $2
@@ -860,8 +867,9 @@ app.get("/admin/users", requireAuth, async (req, res) => {
         company_id,
         created_at
       FROM users
-      WHERE company_id = $1
-      ORDER BY id ASC
+WHERE company_id = $1
+  AND access_mode = 'standard'
+ORDER BY id ASC
       `,
       [companyId]
     );
@@ -923,8 +931,9 @@ app.get("/admin/users/:id", requireAuth, async (req, res) => {
         company_id,
         created_at
       FROM users
-      WHERE id = $1
-        AND company_id = $2
+WHERE id = $1
+  AND company_id = $2
+  AND access_mode = 'standard'
       `,
       [userId, companyId]
     );
@@ -3094,7 +3103,10 @@ async function detectShiftDelayEvents() {
       AND NOT EXISTS (
   SELECT 1
   FROM guard_sessions gs
+  JOIN guards operational_guard
+    ON operational_guard.id = gs.guard_id
   WHERE gs.site_id = ss.site_id
+    AND operational_guard.access_mode = 'standard'
     AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
     AND gs.login_time <= ss.scheduled_start + INTERVAL '15 minutes'
 )
@@ -3180,11 +3192,14 @@ END,
 ),
       (NOW() AT TIME ZONE 'Europe/Athens')
     FROM guard_sessions gs
-    JOIN scheduled_shifts ss
+JOIN guards operational_guard
+  ON operational_guard.id = gs.guard_id
+JOIN scheduled_shifts ss
   ON ss.site_id = gs.site_id
  AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
  AND gs.login_time < ss.scheduled_end
-    WHERE gs.id = $1
+WHERE gs.id = $1
+  AND operational_guard.access_mode = 'standard'
     ON CONFLICT (scheduled_shift_id, guard_session_id)
     DO UPDATE SET
       overlap_start = EXCLUDED.overlap_start,
@@ -3731,11 +3746,17 @@ to_char(
         FROM sites s
 
         LEFT JOIN guard_sessions gs
-          ON gs.site_id = s.id
-          AND gs.logout_time IS NULL
+  ON gs.site_id = s.id
+  AND gs.logout_time IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM guards operational_guard
+    WHERE operational_guard.id = gs.guard_id
+      AND operational_guard.access_mode = 'standard'
+  )
 
-        LEFT JOIN guards g
-          ON g.id = gs.guard_id
+LEFT JOIN guards g
+  ON g.id = gs.guard_id
 
         WHERE
           $1::boolean = true
@@ -3771,10 +3792,11 @@ app.get("/dashboard/metrics", requireAuth, async (req, res) => {
     const guardsResult = await pool.query(
       `
       SELECT COUNT(*)::int AS count
-      FROM guard_sessions gs
-      INNER JOIN sites s
-        ON s.id = gs.site_id
-      WHERE gs.logout_time IS NULL
+FROM guard_sessions gs
+INNER JOIN guards g ON g.id = gs.guard_id
+INNER JOIN sites s ON s.id = gs.site_id
+WHERE gs.logout_time IS NULL
+  AND g.access_mode = 'standard'
         AND (
           $1::boolean = true
           OR s.company_id = $2
@@ -4544,8 +4566,11 @@ app.get(
         INNER JOIN sites s
           ON s.id = g.site_id
         WHERE
-          $1::boolean = true
-          OR s.company_id = $2
+  g.access_mode = 'standard'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
         ORDER BY g.full_name ASC
         `,
         [
@@ -4746,6 +4771,7 @@ s.coverage_type,
       FROM guards g2
       WHERE g2.site_id = s.id
         AND g2.active = true
+        AND g2.access_mode = 'standard'
     )::int AS guards_assigned,
 
     CASE
@@ -4755,6 +4781,12 @@ s.coverage_type,
         FROM guard_sessions gs3
         WHERE gs3.site_id = s.id
           AND gs3.logout_time IS NULL
+          AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs3.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
       )::int
     END AS on_duty,
 
@@ -4771,6 +4803,12 @@ CASE
     FROM guard_sessions gs3
     WHERE gs3.site_id = s.id
       AND gs3.logout_time IS NULL
+      AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs3.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
   ) > 0 THEN 'Covered'
   ELSE 'No Guard'
 END AS status_label,
@@ -4782,6 +4820,12 @@ CASE
     FROM guard_sessions gs3
     WHERE gs3.site_id = s.id
       AND gs3.logout_time IS NULL
+      AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs3.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
   ) > 0 THEN 'normal'
   ELSE 'no-guard'
 END AS status_class
@@ -4796,6 +4840,7 @@ END AS status_class
       ON g.id = gs.guard_id
     WHERE gs.site_id = s.id
       AND gs.logout_time IS NULL
+      AND g.access_mode = 'standard'
     ORDER BY gs.login_time DESC
     LIMIT 1
   ) active_guard ON true
@@ -5845,10 +5890,12 @@ app.get(
         FROM guards g
         INNER JOIN sites s
           ON s.id = g.site_id
-        WHERE (
-          $1::boolean = true
-          OR s.company_id = $2
-        )
+        WHERE
+  g.access_mode = 'standard'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
         ORDER BY g.id ASC
         `,
         [
@@ -6407,8 +6454,9 @@ WHERE
   INNER JOIN sites s
     ON s.id = g.site_id
   WHERE
-    g.active = true
-    AND ($1::boolean = true OR s.company_id = $2)
+  g.active = true
+  AND g.access_mode = 'standard'
+  AND ($1::boolean = true OR s.company_id = $2)
   `,
   [
     isSystemOwner,
@@ -6783,11 +6831,15 @@ try {
   await pool.query(`
 SELECT COUNT(*)::int AS active_guards
 
-FROM guard_sessions
+FROM guard_sessions gs
+INNER JOIN guards g
+  ON g.id = gs.guard_id
 
-WHERE logout_time IS NULL
+WHERE gs.logout_time IS NULL
 
-AND last_heartbeat >
+AND g.access_mode = 'standard'
+
+AND gs.last_heartbeat >
 NOW() - INTERVAL '90 seconds'
 `);
 
@@ -7374,6 +7426,7 @@ END AS display_status
     ON g.id = gs.guard_id
   WHERE gs.site_id = s.id
     AND gs.logout_time IS NULL
+    AND g.access_mode = 'standard'
   ORDER BY gs.login_time DESC
   LIMIT 1
 ) gs ON true
@@ -9313,9 +9366,12 @@ async function runPatrolPushScheduler() {
           gs.site_id,
           s.name AS site_name
         FROM guard_sessions gs
-        LEFT JOIN sites s
-          ON s.id = gs.site_id
-        WHERE gs.logout_time IS NULL
+INNER JOIN guards g
+  ON g.id = gs.guard_id
+LEFT JOIN sites s
+  ON s.id = gs.site_id
+WHERE gs.logout_time IS NULL
+  AND g.access_mode = 'standard'
       ),
 
       recurring_slots AS (
@@ -10773,6 +10829,12 @@ END,
         gs.logout_time IS NULL
         OR gs.logout_time >= u.scheduled_at
       )
+        AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
     ORDER BY gs.login_time DESC
     LIMIT 1
   ) gs ON true
@@ -11119,11 +11181,12 @@ app.get(
   LEFT JOIN sites s
     ON s.id = g.site_id
   WHERE
-    gs.logout_time IS NULL
-    AND (
-      $1::boolean = true
-      OR s.company_id = $2
-    )
+  gs.logout_time IS NULL
+  AND g.access_mode = 'standard'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
   ORDER BY g.full_name ASC
   `,
   [
@@ -11314,6 +11377,12 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
             gs.logout_time IS NULL
             OR gs.logout_time >= (ps.scheduled_date + ps.scheduled_time)
           )
+            AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
         LEFT JOIN guards g
           ON g.id = gs.guard_id
         WHERE ps.schedule_type = 'manual'
