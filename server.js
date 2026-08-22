@@ -436,36 +436,66 @@ ${message}
 
 app.get("/admin/active", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
-    const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
-);
+    const isSystemOwner =
+      req.auth.role === "system_owner";
+
+          await closeExpiredTemporaryAdminSessions({
+      isSystemOwner,
+      companyId: req.auth.company_id,
+    });
 
     const result = await pool.query(
       `
-      SELECT DISTINCT ON (username)
-        username,
-        role,
-        login_time,
-        last_seen
-      FROM admin_sessions
-      WHERE is_active = true
-        AND last_seen > NOW() - INTERVAL '90 seconds'
-        AND NOT EXISTS (
-  SELECT 1
-  FROM users operational_user
-  WHERE operational_user.id = admin_sessions.user_id
-    AND operational_user.access_mode = 'read_only'
-)
+      SELECT DISTINCT ON (ads.username)
+        ads.username,
+        ads.role,
+        ads.login_time,
+        ads.last_seen,
+        COALESCE(
+          u.access_mode,
+          'standard'
+        ) AS access_mode,
+        u.temporary_access_label,
+        u.temporary_access_started_at,
+        u.access_expires_at,
+        (
+          COALESCE(
+            u.access_mode,
+            'standard'
+          ) = $3
+        ) AS is_temporary
+      FROM admin_sessions ads
+      INNER JOIN users u
+        ON u.id = ads.user_id
+      WHERE ads.is_active = true
+        AND ads.last_seen >
+          NOW() - INTERVAL '90 seconds'
+        AND (
+          COALESCE(
+            u.access_mode,
+            'standard'
+          ) <> $3
+          OR (
+            u.status = 'active'
+            AND u.temporary_access_revoked_at IS NULL
+            AND (
+              u.access_expires_at IS NULL
+              OR u.access_expires_at > NOW()
+            )
+          )
+        )
         AND (
           $1::boolean = true
-          OR company_id = $2
+          OR ads.company_id = $2
         )
-      ORDER BY username, last_seen DESC
+      ORDER BY
+        ads.username,
+        ads.last_seen DESC
       `,
       [
         isSystemOwner,
         req.auth.company_id,
+        ACCESS_MODE_READ_ONLY,
       ]
     );
 
@@ -534,11 +564,12 @@ app.post("/admin/logout", requireAuth, async (req, res) => {
     const result = await pool.query(
       `
       UPDATE admin_sessions
-      SET
-        is_active = false,
-        logout_time = NOW(),
-        session_duration_seconds =
-          EXTRACT(EPOCH FROM (NOW() - login_time))::int
+SET
+  is_active = false,
+  logout_time = NOW(),
+  session_duration_seconds =
+    EXTRACT(EPOCH FROM (NOW() - login_time))::int,
+  session_end_reason = 'logout'
       WHERE id = $1
         AND user_id = $2
         AND is_active = true
@@ -577,204 +608,372 @@ app.post("/admin/logout", requireAuth, async (req, res) => {
 // ADMIN LOGIN HISTORY
 // --------------------------------------------------
 
-app.get("/admin/sessions/history", requireAuth, async (req, res) => {
-  try {
-    const { user, from, to, active } = req.query;
+app.get(
+  "/admin/sessions/history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { user, from, to, active } = req.query;
 
-    const isSystemOwner = req.auth.role === "system_owner";
-    const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
-);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
 
-    let query = `
-      SELECT
-        id,
-        username,
-        role,
-        login_time,
-        last_seen,
-        logout_time,
-        is_active,
-        session_duration_seconds,
-
-        (
-          is_active = true
-          AND last_seen > NOW() - INTERVAL '90 seconds'
-        ) AS is_currently_online
-
-      FROM admin_sessions
-      WHERE (
-        $1::boolean = true
-        OR company_id = $2
-      )
-    `;
-
-    const values = [
-      isSystemOwner,
-      req.auth.company_id,
-    ];
-
-    if (user) {
-      values.push(user);
-      query += ` AND username = $${values.length}`;
-    }
-
-    if (from) {
-      values.push(from);
-      query += `
-        AND COALESCE(logout_time, last_seen, login_time)
-        >= $${values.length}::date
-      `;
-    }
-
-    if (to) {
-      values.push(to);
-      query += `
-        AND COALESCE(logout_time, last_seen, login_time)
-        < ($${values.length}::date + INTERVAL '1 day')
-      `;
-    }
-
-    if (active === "true" || active === "false") {
-      values.push(active === "true");
-      query += ` AND is_active = $${values.length}`;
-    }
-
-    query += ` ORDER BY login_time DESC`;
-
-    const result = await pool.query(query, values);
-
-    return res.json({
-      status: "ok",
-      sessions: result.rows,
-    });
-  } catch (err) {
-    console.error("Admin session history error:", err);
-
-    return res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
-  }
+        await closeExpiredTemporaryAdminSessions({
+  isSystemOwner,
+  companyId: req.auth.company_id,
 });
+
+      let query = `
+        SELECT
+          ads.id,
+          ads.username,
+          ads.role,
+          ads.login_time,
+          ads.last_seen,
+          ads.logout_time,
+          ads.is_active,
+          ads.session_duration_seconds,
+          ads.session_end_reason,
+          COALESCE(
+            u.access_mode,
+            'standard'
+          ) AS access_mode,
+          u.temporary_access_label,
+          u.temporary_access_started_at,
+          u.access_expires_at,
+          u.temporary_access_revoked_at,
+          (
+            COALESCE(
+              u.access_mode,
+              'standard'
+            ) = $3
+          ) AS is_temporary,
+          (
+            ads.is_active = true
+            AND ads.last_seen >
+              NOW() - INTERVAL '90 seconds'
+            AND (
+              COALESCE(
+                u.access_mode,
+                'standard'
+              ) <> $3
+              OR (
+                u.status = 'active'
+                AND u.temporary_access_revoked_at
+                  IS NULL
+                AND (
+                  u.access_expires_at IS NULL
+                  OR u.access_expires_at > NOW()
+                )
+              )
+            )
+          ) AS is_currently_online
+        FROM admin_sessions ads
+        LEFT JOIN users u
+          ON u.id = ads.user_id
+        WHERE (
+          $1::boolean = true
+          OR ads.company_id = $2
+        )
+      `;
+
+      const values = [
+        isSystemOwner,
+        req.auth.company_id,
+        ACCESS_MODE_READ_ONLY,
+      ];
+
+      if (user) {
+        values.push(user);
+
+        query += `
+          AND ads.username = $${values.length}
+        `;
+      }
+
+      if (from) {
+        values.push(from);
+
+        query += `
+          AND COALESCE(
+            ads.logout_time,
+            ads.last_seen,
+            ads.login_time
+          ) >= $${values.length}::date
+        `;
+      }
+
+      if (to) {
+        values.push(to);
+
+        query += `
+          AND COALESCE(
+            ads.logout_time,
+            ads.last_seen,
+            ads.login_time
+          ) < (
+            $${values.length}::date
+            + INTERVAL '1 day'
+          )
+        `;
+      }
+
+      if (
+        active === "true" ||
+        active === "false"
+      ) {
+        values.push(active === "true");
+
+        query += `
+          AND ads.is_active =
+            $${values.length}
+        `;
+      }
+
+      query += `
+        ORDER BY ads.login_time DESC
+      `;
+
+      const result = await pool.query(
+        query,
+        values
+      );
+
+      return res.json({
+        status: "ok",
+        sessions: result.rows,
+      });
+    } catch (err) {
+      console.error(
+        "Admin session history error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
 
 
 // --------------------------------------------------
 // ADMIN LOGIN EXPORT CSV
 // --------------------------------------------------
 
-app.get("/admin/sessions/export", requireAuth, async (req, res) => {
-  try {
-    const { from, to } = req.query;
+app.get(
+  "/admin/sessions/export",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { from, to } = req.query;
 
-    const isSystemOwner = req.auth.role === "system_owner";
-    const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
-);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
 
-    let query = `
-      SELECT
-        username,
-        role,
-        login_time,
-        last_seen,
-        logout_time,
-        is_active,
-        session_duration_seconds,
-
-        (
-          is_active = true
-          AND last_seen > NOW() - INTERVAL '90 seconds'
-        ) AS is_currently_online
-
-      FROM admin_sessions
-      WHERE (
-        $1::boolean = true
-        OR company_id = $2
-      )
-    `;
-
-    const values = [
-      isSystemOwner,
-      req.auth.company_id,
-    ];
-
-    if (from) {
-      values.push(from);
-
-      query += `
-        AND COALESCE(logout_time, last_seen, login_time)
-        >= $${values.length}::date
-      `;
-    }
-
-    if (to) {
-      values.push(to);
-
-      query += `
-        AND COALESCE(logout_time, last_seen, login_time)
-        < ($${values.length}::date + INTERVAL '1 day')
-      `;
-    }
-
-    query += ` ORDER BY login_time DESC`;
-
-    const result = await pool.query(query, values);
-
-    result.rows.forEach((row) => {
-      row.login_time = row.login_time
-        ? new Date(row.login_time).toLocaleString("el-GR", {
-            timeZone: companyTimezone,
-          })
-        : "";
-
-      row.last_seen = row.last_seen
-        ? new Date(row.last_seen).toLocaleString("el-GR", {
-            timeZone: companyTimezone,
-          })
-        : "";
-
-      row.logout_time = row.logout_time
-        ? new Date(row.logout_time).toLocaleString("el-GR", {
-            timeZone: companyTimezone,
-          })
-        : "";
-    });
-
-    let csv =
-      "username;role;login_time;last_seen;logout_time;is_active;session_duration_seconds\n";
-
-    result.rows.forEach((row) => {
-      csv +=
-        `${row.username};` +
-        `${row.role};` +
-        `${row.login_time};` +
-        `${row.last_seen};` +
-        `${row.logout_time || ""};` +
-        `${row.is_active};` +
-        `${row.session_duration_seconds || ""}\n`;
-    });
-
-    res.setHeader(
-      "Content-Type",
-      "text/csv"
-    );
-
-    res.setHeader(
-      "Content-Disposition",
-      "attachment; filename=admin_sessions.csv"
-    );
-
-    return res.send(csv);
-  } catch (err) {
-    console.error("Admin session export error:", err);
-
-    return res.status(500).json({
-      status: "error",
-      message: err.message,
-    });
-  }
+        await closeExpiredTemporaryAdminSessions({
+  isSystemOwner,
+  companyId: req.auth.company_id,
 });
+
+      const companyTimezone =
+        await getCompanyTimezone(
+          req.auth.company_id
+        );
+
+      let query = `
+        SELECT
+          ads.username,
+          ads.role,
+          ads.login_time,
+          ads.last_seen,
+          ads.logout_time,
+          ads.is_active,
+          ads.session_duration_seconds,
+          ads.session_end_reason,
+          COALESCE(
+            u.access_mode,
+            'standard'
+          ) AS access_mode,
+          u.temporary_access_label,
+          u.temporary_access_started_at,
+          u.access_expires_at,
+          u.temporary_access_revoked_at,
+          (
+            COALESCE(
+              u.access_mode,
+              'standard'
+            ) = $3
+          ) AS is_temporary,
+          (
+            ads.is_active = true
+            AND ads.last_seen >
+              NOW() - INTERVAL '90 seconds'
+            AND (
+              COALESCE(
+                u.access_mode,
+                'standard'
+              ) <> $3
+              OR (
+                u.status = 'active'
+                AND u.temporary_access_revoked_at
+                  IS NULL
+                AND (
+                  u.access_expires_at IS NULL
+                  OR u.access_expires_at > NOW()
+                )
+              )
+            )
+          ) AS is_currently_online
+        FROM admin_sessions ads
+        LEFT JOIN users u
+          ON u.id = ads.user_id
+        WHERE (
+          $1::boolean = true
+          OR ads.company_id = $2
+        )
+      `;
+
+      const values = [
+        isSystemOwner,
+        req.auth.company_id,
+        ACCESS_MODE_READ_ONLY,
+      ];
+
+      if (from) {
+        values.push(from);
+
+        query += `
+          AND COALESCE(
+            ads.logout_time,
+            ads.last_seen,
+            ads.login_time
+          ) >= $${values.length}::date
+        `;
+      }
+
+      if (to) {
+        values.push(to);
+
+        query += `
+          AND COALESCE(
+            ads.logout_time,
+            ads.last_seen,
+            ads.login_time
+          ) < (
+            $${values.length}::date
+            + INTERVAL '1 day'
+          )
+        `;
+      }
+
+      query += `
+        ORDER BY ads.login_time DESC
+      `;
+
+      const result = await pool.query(
+        query,
+        values
+      );
+
+      const dateFields = [
+        "login_time",
+        "last_seen",
+        "logout_time",
+        "temporary_access_started_at",
+        "access_expires_at",
+        "temporary_access_revoked_at",
+      ];
+
+      result.rows.forEach((row) => {
+        dateFields.forEach((field) => {
+          row[field] = row[field]
+            ? new Date(row[field]).toLocaleString(
+                "el-GR",
+                {
+                  timeZone: companyTimezone,
+                }
+              )
+            : "";
+        });
+      });
+
+      const escapeCsvValue = (value) => {
+        if (
+          value === null ||
+          value === undefined
+        ) {
+          return "";
+        }
+
+        const text = String(value);
+
+        if (/[;"\r\n]/.test(text)) {
+          return `"${text.replace(
+            /"/g,
+            '""'
+          )}"`;
+        }
+
+        return text;
+      };
+
+      const headers = [
+        "username",
+        "role",
+        "access_mode",
+        "is_temporary",
+        "temporary_access_label",
+        "login_time",
+        "last_seen",
+        "logout_time",
+        "is_active",
+        "is_currently_online",
+        "session_duration_seconds",
+        "session_end_reason",
+        "temporary_access_started_at",
+        "access_expires_at",
+        "temporary_access_revoked_at",
+      ];
+
+      const csvRows = result.rows.map(
+        (row) =>
+          headers
+            .map((header) =>
+              escapeCsvValue(row[header])
+            )
+            .join(";")
+      );
+
+      const csv =
+        `${headers.join(";")}\n` +
+        `${csvRows.join("\n")}\n`;
+
+      res.setHeader(
+        "Content-Type",
+        "text/csv; charset=utf-8"
+      );
+
+      res.setHeader(
+        "Content-Disposition",
+        "attachment; filename=admin_sessions.csv"
+      );
+
+      return res.send(csv);
+    } catch (err) {
+      console.error(
+        "Admin session export error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
 
 // ---------------------------------------------------------------------
 // GreekSMS API route
@@ -1343,6 +1542,54 @@ function getTemporaryAccountStatus({
   return "pending";
 }
 
+async function closeExpiredTemporaryAdminSessions({
+  isSystemOwner,
+  companyId,
+}) {
+  await pool.query(
+    `
+    UPDATE admin_sessions AS ads
+    SET
+      is_active = false,
+      logout_time = COALESCE(
+        ads.logout_time,
+        u.access_expires_at
+      ),
+      session_duration_seconds = COALESCE(
+        ads.session_duration_seconds,
+        GREATEST(
+          0,
+          EXTRACT(
+            EPOCH FROM (
+              u.access_expires_at
+              - ads.login_time
+            )
+          )::int
+        )
+      ),
+      session_end_reason = COALESCE(
+        ads.session_end_reason,
+        'temporary_access_expired'
+      )
+    FROM users u
+    WHERE u.id = ads.user_id
+      AND ads.is_active = true
+      AND u.access_mode = $1
+      AND u.access_expires_at IS NOT NULL
+      AND u.access_expires_at <= NOW()
+      AND (
+        $2::boolean = true
+        OR ads.company_id = $3
+      )
+    `,
+    [
+      ACCESS_MODE_READ_ONLY,
+      isSystemOwner,
+      companyId,
+    ]
+  );
+}
+
 function blockReadOnlyMutation(
   req,
   res,
@@ -1586,10 +1833,33 @@ c.name AS company_name,
 if (isTemporaryAccessExpired(user.access_expires_at)) {
   await pool.query(
     `
-    UPDATE admin_sessions
-    SET is_active = false
-    WHERE user_id = $1
-      AND is_active = true
+    UPDATE admin_sessions AS ads
+    SET
+      is_active = false,
+      logout_time = COALESCE(
+        ads.logout_time,
+        u.access_expires_at
+      ),
+      session_duration_seconds = COALESCE(
+        ads.session_duration_seconds,
+        GREATEST(
+          0,
+          EXTRACT(
+            EPOCH FROM (
+              u.access_expires_at
+              - ads.login_time
+            )
+          )::int
+        )
+      ),
+      session_end_reason = COALESCE(
+        ads.session_end_reason,
+        'temporary_access_expired'
+      )
+    FROM users u
+    WHERE ads.user_id = $1
+      AND u.id = ads.user_id
+      AND ads.is_active = true
     `,
     [user.id]
   );
@@ -1811,9 +2081,33 @@ c.name AS company_name,
     if (isTemporaryAccessExpired(auth.access_expires_at)) {
   await pool.query(
     `
-    UPDATE admin_sessions
-    SET is_active = false
-    WHERE id = $1
+    UPDATE admin_sessions AS ads
+    SET
+      is_active = false,
+      logout_time = COALESCE(
+        ads.logout_time,
+        u.access_expires_at
+      ),
+      session_duration_seconds = COALESCE(
+        ads.session_duration_seconds,
+        GREATEST(
+          0,
+          EXTRACT(
+            EPOCH FROM (
+              u.access_expires_at
+              - ads.login_time
+            )
+          )::int
+        )
+      ),
+      session_end_reason = COALESCE(
+        ads.session_end_reason,
+        'temporary_access_expired'
+      )
+    FROM users u
+    WHERE ads.id = $1
+      AND u.id = ads.user_id
+      AND ads.is_active = true
     `,
     [auth.session_id]
   );
@@ -2529,10 +2823,49 @@ app.post(
       if (usersResult.rows.length > 0) {
         await client.query(
           `
-          UPDATE admin_sessions
-          SET is_active = false
-          WHERE user_id = ANY($1::int[])
-            AND is_active = true
+                    UPDATE admin_sessions AS ads
+          SET
+            is_active = false,
+            logout_time = COALESCE(
+              ads.logout_time,
+              CASE
+                WHEN
+                  u.access_expires_at IS NOT NULL
+                  AND u.access_expires_at <= NOW()
+                THEN u.access_expires_at
+                ELSE NOW()
+              END
+            ),
+            session_duration_seconds = COALESCE(
+              ads.session_duration_seconds,
+              GREATEST(
+                0,
+                EXTRACT(
+                  EPOCH FROM (
+                    CASE
+                      WHEN
+                        u.access_expires_at IS NOT NULL
+                        AND u.access_expires_at <= NOW()
+                      THEN u.access_expires_at
+                      ELSE NOW()
+                    END
+                    - ads.login_time
+                  )
+                )::int
+              )
+            ),
+            session_end_reason =
+              CASE
+                WHEN
+                  u.access_expires_at IS NOT NULL
+                  AND u.access_expires_at <= NOW()
+                THEN 'temporary_access_expired'
+                ELSE 'temporary_access_revoked'
+              END
+          FROM users u
+          WHERE ads.user_id = ANY($1::int[])
+            AND u.id = ads.user_id
+            AND ads.is_active = true
           `,
           [
             usersResult.rows.map(
