@@ -499,9 +499,59 @@ app.get("/admin/active", requireAuth, async (req, res) => {
       ]
     );
 
+        const temporaryGuardPreviewResult =
+      await pool.query(
+        `
+        SELECT DISTINCT ON (g.username)
+          g.id AS guard_id,
+          g.username,
+          g.full_name,
+          g.role,
+          gs.login_time,
+          gs.last_heartbeat AS last_seen,
+          g.access_mode,
+          g.temporary_access_label,
+          g.temporary_access_started_at,
+          g.access_expires_at,
+          s.id AS site_id,
+          s.name AS site_name,
+          true AS is_temporary,
+          'guard_web_app' AS preview_surface
+        FROM guard_sessions gs
+        INNER JOIN guards g
+          ON g.id = gs.guard_id
+        INNER JOIN sites s
+          ON s.id = gs.site_id
+        WHERE gs.logout_time IS NULL
+          AND gs.last_heartbeat >
+            NOW() - INTERVAL '90 seconds'
+          AND g.active = true
+          AND g.access_mode = $3
+          AND g.temporary_access_revoked_at IS NULL
+          AND (
+            g.access_expires_at IS NULL
+            OR g.access_expires_at > NOW()
+          )
+          AND (
+            $1::boolean = true
+            OR s.company_id = $2
+          )
+        ORDER BY
+          g.username,
+          gs.last_heartbeat DESC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+          ACCESS_MODE_READ_ONLY,
+        ]
+      );
+
     return res.json({
       status: "ok",
       admins: result.rows,
+      temporary_guard_previews:
+        temporaryGuardPreviewResult.rows,
     });
   } catch (err) {
     console.error("Active admins error:", err);
