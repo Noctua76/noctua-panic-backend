@@ -38,6 +38,122 @@ async function getCompanyTimezone(companyId) {
   return result.rows[0].timezone || "Europe/Athens";
 }
 
+async function ensurePatrolOccurrenceIntegrity() {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "LOCK TABLE patrol_logs IN SHARE ROW EXCLUSIVE MODE"
+    );
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_logs_duplicate_archive (
+        archive_id BIGSERIAL PRIMARY KEY,
+        original_patrol_log_id BIGINT NOT NULL UNIQUE,
+        patrol_log JSONB NOT NULL,
+        archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        archive_reason TEXT NOT NULL
+      )
+    `);
+
+    const archiveResult = await client.query(`
+      WITH ranked AS (
+        SELECT
+          id,
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              schedule_id,
+              COALESCE(schedule_type, 'recurring'),
+              scheduled_at
+            ORDER BY patrol_time ASC NULLS LAST, id ASC
+          ) AS duplicate_rank
+        FROM patrol_logs
+        WHERE schedule_id IS NOT NULL
+          AND scheduled_at IS NOT NULL
+      ),
+      duplicates AS (
+        SELECT id
+        FROM ranked
+        WHERE duplicate_rank > 1
+      )
+      INSERT INTO patrol_logs_duplicate_archive (
+        original_patrol_log_id,
+        patrol_log,
+        archived_at,
+        archive_reason
+      )
+      SELECT
+        pl.id,
+        TO_JSONB(pl),
+        NOW(),
+        'duplicate patrol occurrence removed before unique index'
+      FROM patrol_logs pl
+      INNER JOIN duplicates d
+        ON d.id = pl.id
+      ON CONFLICT (original_patrol_log_id) DO NOTHING
+    `);
+
+    const deleteResult = await client.query(`
+      WITH ranked AS (
+        SELECT
+          id,
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              schedule_id,
+              COALESCE(schedule_type, 'recurring'),
+              scheduled_at
+            ORDER BY patrol_time ASC NULLS LAST, id ASC
+          ) AS duplicate_rank
+        FROM patrol_logs
+        WHERE schedule_id IS NOT NULL
+          AND scheduled_at IS NOT NULL
+      )
+      DELETE FROM patrol_logs pl
+      USING ranked
+      WHERE pl.id = ranked.id
+        AND ranked.duplicate_rank > 1
+    `);
+
+    await client.query(`
+      UPDATE patrol_logs
+      SET
+        completion_status = CASE
+          WHEN COALESCE(delay_minutes, 0) > 0
+            THEN 'completed_late'
+          ELSE 'completed'
+        END,
+        was_missed = false
+      WHERE was_missed IS TRUE
+        OR completion_status = 'missed_completed_late'
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS
+        patrol_logs_occurrence_unique_idx
+      ON patrol_logs (
+        schedule_id,
+        (COALESCE(schedule_type, 'recurring')),
+        scheduled_at
+      )
+      WHERE schedule_id IS NOT NULL
+        AND scheduled_at IS NOT NULL
+    `);
+
+    await client.query("COMMIT");
+
+    return {
+      archivedDuplicates: archiveResult.rowCount,
+      removedDuplicates: deleteResult.rowCount,
+    };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 
 // ================================
 // SHIFT DELAY EMAILS
@@ -9307,6 +9423,10 @@ app.get(
             pi.scheduled_at + INTERVAL '15 minutes'
           ) AS scan_available_until,
 
+          (
+            pi.scheduled_at + INTERVAL '16 minutes'
+          ) AS missed_at,
+
           EXISTS (
             SELECT 1
             FROM patrol_logs pl
@@ -9347,10 +9467,10 @@ app.get(
             THEN 'due_soon'
 
           WHEN (NOW() AT TIME ZONE $4::text) >= scheduled_at
-            AND (NOW() AT TIME ZONE $4::text) <= scan_available_until
+            AND (NOW() AT TIME ZONE $4::text) < missed_at
             THEN 'overdue'
 
-          WHEN (NOW() AT TIME ZONE $4::text) > scan_available_until
+          WHEN (NOW() AT TIME ZONE $4::text) >= missed_at
             THEN 'missed'
 
           ELSE 'scheduled'
@@ -9359,7 +9479,7 @@ app.get(
         CASE
           WHEN already_completed = true THEN false
           WHEN (NOW() AT TIME ZONE $4::text) >= scan_available_from
-            AND (NOW() AT TIME ZONE $4::text) <= scan_available_until
+            AND (NOW() AT TIME ZONE $4::text) < missed_at
             THEN true
           ELSE false
         END AS scan_enabled,
@@ -9396,7 +9516,12 @@ app.get(
     pl.latitude,
     pl.longitude,
     pl.accuracy,
-    'completed' AS status,
+    CASE
+      WHEN pl.completion_status = 'completed_late'
+        OR COALESCE(pl.delay_minutes, 0) > 0
+        THEN 'completed_late'
+      ELSE 'completed'
+    END AS status,
     false AS scan_enabled
   FROM patrol_logs pl
   LEFT JOIN patrol_points pp
@@ -10072,6 +10197,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
             - (reminder_minutes_before || ' minutes')::interval
           ) AS scan_available_from,
           (scheduled_at + INTERVAL '15 minutes') AS scan_available_until,
+          (scheduled_at + INTERVAL '16 minutes') AS missed_at,
           local_now
         FROM candidate_occurrences
       )
@@ -10083,7 +10209,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         local_now,
         CASE
           WHEN local_now < scan_available_from THEN 'scheduled'
-          WHEN local_now > scan_available_until THEN 'missed'
+          WHEN local_now >= missed_at THEN 'missed'
           WHEN local_now < scheduled_at THEN 'due_soon'
           ELSE 'overdue'
         END AS current_status,
@@ -10096,7 +10222,8 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
       FROM occurrence_windows
       ORDER BY
         CASE
-          WHEN local_now BETWEEN scan_available_from AND scan_available_until
+          WHEN local_now >= scan_available_from
+            AND local_now < missed_at
             THEN 0
           ELSE 1
         END,
@@ -10191,7 +10318,10 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         $1,$2,$3,$4,$5,$6,$7,$8,
         NOW(),
         $9,$10,
-        'completed',
+        CASE
+          WHEN $10::int > 0 THEN 'completed_late'
+          ELSE 'completed'
+        END,
         false,
         $11,$12,$13,$14
       )
@@ -10245,6 +10375,16 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Patrol scan error:", err);
+
+    if (
+      err.code === "23505" &&
+      err.constraint === "patrol_logs_occurrence_unique_idx"
+    ) {
+      return res.status(409).json({
+        status: "error",
+        message: "This patrol has already been completed",
+      });
+    }
 
     res.status(500).json({
       status: "error",
@@ -11171,7 +11311,7 @@ AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
         'status',
   CASE
   WHEN u.schedule_type = 'manual'
-    AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
+    AND u.scheduled_at + INTERVAL '16 minutes' <= (NOW() AT TIME ZONE 'Europe/Athens')
     THEN 'missed'
 
   WHEN u.schedule_type = 'manual'
@@ -11183,7 +11323,7 @@ AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
     THEN 'due_soon'
 
   WHEN u.schedule_type = 'recurring'
-  AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
+  AND u.scheduled_at + INTERVAL '16 minutes' <= (NOW() AT TIME ZONE 'Europe/Athens')
   THEN 'missed'
 
 WHEN u.schedule_type = 'recurring'
@@ -11255,7 +11395,7 @@ sn.next_patrol_type,
 
         CASE
   WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
-  WHEN sn.next_patrol < (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes' THEN 'missed'
+  WHEN sn.next_patrol + INTERVAL '16 minutes' <= (NOW() AT TIME ZONE 'Europe/Athens') THEN 'missed'
 WHEN sn.next_patrol < (NOW() AT TIME ZONE 'Europe/Athens') THEN 'overdue'
 WHEN sn.next_patrol <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes' THEN 'due_soon'
   ELSE 'scheduled'
@@ -11718,17 +11858,23 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
   INNER JOIN sites s
     ON s.id = ps.site_id
 
+  INNER JOIN companies c
+    ON c.id = s.company_id
+
   CROSS JOIN LATERAL (
     SELECT
       (
-        (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+        (
+          ps.created_at AT TIME ZONE
+            COALESCE(c.timezone, 'Europe/Athens')
+        )::date
         + ps.start_time
       ) AS anchor_time
   ) anchor
 
   CROSS JOIN LATERAL generate_series(
     anchor.anchor_time,
-    NOW() AT TIME ZONE 'Europe/Athens',
+    NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'),
     (ps.interval_hours || ' hours')::interval
   ) AS gs(expected_slot)
 
@@ -11737,24 +11883,15 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
 
-    AND gs.expected_slot <
-      (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '15 minutes'
+    AND gs.expected_slot + INTERVAL '16 minutes' <=
+      (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
 
     AND NOT EXISTS (
       SELECT 1
       FROM patrol_logs pl
-      WHERE pl.site_id = ps.site_id
-        AND pl.point_id = ps.patrol_point_id
-        AND (
-          pl.scheduled_at = gs.expected_slot
-          OR (
-            pl.scheduled_at IS NULL
-            AND pl.patrol_time >=
-              gs.expected_slot - INTERVAL '10 minutes'
-            AND pl.patrol_time <=
-              gs.expected_slot + INTERVAL '30 minutes'
-          )
-        )
+      WHERE pl.schedule_id = ps.id
+        AND COALESCE(pl.schedule_type, 'recurring') = 'recurring'
+        AND pl.scheduled_at = gs.expected_slot
     )
 ),
       manual_missed AS (
@@ -11772,6 +11909,9 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
         FROM patrol_schedules ps
         LEFT JOIN sites s
           ON s.id = ps.site_id
+
+        LEFT JOIN companies c
+          ON c.id = s.company_id
         LEFT JOIN patrol_points pp
           ON pp.id = ps.patrol_point_id
         LEFT JOIN guard_sessions gs
@@ -11790,14 +11930,16 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
         LEFT JOIN guards g
           ON g.id = gs.guard_id
         WHERE ps.schedule_type = 'manual'
-          AND (ps.scheduled_date + ps.scheduled_time) < NOW()
+          AND (
+            ps.scheduled_date + ps.scheduled_time + INTERVAL '16 minutes'
+          ) <= (
+            NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM patrol_logs pl
-            WHERE pl.point_id = ps.patrol_point_id
-              AND pl.site_id = ps.site_id
-              AND pl.patrol_time >= (ps.scheduled_date + ps.scheduled_time) - INTERVAL '10 minutes'
-              AND pl.patrol_time <= (ps.scheduled_date + ps.scheduled_time) + INTERVAL '30 minutes'
+            WHERE pl.schedule_id = ps.id
+              AND COALESCE(pl.schedule_type, 'manual') = 'manual'
           )
       ),
       combined AS (
@@ -12370,6 +12512,7 @@ app.get(
           ps.site_id,
           s.name AS site_name,
           s.location AS site_location,
+          COALESCE(c.timezone, 'Europe/Athens') AS company_timezone,
 
           ps.patrol_point_id,
           pp.point_name,
@@ -12401,6 +12544,9 @@ app.get(
         LEFT JOIN sites s
           ON s.id = ps.site_id
 
+        LEFT JOIN companies c
+          ON c.id = s.company_id
+
         LEFT JOIN patrol_points pp
           ON pp.id = ps.patrol_point_id
 
@@ -12420,12 +12566,8 @@ app.get(
           FROM patrol_logs pl
           LEFT JOIN guards g
             ON g.id = pl.guard_id
-          WHERE pl.site_id = ps.site_id
-            AND pl.point_id = ps.patrol_point_id
-            AND pl.patrol_time >=
-              (ps.scheduled_date::timestamp + ps.scheduled_time) - INTERVAL '10 minutes'
-            AND pl.patrol_time <=
-              (ps.scheduled_date::timestamp + ps.scheduled_time) + INTERVAL '24 hours'
+          WHERE pl.schedule_id = ps.id
+            AND COALESCE(pl.schedule_type, 'manual') = 'manual'
           ORDER BY ABS(
             EXTRACT(
               EPOCH FROM (
@@ -12452,19 +12594,16 @@ app.get(
 
           WHEN patrol_log_id IS NOT NULL
             AND patrol_time > scheduled_at
-            AND patrol_time <= scheduled_at + INTERVAL '15 minutes'
             THEN 'completed_late'
 
-          WHEN patrol_log_id IS NOT NULL
-            AND patrol_time > scheduled_at + INTERVAL '15 minutes'
-            THEN 'missed_completed_late'
-
           WHEN patrol_log_id IS NULL
-            AND NOW() <= scheduled_at + INTERVAL '15 minutes'
+            AND (NOW() AT TIME ZONE company_timezone)
+              < scheduled_at + INTERVAL '16 minutes'
             THEN 'pending'
 
           WHEN patrol_log_id IS NULL
-            AND NOW() > scheduled_at + INTERVAL '15 minutes'
+            AND (NOW() AT TIME ZONE company_timezone)
+              >= scheduled_at + INTERVAL '16 minutes'
             THEN 'missed'
 
           ELSE 'pending'
@@ -12742,16 +12881,11 @@ app.get(
 
         let displayStatus = "completed";
 
-        if (row.was_missed === true) {
-          displayStatus = "missed_completed_late";
-        } else if (
-          row.completion_status === "completed_late"
+        if (
+          row.completion_status === "completed_late" ||
+          Number(row.delay_minutes || 0) > 0
         ) {
           displayStatus = "completed_late";
-        } else if (
-          row.completion_status === "missed_completed_late"
-        ) {
-          displayStatus = "missed_completed_late";
         }
 
         return {
@@ -12855,9 +12989,6 @@ if (!historyResponse.ok) {
     const completedLate = history.filter(
       (item) => item.display_status === "completed_late"
     ).length;
-    const missedCompletedLate = history.filter(
-      (item) => item.display_status === "missed_completed_late"
-    ).length;
     const completedOnTime = history.filter(
       (item) => item.display_status === "completed"
     ).length;
@@ -12868,7 +12999,6 @@ if (!historyResponse.ok) {
     const reportId = `COMPLETED-PATROL-${site_id || "ALL"}-${Date.now()}`;
 
     const formatStatus = (value) => {
-      if (value === "missed_completed_late") return "Missed Completed Late";
       if (value === "completed_late") return "Completed Late";
       return "Completed";
     };
@@ -13078,8 +13208,6 @@ if (!historyResponse.ok) {
                   ? "Completed"
                   : status === "completed_late"
                   ? "Completed Late"
-                  : status === "missed_completed_late"
-                  ? "Missed Completed Late"
                   : "All Completed"
               )}</span>
             </div>
@@ -13099,10 +13227,6 @@ if (!historyResponse.ok) {
               <span class="value">${escapeHtml(completedLate)}</span>
             </div>
 
-            <div class="summary-item">
-              <span class="label">Missed Completed Late</span>
-              <span class="value">${escapeHtml(missedCompletedLate)}</span>
-            </div>
           </div>
 
           <h2>Completed Patrol Log</h2>
@@ -13179,16 +13303,27 @@ if (!historyResponse.ok) {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+async function startBackend() {
+  const patrolIntegrity =
+    await ensurePatrolOccurrenceIntegrity();
+
+  console.log("Patrol occurrence integrity ready:", patrolIntegrity);
+
+  app.listen(PORT, () => {
+    console.log(`Backend server running on port ${PORT}`);
+  });
+
+  startScheduledShiftGenerator();
+  startShiftDelayMonitor();
+
+  setTimeout(runPatrolPushScheduler, 10000);
+  setInterval(runPatrolPushScheduler, 60000);
+}
+
+startBackend().catch((err) => {
+  console.error("Backend startup failed:", err);
+  process.exit(1);
 });
-
-startScheduledShiftGenerator();
-startShiftDelayMonitor();
-
-setTimeout(runPatrolPushScheduler, 10000);
-
-setInterval(runPatrolPushScheduler, 60000);
 
 
 
