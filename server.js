@@ -9189,6 +9189,7 @@ app.get(
         gs.id AS session_id,
         gs.guard_id,
         gs.site_id,
+        s.company_id,
         gs.login_time,
         gs.logout_time,
         g.full_name AS guard_name,
@@ -9215,6 +9216,7 @@ app.get(
     }
 
     const session = sessionResult.rows[0];
+    const companyTimezone = await getCompanyTimezone(session.company_id);
 
     const boardResult = await pool.query(
       `
@@ -9243,11 +9245,11 @@ app.get(
         CROSS JOIN LATERAL (
           SELECT
             (
-              (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+              (ps.created_at AT TIME ZONE $4::text)::date
               + ps.start_time
             ) AS anchor_time,
-            (NOW() AT TIME ZONE 'Europe/Athens')::date AS day_start,
-            ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day') AS day_end
+            (NOW() AT TIME ZONE $4::text)::date AS day_start,
+            ((NOW() AT TIME ZONE $4::text)::date + INTERVAL '1 day') AS day_end
         ) w
 
         CROSS JOIN LATERAL generate_series(
@@ -9283,7 +9285,7 @@ app.get(
         WHERE ps.schedule_type = 'manual'
           AND ps.active = true
           AND ps.site_id = (SELECT site_id FROM active_session)
-          AND ps.scheduled_date = (NOW() AT TIME ZONE 'Europe/Athens')::date
+          AND ps.scheduled_date = (NOW() AT TIME ZONE $4::text)::date
       ),
 
       patrol_items AS (
@@ -9337,18 +9339,18 @@ app.get(
           WHEN already_completed = true
             THEN 'completed'
 
-          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < scan_available_from
+          WHEN (NOW() AT TIME ZONE $4::text) < scan_available_from
             THEN 'scheduled'
 
-          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= scan_available_from
-            AND (NOW() AT TIME ZONE 'Europe/Athens') < scheduled_at
+          WHEN (NOW() AT TIME ZONE $4::text) >= scan_available_from
+            AND (NOW() AT TIME ZONE $4::text) < scheduled_at
             THEN 'due_soon'
 
-          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= scheduled_at
-            AND (NOW() AT TIME ZONE 'Europe/Athens') <= scan_available_until
+          WHEN (NOW() AT TIME ZONE $4::text) >= scheduled_at
+            AND (NOW() AT TIME ZONE $4::text) <= scan_available_until
             THEN 'overdue'
 
-          WHEN (NOW() AT TIME ZONE 'Europe/Athens') > scan_available_until
+          WHEN (NOW() AT TIME ZONE $4::text) > scan_available_until
             THEN 'missed'
 
           ELSE 'scheduled'
@@ -9356,8 +9358,8 @@ app.get(
 
         CASE
           WHEN already_completed = true THEN false
-          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= scan_available_from
-            AND (NOW() AT TIME ZONE 'Europe/Athens') <= scan_available_until
+          WHEN (NOW() AT TIME ZONE $4::text) >= scan_available_from
+            AND (NOW() AT TIME ZONE $4::text) <= scan_available_until
             THEN true
           ELSE false
         END AS scan_enabled,
@@ -9365,7 +9367,7 @@ app.get(
         FLOOR(
           EXTRACT(
             EPOCH FROM (
-              (NOW() AT TIME ZONE 'Europe/Athens') - scheduled_at
+              (NOW() AT TIME ZONE $4::text) - scheduled_at
             )
           ) / 60
         )::int AS minutes_delta
@@ -9374,7 +9376,7 @@ app.get(
 
       ORDER BY scheduled_at ASC, point_id ASC
       `,
-      [guard_id, session_id, session.site_id]
+      [guard_id, session_id, session.site_id, companyTimezone]
     );
 
     const completedResult = await pool.query(
@@ -9924,86 +9926,36 @@ app.post("/push/test", async (req, res) => {
   }
 });
 
-app.post("/patrol/scan", async (req, res) => {
+app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
   try {
     const {
       schedule_id,
-      schedule_type,
-      scheduled_at,
-      guard_id,
-      session_id,
       qr_token,
       latitude,
       longitude,
       accuracy,
     } = req.body;
 
+    const normalizedScheduleId = Number(schedule_id);
+    const normalizedQrToken =
+      typeof qr_token === "string" ? qr_token.trim() : "";
+
     if (
-      !schedule_id ||
-      !schedule_type ||
-      !scheduled_at ||
-      !guard_id ||
-      !session_id ||
-      !qr_token
+      !Number.isInteger(normalizedScheduleId) ||
+      normalizedScheduleId <= 0 ||
+      !normalizedQrToken
     ) {
       return res.status(400).json({
         status: "error",
-        message:
-          "schedule_id, schedule_type, scheduled_at, guard_id, session_id and qr_token are required",
+        message: "A valid schedule_id and qr_token are required",
       });
     }
 
-    if (!["manual", "recurring"].includes(schedule_type)) {
-      return res.status(400).json({
-        status: "error",
-        message: "schedule_type must be manual or recurring",
-      });
-    }
-
-    const sessionResult = await pool.query(
-      `
-      SELECT
-  gs.id AS session_id,
-  gs.guard_id,
-  gs.site_id,
-  gs.login_time,
-  gs.logout_time,
-  g.access_mode,
-  g.access_expires_at
-FROM guard_sessions gs
-JOIN guards g
-  ON g.id = gs.guard_id
-WHERE gs.id = $1
-  AND gs.guard_id = $2
-  AND gs.logout_time IS NULL
-LIMIT 1
-      `,
-      [session_id, guard_id]
-    );
-
-    if (sessionResult.rows.length === 0) {
-      return res.status(403).json({
-        status: "error",
-        message: "Active guard session not found",
-      });
-    }
-
-    const activeSession = sessionResult.rows[0];
-
-    if (
-  activeSession.access_mode ===
-    ACCESS_MODE_READ_ONLY ||
-  isTemporaryAccessExpired(
-    activeSession.access_expires_at
-  )
-) {
-  return res.status(403).json({
-    status: "error",
-    code: "READ_ONLY_ACCESS",
-    message:
-      "Patrol scans are disabled for read-only access",
-  });
-}
+    const guardId = req.guard.guard_id;
+    const sessionId = req.guard.session_id;
+    const siteId = req.guard.site_id;
+    const companyId = req.guard.company_id;
+    const companyTimezone = await getCompanyTimezone(companyId);
 
     const patrolResult = await pool.query(
       `
@@ -10015,26 +9967,24 @@ LIMIT 1
         pp.point_name,
         pp.qr_token,
         pp.active AS point_active,
-        ps.reminder_minutes_before,
-
-        CASE
-          WHEN ps.schedule_type = 'manual'
-            THEN (ps.scheduled_date::timestamp + ps.scheduled_time)
-          ELSE $3::timestamp
-        END AS resolved_scheduled_at
+        ps.reminder_minutes_before
 
       FROM patrol_schedules ps
 
       JOIN patrol_points pp
         ON pp.id = ps.patrol_point_id
 
+      JOIN sites s
+        ON s.id = ps.site_id
+
       WHERE ps.id = $1
-        AND ps.schedule_type = $2
+        AND ps.site_id = $2
+        AND s.company_id = $3
         AND ps.active = true
         AND pp.active = true
       LIMIT 1
       `,
-      [schedule_id, schedule_type, scheduled_at]
+      [normalizedScheduleId, siteId, companyId]
     );
 
     if (patrolResult.rows.length === 0) {
@@ -10046,14 +9996,7 @@ LIMIT 1
 
     const patrol = patrolResult.rows[0];
 
-    if (Number(patrol.site_id) !== Number(activeSession.site_id)) {
-      return res.status(403).json({
-        status: "error",
-        message: "Patrol does not belong to active guard site",
-      });
-    }
-
-    if (String(patrol.qr_token) !== String(qr_token)) {
+    if (String(patrol.qr_token) !== normalizedQrToken) {
       return res.status(403).json({
         status: "error",
         message: "QR token does not match this patrol checkpoint",
@@ -10062,29 +10005,118 @@ LIMIT 1
 
     const windowResult = await pool.query(
       `
+      WITH schedule_context AS (
+        SELECT
+          ps.schedule_type,
+          ps.scheduled_date,
+          ps.scheduled_time,
+          ps.interval_hours,
+          ps.start_time,
+          COALESCE(ps.reminder_minutes_before, 5) AS reminder_minutes_before,
+          (NOW() AT TIME ZONE $2::text) AS local_now,
+          (
+            (ps.created_at AT TIME ZONE $2::text)::date
+            + ps.start_time
+          ) AS anchor_time
+        FROM patrol_schedules ps
+        WHERE ps.id = $1
+          AND ps.site_id = $3
+          AND ps.active = true
+      ),
+
+      recurring_index AS (
+        SELECT
+          sc.*,
+          FLOOR(
+            EXTRACT(EPOCH FROM (sc.local_now - sc.anchor_time))
+            / (sc.interval_hours * 3600)
+          )::bigint AS base_index
+        FROM schedule_context sc
+        WHERE sc.schedule_type = 'recurring'
+          AND sc.start_time IS NOT NULL
+          AND sc.interval_hours IS NOT NULL
+          AND sc.interval_hours > 0
+      ),
+
+      candidate_occurrences AS (
+        SELECT
+          (sc.scheduled_date::timestamp + sc.scheduled_time) AS scheduled_at,
+          sc.local_now,
+          sc.reminder_minutes_before
+        FROM schedule_context sc
+        WHERE sc.schedule_type = 'manual'
+          AND sc.scheduled_date IS NOT NULL
+          AND sc.scheduled_time IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          (
+            ri.anchor_time
+            + (candidate_index * ri.interval_hours) * INTERVAL '1 hour'
+          ) AS scheduled_at,
+          ri.local_now,
+          ri.reminder_minutes_before
+        FROM recurring_index ri
+        CROSS JOIN LATERAL generate_series(
+          GREATEST(ri.base_index, 0),
+          GREATEST(ri.base_index + 1, 0)
+        ) AS candidate(candidate_index)
+      ),
+
+      occurrence_windows AS (
+        SELECT
+          scheduled_at,
+          (
+            scheduled_at
+            - (reminder_minutes_before || ' minutes')::interval
+          ) AS scan_available_from,
+          (scheduled_at + INTERVAL '15 minutes') AS scan_available_until,
+          local_now
+        FROM candidate_occurrences
+      )
+
       SELECT
-        $1::timestamp AS scheduled_at,
-
-        (
-          $1::timestamp
-          - (COALESCE($2::int, 5) || ' minutes')::interval
-        ) AS scan_available_from,
-
-        (
-          $1::timestamp + INTERVAL '15 minutes'
-        ) AS scan_available_until,
-
-        (NOW() AT TIME ZONE 'Europe/Athens') AS now_athens
+        scheduled_at,
+        scan_available_from,
+        scan_available_until,
+        local_now,
+        CASE
+          WHEN local_now < scan_available_from THEN 'scheduled'
+          WHEN local_now > scan_available_until THEN 'missed'
+          WHEN local_now < scheduled_at THEN 'due_soon'
+          ELSE 'overdue'
+        END AS current_status,
+        GREATEST(
+          0,
+          FLOOR(
+            EXTRACT(EPOCH FROM (local_now - scheduled_at)) / 60
+          )
+        )::int AS delay_minutes
+      FROM occurrence_windows
+      ORDER BY
+        CASE
+          WHEN local_now BETWEEN scan_available_from AND scan_available_until
+            THEN 0
+          ELSE 1
+        END,
+        ABS(EXTRACT(EPOCH FROM (local_now - scheduled_at))) ASC
+      LIMIT 1
       `,
-      [
-        patrol.resolved_scheduled_at,
-        patrol.reminder_minutes_before || 5,
-      ]
+      [normalizedScheduleId, companyTimezone, siteId]
     );
+
+    if (windowResult.rows.length === 0) {
+      return res.status(409).json({
+        status: "error",
+        message: "No valid patrol occurrence could be resolved",
+        scan_enabled: false,
+      });
+    }
 
     const scanWindow = windowResult.rows[0];
 
-    if (new Date(scanWindow.now_athens) < new Date(scanWindow.scan_available_from)) {
+    if (scanWindow.current_status === "scheduled") {
       return res.status(403).json({
         status: "error",
         message: "Scan not allowed yet",
@@ -10095,7 +10127,7 @@ LIMIT 1
       });
     }
 
-    if (new Date(scanWindow.now_athens) > new Date(scanWindow.scan_available_until)) {
+    if (scanWindow.current_status === "missed") {
       return res.status(409).json({
         status: "error",
         message: "Patrol missed",
@@ -10120,8 +10152,8 @@ LIMIT 1
       [
         patrol.site_id,
         patrol.point_id,
-        schedule_id,
-        schedule_type,
+        normalizedScheduleId,
+        patrol.schedule_type,
         scanWindow.scheduled_at,
       ]
     );
@@ -10133,25 +10165,6 @@ LIMIT 1
         patrol_log_id: duplicateResult.rows[0].id,
       });
     }
-
-    const delayResult = await pool.query(
-      `
-      SELECT
-        GREATEST(
-          0,
-          FLOOR(
-            EXTRACT(
-              EPOCH FROM (
-                (NOW() AT TIME ZONE 'Europe/Athens') - $1::timestamp
-              )
-            ) / 60
-          )
-        )::int AS delay_minutes
-      `,
-      [scanWindow.scheduled_at]
-    );
-
-    const delayMinutes = delayResult.rows[0].delay_minutes;
 
     const insertResult = await pool.query(
       `
@@ -10187,22 +10200,22 @@ LIMIT 1
       [
         patrol.site_id,
         patrol.point_id,
-        guard_id,
-        session_id,
-        qr_token,
+        guardId,
+        sessionId,
+        normalizedQrToken,
         latitude || null,
         longitude || null,
         accuracy || null,
         scanWindow.scheduled_at,
-        delayMinutes,
-        schedule_id,
-        schedule_type,
+        scanWindow.delay_minutes,
+        normalizedScheduleId,
+        patrol.schedule_type,
         scanWindow.scan_available_from,
         scanWindow.scan_available_until,
       ]
     );
 
-    if (schedule_type === "manual") {
+    if (patrol.schedule_type === "manual") {
       await pool.query(
         `
         UPDATE patrol_schedules
@@ -10212,7 +10225,7 @@ LIMIT 1
         WHERE id = $1
           AND schedule_type = 'manual'
         `,
-        [schedule_id]
+        [normalizedScheduleId]
       );
     }
 
