@@ -9232,9 +9232,7 @@ app.get(
           'recurring' AS schedule_type,
           ps.site_id,
           ps.patrol_point_id AS point_id,
-          pp.point_name AS checkpoint,
-          pp.qr_token,
-          ps.reminder_minutes_before,
+          pp.point_name AS checkpoint,          ps.reminder_minutes_before,
           gs.expected_slot AS scheduled_at
         FROM patrol_schedules ps
 
@@ -9274,9 +9272,7 @@ app.get(
           'manual' AS schedule_type,
           ps.site_id,
           ps.patrol_point_id AS point_id,
-          pp.point_name AS checkpoint,
-          pp.qr_token,
-          ps.reminder_minutes_before,
+          pp.point_name AS checkpoint,          ps.reminder_minutes_before,
           (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
         FROM patrol_schedules ps
 
@@ -9332,9 +9328,7 @@ app.get(
         schedule_type,
         site_id,
         point_id,
-        checkpoint,
-        qr_token,
-        reminder_minutes_before,
+        checkpoint,        reminder_minutes_before,
         to_char(scheduled_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scheduled_at,
         to_char(scan_available_from, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_from,
         to_char(scan_available_until, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_until,
@@ -11363,21 +11357,35 @@ FROM patrol_points
   }
 });
 
-app.get("/patrol-points/:id/qr", async (req, res) => {
-  const { id } = req.params;
+app.get("/patrol-points/:id/qr", requireAuth, async (req, res) => {
+  const pointId = Number(req.params.id);
+  const isSystemOwner = req.auth.role === "system_owner";
+
+  if (!Number.isInteger(pointId) || pointId <= 0) {
+    return res.status(400).json({
+      status: "error",
+      message: "Invalid patrol point ID",
+    });
+  }
 
   try {
     const result = await pool.query(
       `
       SELECT
-        id,
-        point_name,
-        qr_token,
-        active
-      FROM patrol_points
-      WHERE id = $1
+        pp.id,
+        pp.point_name,
+        pp.qr_token,
+        pp.active
+      FROM patrol_points pp
+      JOIN sites s
+        ON s.id = pp.site_id
+      WHERE pp.id = $1
+        AND (
+          $2::boolean = true
+          OR s.company_id = $3
+        )
       `,
-      [id]
+      [pointId, isSystemOwner, req.auth.company_id]
     );
 
     if (result.rows.length === 0) {
