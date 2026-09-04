@@ -7613,21 +7613,75 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
 
     const incident = incidentResult.rows[0];
 
-    const results = await Promise.all(
+    const smsSettledResults = await Promise.allSettled(
       recipients.map(to => sendVonageSms(to, text))
     );
 
+    const smsNotifications = smsSettledResults.map((result, index) => {
+      const providerMessage =
+        result.status === "fulfilled"
+          ? result.value?.messages?.[0]
+          : null;
+      const submitted =
+        result.status === "fulfilled" &&
+        String(providerMessage?.status) === "0";
+
+      return {
+        phone: recipients[index],
+        status: submitted ? "submitted" : "failed",
+        provider: "vonage",
+        providerMessageId:
+          providerMessage?.["message-id"] || null,
+      };
+    });
+
+    const results = smsSettledResults
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+
     let callResults = [];
 
-    try {
-      callResults = await startVoiceCalls(recipients, {
-  incidentId: incident.id,
-  siteId,
-  guardId
-});
-    } catch (callErr) {
-      console.error('Voice call failed (non-blocking):', callErr);
+    const voiceNotifications = [];
+
+    for (const to of recipients) {
+      try {
+        const recipientCallResults = await startVoiceCalls([to], {
+          incidentId: incident.id,
+          siteId,
+          guardId,
+        });
+
+        callResults.push(...recipientCallResults);
+        voiceNotifications.push({
+          phone: to,
+          status: "submitted",
+          provider: "vonage",
+          providerCallUuid:
+            recipientCallResults[0]?.response?.uuid ||
+            recipientCallResults[0]?.response?.call_uuid ||
+            null,
+        });
+      } catch (callErr) {
+        console.error(
+          `Voice call failed for ${to} (non-blocking):`,
+          callErr
+        );
+        voiceNotifications.push({
+          phone: to,
+          status: "failed",
+          provider: "vonage",
+          providerCallUuid: null,
+        });
+      }
     }
+
+    const smsSent = smsNotifications.filter(
+      (notification) => notification.status === "submitted"
+    ).length;
+    const smsFailed = smsNotifications.length - smsSent;
+    const voiceSubmitted = voiceNotifications.filter(
+      (notification) => notification.status === "submitted"
+    ).length;
 
     await ensureAlertEventsTable();
 
@@ -7661,10 +7715,10 @@ await pool.query(
     guardId,
 
     recipients.length,
-    results.length,
-    0,
+    smsSent,
+    smsFailed,
     recipients.length,
-    "submitted",
+    voiceSubmitted === recipients.length ? "submitted" : "partial_failure",
 
     "vonage"
   ]
@@ -7672,11 +7726,15 @@ await pool.query(
 
     return res.json({
       status: 'ok',
-      message: 'Alert received, incident created, SMS sent and voice calls started',
+      message: 'Alert received, incident created, notification attempts processed',
       incident: incidentResult.rows[0],
       recipients,
       smsResults: results,
-      callResults
+      callResults,
+      notifications: {
+        sms: smsNotifications,
+        voice: voiceNotifications,
+      },
     });
 
   } catch (err) {
