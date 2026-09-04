@@ -7216,8 +7216,11 @@ app.get("/system/status", async (req, res) => {
     let webAppStatus = "offline";
 
 try {
+  const guardWebAppHealthUrl =
+    process.env.GUARD_WEBAPP_HEALTH_URL ||
+    "https://noctua76.github.io/noctua-panic-webapp/health.json";
   const webCheck = await fetch(
-    "https://noctua76.github.io/noctua-panic-webapp/health.json",
+    guardWebAppHealthUrl,
     {
       cache: "no-store"
     }
@@ -7442,7 +7445,10 @@ app.post('/test-sms', requireAuth, async (req, res) => {
 });
 
 async function startVoiceCalls(recipients, context = {}) {
-  const baseUrl = 'https://noctua-panic-backend-production.up.railway.app';
+  const baseUrl = (
+    process.env.PUBLIC_BACKEND_URL ||
+    'https://noctua-panic-backend-production.up.railway.app'
+  ).replace(/\/+$/, '');
 
   const results = [];
   for (const to of recipients) {
@@ -9863,7 +9869,7 @@ async function sendScanOpenPushIfNeeded({
   const payload = {
   title: "Patrol Reminder",
   body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nScan window is now open.`,
-  url: "/noctua-panic-webapp/patrol.html",
+  url: "patrol.html",
 };
 
   const pushResult = await sendPushNotificationToGuard(guardId, payload);
@@ -10090,7 +10096,7 @@ app.post("/push/test", async (req, res) => {
     const payload = {
       title: "Aegis Link",
       body: "Test Push Notification",
-      url: "/patrol.html",
+      url: "patrol.html",
     };
 
     const result = await sendPushNotificationToGuard(guard_id, payload);
