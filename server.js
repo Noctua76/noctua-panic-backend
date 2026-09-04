@@ -7218,7 +7218,7 @@ app.get("/system/status", async (req, res) => {
 try {
   const guardWebAppHealthUrl =
     process.env.GUARD_WEBAPP_HEALTH_URL ||
-    "https://noctua76.github.io/noctua-panic-webapp/health.json";
+    "https://guard.aegislink.noctuacore.ai/health.json";
   const webCheck = await fetch(
     guardWebAppHealthUrl,
     {
