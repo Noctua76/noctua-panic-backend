@@ -3903,7 +3903,7 @@ if (
   });
 }
 
-    const closedSessions = await pool.query(
+const closedSessions = await pool.query(
   `
   UPDATE guard_sessions
   SET
@@ -3913,6 +3913,15 @@ if (
   WHERE guard_id = $1
     AND logout_time IS NULL
   RETURNING id
+  `,
+  [guard.id]
+);
+
+await pool.query(
+  `
+  UPDATE push_subscriptions
+  SET active = FALSE, last_seen = NOW()
+  WHERE guard_id = $1 AND active = TRUE
   `,
   [guard.id]
 );
@@ -4130,6 +4139,17 @@ app.post("/guard/logout", requireGuardAuth, async (req, res) => {
 );
 
 for (const row of logoutResult.rows) {
+  await pool.query(
+    `
+    UPDATE push_subscriptions
+    SET active = FALSE, last_seen = NOW()
+    WHERE guard_id = $1
+      AND session_id = $2
+      AND active = TRUE
+    `,
+    [guard_id, row.id]
+  );
+
   await syncScheduledShiftsForSession(row.id);
 }
 
@@ -9641,20 +9661,26 @@ app.get("/push/vapid-public-key", (req, res) => {
   });
 });
 
-app.post("/push/subscribe", async (req, res) => {
+app.post("/push/subscribe", requireGuardAuth, async (req, res) => {
   try {
     const {
-      guard_id,
-      session_id,
       subscription,
       user_agent,
       device_name,
     } = req.body;
 
-    if (!guard_id || !session_id || !subscription) {
+    const {
+      guard_id,
+      session_id,
+      site_id,
+      access_mode,
+      access_expires_at,
+    } = req.guard;
+
+    if (!subscription) {
       return res.status(400).json({
         status: "error",
-        message: "guard_id, session_id and subscription are required",
+        message: "subscription is required",
       });
     }
 
@@ -9670,40 +9696,11 @@ app.post("/push/subscribe", async (req, res) => {
       });
     }
 
-    const sessionResult = await pool.query(
-      `
-      SELECT
-  gs.id,
-  gs.guard_id,
-  gs.site_id,
-  gs.logout_time,
-  g.access_mode,
-  g.access_expires_at
-FROM guard_sessions gs
-JOIN guards g
-  ON g.id = gs.guard_id
-WHERE gs.id = $1
-  AND gs.guard_id = $2
-  AND gs.logout_time IS NULL
-LIMIT 1
-      `,
-      [session_id, guard_id]
-    );
-
-    if (sessionResult.rows.length === 0) {
-      return res.status(403).json({
-        status: "error",
-        message: "No active guard session found",
-      });
-    }
-
-    const activeSession = sessionResult.rows[0];
-
     if (
-  activeSession.access_mode ===
+  access_mode ===
     ACCESS_MODE_READ_ONLY ||
   isTemporaryAccessExpired(
-    activeSession.access_expires_at
+    access_expires_at
   )
 ) {
   return res.status(403).json({
@@ -9746,7 +9743,7 @@ LIMIT 1
       [
         guard_id,
         session_id,
-        activeSession.site_id,
+        site_id,
         subscription.endpoint,
         subscription.keys.p256dh,
         subscription.keys.auth,
@@ -9771,15 +9768,60 @@ LIMIT 1
   }
 });
 
-async function sendPushNotificationToGuard(guardId, payload) {
+app.post("/push/unsubscribe", requireGuardAuth, async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    const { guard_id, session_id } = req.guard;
+
+    const result = await pool.query(
+      `
+      UPDATE push_subscriptions
+      SET active = FALSE, last_seen = NOW()
+      WHERE guard_id = $1
+        AND session_id = $2
+        AND active = TRUE
+        AND ($3::text IS NULL OR endpoint = $3)
+      RETURNING id
+      `,
+      [guard_id, session_id, endpoint || null]
+    );
+
+    return res.json({
+      status: "ok",
+      deactivated_count: result.rowCount,
+    });
+  } catch (err) {
+    console.error("Push unsubscribe error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to deactivate push subscription",
+      detail: err.message,
+    });
+  }
+});
+
+async function sendPushNotificationToGuard({
+  guardId,
+  sessionId,
+  siteId,
+  payload,
+  ttlSeconds = 900,
+}) {
   const subscriptions = await pool.query(
     `
-    SELECT *
-    FROM push_subscriptions
-    WHERE guard_id = $1
-      AND active = TRUE
+    SELECT ps.*
+    FROM push_subscriptions ps
+    JOIN guard_sessions gs
+      ON gs.id = ps.session_id
+      AND gs.guard_id = ps.guard_id
+      AND gs.site_id = ps.site_id
+    WHERE ps.guard_id = $1
+      AND ps.session_id = $2
+      AND ps.site_id = $3
+      AND ps.active = TRUE
+      AND gs.logout_time IS NULL
     `,
-    [guardId]
+    [guardId, sessionId, siteId]
   );
 
   if (subscriptions.rows.length === 0) {
@@ -9801,7 +9843,11 @@ async function sendPushNotificationToGuard(guardId, payload) {
             auth: sub.auth,
           },
         },
-        JSON.stringify(payload)
+        JSON.stringify(payload),
+        {
+          TTL: ttlSeconds,
+          urgency: "high",
+        }
       );
 
       results.push({
@@ -9810,6 +9856,15 @@ async function sendPushNotificationToGuard(guardId, payload) {
       });
     } catch (err) {
       console.error("Push send error:", err);
+
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        await pool.query(
+          `UPDATE push_subscriptions
+           SET active = FALSE, last_seen = NOW()
+           WHERE id = $1`,
+          [sub.id]
+        );
+      }
 
       results.push({
         subscription_id: sub.id,
@@ -9822,6 +9877,8 @@ async function sendPushNotificationToGuard(guardId, payload) {
   return {
     status: "ok",
     sent: results,
+    sent_count: results.filter((result) => result.success).length,
+    failed_count: results.filter((result) => !result.success).length,
   };
 }
 
@@ -9870,9 +9927,22 @@ async function sendScanOpenPushIfNeeded({
   title: "Patrol Reminder",
   body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nScan window is now open.`,
   url: "patrol.html",
+  schedule_id: scheduleId,
+  schedule_type: scheduleType,
+  scheduled_at: scheduledAt,
 };
 
-  const pushResult = await sendPushNotificationToGuard(guardId, payload);
+  const pushResult = await sendPushNotificationToGuard({
+    guardId,
+    sessionId,
+    siteId,
+    payload,
+    ttlSeconds: 900,
+  });
+
+  if ((pushResult.sent_count || 0) === 0) {
+    return { status: "not_delivered", pushResult };
+  }
 
   await pool.query(
     `
@@ -9928,7 +9998,7 @@ async function runPatrolPushScheduler() {
     const dueSoonResult = await pool.query(
       `
       WITH active_sessions AS (
-        SELECT
+        SELECT DISTINCT ON (gs.guard_id, gs.site_id)
           gs.id AS session_id,
           gs.guard_id,
           gs.site_id,
@@ -9940,6 +10010,11 @@ LEFT JOIN sites s
   ON s.id = gs.site_id
 WHERE gs.logout_time IS NULL
   AND g.access_mode = 'standard'
+ORDER BY
+  gs.guard_id,
+  gs.site_id,
+  gs.last_heartbeat DESC,
+  gs.id DESC
       ),
 
       recurring_slots AS (
@@ -10041,7 +10116,7 @@ WHERE gs.logout_time IS NULL
         ON active_sessions.site_id = e.site_id
 
       WHERE (NOW() AT TIME ZONE 'Europe/Athens') >= e.scan_available_from
-        AND (NOW() AT TIME ZONE 'Europe/Athens') < e.scheduled_at
+        AND (NOW() AT TIME ZONE 'Europe/Athens') < e.scan_available_until
 
         AND NOT EXISTS (
           SELECT 1
@@ -10082,16 +10157,13 @@ WHERE gs.logout_time IS NULL
   }
 }
 
-app.post("/push/test", async (req, res) => {
+app.post("/push/test", requireGuardAuth, async (req, res) => {
   try {
-    const { guard_id } = req.body;
-
-    if (!guard_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "guard_id is required",
-      });
-    }
+    const {
+      guard_id: guardId,
+      session_id: sessionId,
+      site_id: siteId,
+    } = req.guard;
 
     const payload = {
       title: "Aegis Link",
@@ -10099,7 +10171,13 @@ app.post("/push/test", async (req, res) => {
       url: "patrol.html",
     };
 
-    const result = await sendPushNotificationToGuard(guard_id, payload);
+    const result = await sendPushNotificationToGuard({
+      guardId,
+      sessionId,
+      siteId,
+      payload,
+      ttlSeconds: 60,
+    });
 
     res.json({
       status: "ok",
