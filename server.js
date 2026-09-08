@@ -9611,13 +9611,12 @@ app.get(
   LEFT JOIN patrol_points pp
     ON pp.id = pl.point_id
   WHERE pl.guard_id = $1
-    AND pl.session_id = $2
-    AND pl.site_id = $3
+    AND pl.site_id = $2
     AND pl.patrol_time >= NOW() - INTERVAL '24 hours'
   ORDER BY pl.patrol_time DESC
   LIMIT 20
   `,
-  [guard_id, session_id, session.site_id]
+  [guard_id, session.site_id]
 );
 
     res.json({
