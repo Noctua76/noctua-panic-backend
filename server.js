@@ -2385,6 +2385,12 @@ g.access_expires_at
   WHERE
     gs.session_token = $1
     AND gs.logout_time IS NULL
+    AND (
+      g.access_mode <> 'standard'
+      OR gs.scheduled_shift_end IS NULL
+      OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+         > (NOW() AT TIME ZONE 'Europe/Athens')
+    )
   LIMIT 1
   `,
   [sessionToken]
@@ -3309,6 +3315,8 @@ function pad2(value) {
   return String(value).padStart(2, "0");
 }
 
+const SHIFT_LOGIN_GRACE_MINUTES = 15;
+
 function parseTimeToMinutes(value) {
   if (!value || !value.includes(":")) return null;
 
@@ -3381,6 +3389,60 @@ function getScheduledShiftFromRules(shiftRules, date = new Date()) {
   const today = { year, month, day };
   const yesterday = shiftDatePlusDays(year, month, day, -1);
   const tomorrow = shiftDatePlusDays(year, month, day, 1);
+
+  // A login made during the handover window belongs to the upcoming shift,
+  // even while the previous shift is still in progress.
+  const upcomingShift = shifts
+    .map((shift) => {
+      const startMinutes = parseTimeToMinutes(shift.start);
+      const endMinutes = parseTimeToMinutes(shift.end);
+
+      if (
+        startMinutes === null ||
+        endMinutes === null ||
+        startMinutes === endMinutes
+      ) {
+        return null;
+      }
+
+      const minutesUntilStart =
+        (startMinutes - currentMinutes + 1440) % 1440;
+
+      if (minutesUntilStart > SHIFT_LOGIN_GRACE_MINUTES) {
+        return null;
+      }
+
+      const startDate =
+        startMinutes < currentMinutes && minutesUntilStart > 0
+          ? tomorrow
+          : today;
+      const endDate =
+        startMinutes > endMinutes
+          ? shiftDatePlusDays(
+              startDate.year,
+              startDate.month,
+              startDate.day,
+              1
+            )
+          : startDate;
+
+      return {
+        minutesUntilStart,
+        start: toPgTimestamp(startDate, shift.start),
+        end: toPgTimestamp(endDate, shift.end),
+        label: `${shift.start}–${shift.end}`,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.minutesUntilStart - b.minutesUntilStart)[0];
+
+  if (upcomingShift) {
+    return {
+      start: upcomingShift.start,
+      end: upcomingShift.end,
+      label: upcomingShift.label,
+    };
+  }
 
   for (const shift of shifts) {
     const startMinutes = parseTimeToMinutes(shift.start);
@@ -3534,16 +3596,29 @@ async function generateScheduledShiftsForAllSites(targetDate) {
 }
 
 function startScheduledShiftGenerator() {
-  setInterval(async () => {
+  const runGenerator = async () => {
     try {
       const athensToday = getAthensDateParts(new Date());
+      const targetDates = [-1, 0, 1].map((offset) => {
+        const dateParts = shiftDatePlusDays(
+          athensToday.year,
+          athensToday.month,
+          athensToday.day,
+          offset
+        );
 
-      const todayDate =
-        `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
+        return `${dateParts.year}-${pad2(dateParts.month)}-${pad2(dateParts.day)}`;
+      });
 
-      console.log("[SHIFT GENERATOR] Running for", todayDate);
+      console.log("[SHIFT GENERATOR] Running for", targetDates.join(", "));
 
-      const created = await generateScheduledShiftsForAllSites(todayDate);
+      const created = [];
+
+      for (const targetDate of targetDates) {
+        created.push(
+          ...(await generateScheduledShiftsForAllSites(targetDate))
+        );
+      }
 
       console.log(
         "[SHIFT GENERATOR] Created",
@@ -3554,11 +3629,14 @@ function startScheduledShiftGenerator() {
     } catch (err) {
   console.error("[SHIFT GENERATOR ERROR]", err.message);
 
-  if (err.stack) {
-    console.error(err.stack);
-  }
-}
-  }, 60000);
+      if (err.stack) {
+        console.error(err.stack);
+      }
+    }
+  };
+
+  setTimeout(runGenerator, 0);
+  setInterval(runGenerator, 60000);
 }
 
 async function detectShiftDelayEvents() {
@@ -3608,6 +3686,10 @@ async function detectShiftDelayEvents() {
     AND operational_guard.access_mode = 'standard'
     AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
     AND gs.login_time <= ss.scheduled_start + INTERVAL '15 minutes'
+    AND gs.scheduled_shift_start = ss.scheduled_start
+    AND gs.scheduled_shift_end = ss.scheduled_end
+    AND COALESCE(gs.logout_time, ss.scheduled_start + INTERVAL '15 minutes')
+        >= ss.scheduled_start + INTERVAL '15 minutes'
 )
 
       AND NOT EXISTS (
@@ -3641,18 +3723,22 @@ async function detectShiftDelayEvents() {
 }
 
 function startShiftDelayMonitor() {
-  setInterval(async () => {
+  const runMonitor = async () => {
     try {
+      await expireGuardSessionsPastShiftGrace();
       await detectShiftDelayEvents();
       await processPendingShiftDelayEmails();
     } catch (err) {
-      console.error("[SHIFT DELAY MONITOR ERROR]", err.message);
+      console.error("[SHIFT TRANSITION MONITOR ERROR]", err.message);
 
       if (err.stack) {
         console.error(err.stack);
       }
     }
-  }, 60000);
+  };
+
+  setTimeout(runMonitor, 0);
+  setInterval(runMonitor, 60000);
 }
 
 async function syncScheduledShiftsForSession(sessionId) {
@@ -3695,8 +3781,19 @@ JOIN guards operational_guard
   ON operational_guard.id = gs.guard_id
 JOIN scheduled_shifts ss
   ON ss.site_id = gs.site_id
- AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
- AND gs.login_time < ss.scheduled_end
+ AND (
+   (
+     gs.scheduled_shift_start IS NOT NULL
+     AND gs.scheduled_shift_end IS NOT NULL
+     AND ss.scheduled_start = gs.scheduled_shift_start
+     AND ss.scheduled_end = gs.scheduled_shift_end
+   )
+   OR (
+     gs.scheduled_shift_start IS NULL
+     AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
+     AND gs.login_time < ss.scheduled_end
+   )
+ )
 WHERE gs.id = $1
   AND operational_guard.access_mode = 'standard'
     ON CONFLICT (scheduled_shift_id, guard_session_id)
@@ -3825,6 +3922,73 @@ AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '15 minutes'
     WHERE ss.id = total_coverage.scheduled_shift_id
     `
   );
+}
+
+async function expireGuardSessionsPastShiftGrace() {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const closedResult = await client.query(`
+      WITH expired_sessions AS (
+        SELECT gs.id
+        FROM guard_sessions gs
+        JOIN guards g
+          ON g.id = gs.guard_id
+        WHERE gs.logout_time IS NULL
+          AND g.access_mode = 'standard'
+          AND gs.scheduled_shift_end IS NOT NULL
+          AND gs.scheduled_shift_end + INTERVAL '15 minutes'
+              <= (NOW() AT TIME ZONE 'Europe/Athens')
+        FOR UPDATE OF gs SKIP LOCKED
+      )
+      UPDATE guard_sessions gs
+      SET
+        logout_time = (NOW() AT TIME ZONE 'Europe/Athens'),
+        last_heartbeat = (NOW() AT TIME ZONE 'Europe/Athens'),
+        status = 'shift_boundary_timeout'
+      FROM expired_sessions expired
+      WHERE gs.id = expired.id
+        AND gs.logout_time IS NULL
+      RETURNING gs.id, gs.guard_id
+    `);
+
+    if (closedResult.rows.length > 0) {
+      const sessionIds = closedResult.rows.map((row) => row.id);
+
+      await client.query(
+        `
+        UPDATE push_subscriptions
+        SET active = FALSE, last_seen = NOW()
+        WHERE session_id = ANY($1::int[])
+          AND active = TRUE
+        `,
+        [sessionIds]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    for (const row of closedResult.rows) {
+      await syncScheduledShiftsForSession(row.id);
+    }
+
+    if (closedResult.rows.length > 0) {
+      console.log(
+        "[SHIFT SESSION EXPIRY] Closed",
+        closedResult.rows.length,
+        "session(s) after the shift handover window"
+      );
+    }
+
+    return closedResult.rows;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ----------------------------------------------------------
@@ -3992,15 +4156,19 @@ const scheduledShift =
 
 console.log("NEW SESSION:", sessionResult.rows[0]);
 
-const athensToday = getAthensDateParts(new Date());
-const todayDate = `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
-
 if (
   guard.access_mode !== ACCESS_MODE_READ_ONLY
 ) {
+  const scheduledShiftDate =
+    scheduledShift?.start?.slice(0, 10) ||
+    (() => {
+      const athensToday = getAthensDateParts(new Date());
+      return `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
+    })();
+
   await generateScheduledShiftsForSite(
     guard.site_id,
-    todayDate
+    scheduledShiftDate
   );
 
   await syncScheduledShiftsForSession(
@@ -4264,9 +4432,14 @@ to_char(
 
         FROM sites s
 
-        LEFT JOIN guard_sessions gs
+LEFT JOIN guard_sessions gs
   ON gs.site_id = s.id
   AND gs.logout_time IS NULL
+  AND (
+    gs.scheduled_shift_end IS NULL
+    OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+       > (NOW() AT TIME ZONE 'Europe/Athens')
+  )
   AND EXISTS (
     SELECT 1
     FROM guards operational_guard
@@ -4316,6 +4489,11 @@ INNER JOIN guards g ON g.id = gs.guard_id
 INNER JOIN sites s ON s.id = gs.site_id
 WHERE gs.logout_time IS NULL
   AND g.access_mode = 'standard'
+  AND (
+    gs.scheduled_shift_end IS NULL
+    OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+       > (NOW() AT TIME ZONE 'Europe/Athens')
+  )
         AND (
           $1::boolean = true
           OR s.company_id = $2
@@ -5300,6 +5478,11 @@ s.coverage_type,
         FROM guard_sessions gs3
         WHERE gs3.site_id = s.id
           AND gs3.logout_time IS NULL
+          AND (
+            gs3.scheduled_shift_end IS NULL
+            OR gs3.scheduled_shift_end + INTERVAL '15 minutes'
+               > (NOW() AT TIME ZONE 'Europe/Athens')
+          )
           AND EXISTS (
   SELECT 1
   FROM guards operational_guard
@@ -5322,6 +5505,11 @@ CASE
     FROM guard_sessions gs3
     WHERE gs3.site_id = s.id
       AND gs3.logout_time IS NULL
+      AND (
+        gs3.scheduled_shift_end IS NULL
+        OR gs3.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
       AND EXISTS (
   SELECT 1
   FROM guards operational_guard
@@ -5339,6 +5527,11 @@ CASE
     FROM guard_sessions gs3
     WHERE gs3.site_id = s.id
       AND gs3.logout_time IS NULL
+      AND (
+        gs3.scheduled_shift_end IS NULL
+        OR gs3.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
       AND EXISTS (
   SELECT 1
   FROM guards operational_guard
@@ -5359,6 +5552,11 @@ END AS status_class
       ON g.id = gs.guard_id
     WHERE gs.site_id = s.id
       AND gs.logout_time IS NULL
+      AND (
+        gs.scheduled_shift_end IS NULL
+        OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
       AND g.access_mode = 'standard'
     ORDER BY gs.login_time DESC
     LIMIT 1
@@ -7360,6 +7558,12 @@ INNER JOIN guards g
 WHERE gs.logout_time IS NULL
 
 AND g.access_mode = 'standard'
+
+AND (
+  gs.scheduled_shift_end IS NULL
+  OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+     > (NOW() AT TIME ZONE 'Europe/Athens')
+)
 
 AND gs.last_heartbeat >
 NOW() - INTERVAL '90 seconds'
@@ -9434,7 +9638,8 @@ app.get(
           'recurring' AS schedule_type,
           ps.site_id,
           ps.patrol_point_id AS point_id,
-          pp.point_name AS checkpoint,          ps.reminder_minutes_before,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
           gs.expected_slot AS scheduled_at
         FROM patrol_schedules ps
 
@@ -9474,7 +9679,8 @@ app.get(
           'manual' AS schedule_type,
           ps.site_id,
           ps.patrol_point_id AS point_id,
-          pp.point_name AS checkpoint,          ps.reminder_minutes_before,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
           (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
         FROM patrol_schedules ps
 
@@ -9534,7 +9740,8 @@ app.get(
         schedule_type,
         site_id,
         point_id,
-        checkpoint,        reminder_minutes_before,
+        checkpoint,
+        reminder_minutes_before,
         to_char(scheduled_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scheduled_at,
         to_char(scan_available_from, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_from,
         to_char(scan_available_until, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_until,
@@ -9819,6 +10026,11 @@ async function sendPushNotificationToGuard({
       AND ps.site_id = $3
       AND ps.active = TRUE
       AND gs.logout_time IS NULL
+      AND (
+        gs.scheduled_shift_end IS NULL
+        OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
     `,
     [guardId, sessionId, siteId]
   );
@@ -10009,6 +10221,11 @@ LEFT JOIN sites s
   ON s.id = gs.site_id
 WHERE gs.logout_time IS NULL
   AND g.access_mode = 'standard'
+  AND (
+    gs.scheduled_shift_end IS NULL
+    OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+       > (NOW() AT TIME ZONE 'Europe/Athens')
+  )
 ORDER BY
   gs.guard_id,
   gs.site_id,
