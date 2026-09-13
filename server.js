@@ -15,6 +15,7 @@ const nodemailer = require("nodemailer");
 const createRuntimeRouter = require("./runtime/routes");
 const createAnonymousInstallRouter =
   require("./runtime/anonymous-install.routes");
+const { createSystemStatusService } = require("./system-status");
 
 // ================================
 // TIMEZONE HELPERS
@@ -381,6 +382,12 @@ const vonageVoice = new Vonage({
 
 
 const app = express();
+const systemStatusService = createSystemStatusService({
+  pool,
+  env: process.env,
+  fetchImpl: fetch,
+  crypto,
+});
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -7425,7 +7432,7 @@ app.get("/settings/config", async (req, res) => {
 // ----------------------------------------------------------
 // SYSTEM STATUS
 // ----------------------------------------------------------
-app.get("/system/status", async (req, res) => {
+app.get("/system/status/legacy-internal", requireAuth, async (req, res) => {
 
   const startedAt = Date.now();
 
@@ -7617,6 +7624,58 @@ WHERE status IN (
 
   }
 
+});
+
+// Public endpoint intentionally exposes platform health only.
+app.get("/system/status", async (_req, res) => {
+  try {
+    return res.json(await systemStatusService.getPublicStatus());
+  } catch (err) {
+    console.error("Public system status error:", err);
+    return res.status(503).json({
+      overall_status: "offline",
+      scope: "platform",
+      checked_at: new Date().toISOString(),
+      message: err.message,
+    });
+  }
+});
+
+app.get("/system/status/tenant", requireAuth, async (req, res) => {
+  try {
+    return res.json(
+      await systemStatusService.getTenantStatus(req.auth.company_id)
+    );
+  } catch (err) {
+    console.error("Tenant system status error:", err);
+    return res.status(500).json({
+      overall_status: "offline",
+      scope: "tenant",
+      checked_at: new Date().toISOString(),
+      message: err.message,
+    });
+  }
+});
+
+app.get("/system/status/global", requireAuth, async (req, res) => {
+  if (req.auth.role !== "system_owner") {
+    return res.status(403).json({
+      status: "error",
+      message: "System owner access required",
+    });
+  }
+
+  try {
+    return res.json(await systemStatusService.getGlobalStatus());
+  } catch (err) {
+    console.error("Global system status error:", err);
+    return res.status(500).json({
+      overall_status: "offline",
+      scope: "global",
+      checked_at: new Date().toISOString(),
+      message: err.message,
+    });
+  }
 });
 
 // ----------------------------------------------------------
@@ -10015,12 +10074,13 @@ async function sendPushNotificationToGuard({
 }) {
   const subscriptions = await pool.query(
     `
-    SELECT ps.*
+    SELECT ps.*, s.company_id
     FROM push_subscriptions ps
     JOIN guard_sessions gs
       ON gs.id = ps.session_id
       AND gs.guard_id = ps.guard_id
       AND gs.site_id = ps.site_id
+    JOIN sites s ON s.id = ps.site_id
     WHERE ps.guard_id = $1
       AND ps.session_id = $2
       AND ps.site_id = $3
@@ -10083,6 +10143,29 @@ async function sendPushNotificationToGuard({
         error: err.message,
       });
     }
+  }
+
+  const resultsByCompany = new Map();
+  subscriptions.rows.forEach((sub, index) => {
+    const companyId = Number(sub.company_id);
+    const current = resultsByCompany.get(companyId) || {
+      sentCount: 0,
+      failedCount: 0,
+      error: null,
+    };
+    if (results[index]?.success) {
+      current.sentCount += 1;
+    } else {
+      current.failedCount += 1;
+      current.error = results[index]?.error || current.error;
+    }
+    resultsByCompany.set(companyId, current);
+  });
+
+  for (const [companyId, delivery] of resultsByCompany) {
+    await systemStatusService
+      .recordTenantPush(companyId, delivery)
+      .catch((err) => console.error("Push health telemetry error:", err));
   }
 
   return {
@@ -10204,6 +10287,10 @@ async function runPatrolPushScheduler() {
   }
 
   patrolPushSchedulerRunning = true;
+  const runStartedAt = Date.now();
+  let duePatrols = 0;
+  let delivered = 0;
+  let failed = 0;
 
   try {
     const dueSoonResult = await pool.query(
@@ -10353,8 +10440,10 @@ ORDER BY
       `
     );
 
+    duePatrols = dueSoonResult.rows.length;
+
     for (const patrol of dueSoonResult.rows) {
-      await sendScanOpenPushIfNeeded({
+      const deliveryResult = await sendScanOpenPushIfNeeded({
         guardId: Number(patrol.guard_id),
         sessionId: Number(patrol.session_id),
         siteId: Number(patrol.site_id),
@@ -10365,9 +10454,38 @@ ORDER BY
         siteName: patrol.site_name,
         scanAvailableFrom: patrol.scan_available_from,
       });
+      if (deliveryResult.status === "sent" || deliveryResult.status === "already_sent") {
+        delivered += 1;
+      } else {
+        failed += 1;
+      }
     }
+
+    await systemStatusService.recordPatrolSchedulerRun({
+      status: failed > 0 ? "degraded" : "operational",
+      metadata: {
+        due_patrols: duePatrols,
+        delivered,
+        failed,
+        duration_ms: Date.now() - runStartedAt,
+      },
+    });
   } catch (err) {
     console.error("Patrol push scheduler error:", err);
+    await systemStatusService
+      .recordPatrolSchedulerRun({
+        status: "offline",
+        error: err,
+        metadata: {
+          due_patrols: duePatrols,
+          delivered,
+          failed,
+          duration_ms: Date.now() - runStartedAt,
+        },
+      })
+      .catch((telemetryError) =>
+        console.error("Patrol scheduler telemetry error:", telemetryError)
+      );
   } finally {
     patrolPushSchedulerRunning = false;
   }
@@ -13662,6 +13780,8 @@ if (!historyResponse.ok) {
 });
 
 async function startBackend() {
+  await systemStatusService.initialize();
+
   const patrolIntegrity =
     await ensurePatrolOccurrenceIntegrity();
 
@@ -13673,6 +13793,7 @@ async function startBackend() {
 
   startScheduledShiftGenerator();
   startShiftDelayMonitor();
+  systemStatusService.startMonitor();
 
   setTimeout(runPatrolPushScheduler, 10000);
   setInterval(runPatrolPushScheduler, 60000);
