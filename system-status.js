@@ -78,9 +78,9 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         scope, company_id, service, status, last_checked_at,
         last_success_at, last_failure_at, last_error, response_time_ms, metadata, updated_at
       ) VALUES (
-        $1, $2, $3, $4, NOW(),
-        CASE WHEN $4 = 'operational' THEN NOW() ELSE NULL END,
-        CASE WHEN $4 IN ('degraded', 'offline') THEN NOW() ELSE NULL END,
+        $1, $2, $3, $4::varchar, NOW(),
+        CASE WHEN $4::varchar = 'operational'::varchar THEN NOW() ELSE NULL END,
+        CASE WHEN $4::varchar IN ('degraded'::varchar, 'offline'::varchar) THEN NOW() ELSE NULL END,
         $5, $6, $7::jsonb, NOW()
       )
       ON CONFLICT (scope, company_id, service) DO UPDATE SET
