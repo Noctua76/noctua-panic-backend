@@ -129,13 +129,20 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
 
   async function timedCheck(name, check, { ttlMs = 30000, configured = true, metadata = {} } = {}) {
     if (!configured) {
-      const result = { name, status: "not_configured", configured: false, ...metadata };
+      const result = {
+        name,
+        status: "not_configured",
+        configured: false,
+        last_checked_at: new Date().toISOString(),
+        ...metadata,
+      };
       await saveState({ scope: "platform", name, status: result.status, metadata: result });
       return result;
     }
     const cached = cache.get(name);
     if (cached && Date.now() - cached.cachedAt < ttlMs) return cached.value;
     const started = Date.now();
+    const checkedAt = new Date().toISOString();
     let value;
     try {
       const detail = (await check()) || {};
@@ -143,6 +150,9 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         name,
         status: detail.status || "operational",
         configured: true,
+        last_checked_at: checkedAt,
+        last_success_at: (detail.status || "operational") === "operational" ? checkedAt : undefined,
+        last_failure_at: ["degraded", "offline"].includes(detail.status) ? checkedAt : undefined,
         response_time_ms: Date.now() - started,
         ...metadata,
         ...detail,
@@ -152,6 +162,8 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         name,
         status: "offline",
         configured: true,
+        last_checked_at: checkedAt,
+        last_failure_at: checkedAt,
         response_time_ms: Date.now() - started,
         last_error: errorMessage(error),
         ...metadata,
