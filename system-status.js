@@ -501,14 +501,45 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
     const platform = await checkPlatform();
     const tenants = [];
     for (const company of companies.rows) {
-      const services = await getTenantServices(company.id);
-      tenants.push({
-        company_id: company.id,
-        company_name: company.name,
-        company_status: company.status,
-        ...summarize(services),
-        services,
-      });
+      try {
+        const services = await getTenantServices(company.id);
+        tenants.push({
+          company_id: company.id,
+          company_name: company.name,
+          company_status: company.status,
+          ...summarize(services),
+          services,
+        });
+      } catch (error) {
+        const tenantError = service(
+          "tenant_operational_data",
+          "Tenant Operational Data",
+          "degraded",
+          {
+            scope: "tenant",
+            severity: "medium",
+            last_checked_at: new Date().toISOString(),
+            last_failure_at: new Date().toISOString(),
+            last_error: errorMessage(error),
+          }
+        );
+
+        console.error(
+          `Tenant system status error for company ${company.id}:`,
+          error
+        );
+
+        tenants.push({
+          company_id: company.id,
+          company_name: company.name,
+          company_status: company.status,
+          overall_status: "degraded",
+          critical_issue: false,
+          counts: { degraded: 1 },
+          data_error: true,
+          services: [tenantError],
+        });
+      }
     }
     return {
       ...summarize([...platform, ...tenants.flatMap((tenant) => tenant.services)]),
