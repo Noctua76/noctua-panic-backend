@@ -16,6 +16,13 @@ const createRuntimeRouter = require("./runtime/routes");
 const createAnonymousInstallRouter =
   require("./runtime/anonymous-install.routes");
 const { createSystemStatusService } = require("./system-status");
+const { runMigrations } = require("./database/run-migrations");
+const { createCorsOptions } = require("./security/cors-policy");
+const { createAuthProtection } = require("./security/auth-protection");
+const {
+  attachCorrectionsToRows,
+  createPatrolCorrectionsRouter,
+} = require("./patrol/corrections");
 
 // ================================
 // TIMEZONE HELPERS
@@ -40,119 +47,48 @@ async function getCompanyTimezone(companyId) {
 }
 
 async function ensurePatrolOccurrenceIntegrity() {
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-    await client.query(
-      "LOCK TABLE patrol_logs IN SHARE ROW EXCLUSIVE MODE"
-    );
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS patrol_logs_duplicate_archive (
-        archive_id BIGSERIAL PRIMARY KEY,
-        original_patrol_log_id BIGINT NOT NULL UNIQUE,
-        patrol_log JSONB NOT NULL,
-        archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        archive_reason TEXT NOT NULL
-      )
-    `);
-
-    const archiveResult = await client.query(`
-      WITH ranked AS (
-        SELECT
-          id,
-          ROW_NUMBER() OVER (
-            PARTITION BY
-              schedule_id,
-              COALESCE(schedule_type, 'recurring'),
-              scheduled_at
-            ORDER BY patrol_time ASC NULLS LAST, id ASC
-          ) AS duplicate_rank
+  const result = await pool.query(`
+    WITH duplicate_occurrences AS (
+      SELECT COUNT(*)::int AS duplicate_groups
+      FROM (
+        SELECT 1
         FROM patrol_logs
         WHERE schedule_id IS NOT NULL
           AND scheduled_at IS NOT NULL
-      ),
-      duplicates AS (
-        SELECT id
-        FROM ranked
-        WHERE duplicate_rank > 1
-      )
-      INSERT INTO patrol_logs_duplicate_archive (
-        original_patrol_log_id,
-        patrol_log,
-        archived_at,
-        archive_reason
-      )
-      SELECT
-        pl.id,
-        TO_JSONB(pl),
-        NOW(),
-        'duplicate patrol occurrence removed before unique index'
-      FROM patrol_logs pl
-      INNER JOIN duplicates d
-        ON d.id = pl.id
-      ON CONFLICT (original_patrol_log_id) DO NOTHING
-    `);
-
-    const deleteResult = await client.query(`
-      WITH ranked AS (
-        SELECT
-          id,
-          ROW_NUMBER() OVER (
-            PARTITION BY
-              schedule_id,
-              COALESCE(schedule_type, 'recurring'),
-              scheduled_at
-            ORDER BY patrol_time ASC NULLS LAST, id ASC
-          ) AS duplicate_rank
-        FROM patrol_logs
-        WHERE schedule_id IS NOT NULL
-          AND scheduled_at IS NOT NULL
-      )
-      DELETE FROM patrol_logs pl
-      USING ranked
-      WHERE pl.id = ranked.id
-        AND ranked.duplicate_rank > 1
-    `);
-
-    await client.query(`
-      UPDATE patrol_logs
-      SET
-        completion_status = CASE
-          WHEN COALESCE(delay_minutes, 0) > 0
-            THEN 'completed_late'
-          ELSE 'completed'
-        END,
-        was_missed = false
+        GROUP BY
+          schedule_id,
+          COALESCE(schedule_type, 'recurring'),
+          scheduled_at
+        HAVING COUNT(*) > 1
+      ) duplicates
+    ),
+    legacy_outcomes AS (
+      SELECT COUNT(*)::int AS legacy_outcome_rows
+      FROM patrol_logs
       WHERE was_missed IS TRUE
         OR completion_status = 'missed_completed_late'
-    `);
+    )
+    SELECT duplicate_groups, legacy_outcome_rows
+    FROM duplicate_occurrences, legacy_outcomes
+  `);
 
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS
-        patrol_logs_occurrence_unique_idx
-      ON patrol_logs (
-        schedule_id,
-        (COALESCE(schedule_type, 'recurring')),
-        scheduled_at
-      )
-      WHERE schedule_id IS NOT NULL
-        AND scheduled_at IS NOT NULL
-    `);
+  const integrity = result.rows[0] || {
+    duplicate_groups: 0,
+    legacy_outcome_rows: 0,
+  };
 
-    await client.query("COMMIT");
-
-    return {
-      archivedDuplicates: archiveResult.rowCount,
-      removedDuplicates: deleteResult.rowCount,
-    };
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
+  if (integrity.duplicate_groups > 0 || integrity.legacy_outcome_rows > 0) {
+    console.warn(
+      "[PATROL INTEGRITY] Historical anomalies detected; records were not changed:",
+      integrity
+    );
   }
+
+  return {
+    readOnly: true,
+    duplicateGroups: integrity.duplicate_groups,
+    legacyOutcomeRows: integrity.legacy_outcome_rows,
+  };
 }
 
 
@@ -382,6 +318,8 @@ const vonageVoice = new Vonage({
 
 
 const app = express();
+app.set("trust proxy", 1);
+const authProtection = createAuthProtection({ pool });
 const systemStatusService = createSystemStatusService({
   pool,
   env: process.env,
@@ -404,7 +342,7 @@ const supabase = createClient(
     },
   }
 );
-app.use(cors());
+app.use(cors(createCorsOptions(process.env)));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(morgan('dev'));
@@ -1699,13 +1637,30 @@ function getTemporaryAccountStatus({
   revokedAt,
   startedAt,
   expiresAt,
+  activationDeadline,
+  expiryReason,
 }) {
-  if (!enabled || revokedAt) {
+  if (expiryReason === "activation_deadline_missed") {
+    return "auto_expired";
+  }
+
+  if (expiryReason === "manual_revoked" || !enabled || revokedAt) {
     return "revoked";
   }
 
-  if (isTemporaryAccessExpired(expiresAt)) {
+  if (
+    expiryReason === "access_period_completed" ||
+    isTemporaryAccessExpired(expiresAt)
+  ) {
     return "expired";
+  }
+
+  if (
+    !startedAt &&
+    activationDeadline &&
+    isTemporaryAccessExpired(activationDeadline)
+  ) {
+    return "auto_expired";
   }
 
   if (startedAt) {
@@ -1713,6 +1668,70 @@ function getTemporaryAccountStatus({
   }
 
   return "pending";
+}
+
+function getTemporaryExpiryMessage(expiryReason) {
+  if (expiryReason === "activation_deadline_missed") {
+    return "Preview access expired. These credentials were not activated within 14 days.";
+  }
+
+  if (expiryReason === "manual_revoked") {
+    return "Preview access was revoked by the system owner.";
+  }
+
+  return "Preview access expired. The access period has been completed.";
+}
+
+function getTemporaryStatusReason(status) {
+  switch (status) {
+    case "auto_expired":
+      return "Never activated within 14 days";
+    case "expired":
+      return "48-hour access period completed";
+    case "revoked":
+      return "Manually revoked by system owner";
+    case "active":
+      return "48-hour access period active";
+    default:
+      return "Available for first activation within 14 days";
+  }
+}
+
+async function refreshTemporaryAccessExpirations() {
+  for (const tableName of ["users", "guards"]) {
+    await pool.query(`
+      UPDATE ${tableName}
+      SET
+        temporary_access_expiry_reason = CASE
+          WHEN temporary_access_started_at IS NULL
+            AND temporary_access_activation_deadline <= NOW()
+          THEN 'activation_deadline_missed'
+          ELSE 'access_period_completed'
+        END,
+        temporary_access_auto_expired_at = COALESCE(
+          temporary_access_auto_expired_at,
+          CASE
+            WHEN temporary_access_started_at IS NULL
+            THEN temporary_access_activation_deadline
+            ELSE access_expires_at
+          END
+        )
+      WHERE access_mode = 'read_only'
+        AND temporary_access_expiry_reason IS NULL
+        AND temporary_access_revoked_at IS NULL
+        AND (
+          (
+            temporary_access_started_at IS NULL
+            AND temporary_access_activation_deadline IS NOT NULL
+            AND temporary_access_activation_deadline <= NOW()
+          )
+          OR (
+            access_expires_at IS NOT NULL
+            AND access_expires_at <= NOW()
+          )
+        )
+    `);
+  }
 }
 
 async function closeExpiredTemporaryAdminSessions({
@@ -1845,6 +1864,8 @@ async function activateTemporaryUserAccess(user) {
     return user;
   }
 
+  await refreshTemporaryAccessExpirations();
+
   const result = await pool.query(
     `
     UPDATE users
@@ -1859,19 +1880,29 @@ async function activateTemporaryUserAccess(user) {
           + temporary_access_duration_hours * INTERVAL '1 hour'
       )
     WHERE id = $1
+      AND temporary_access_expiry_reason IS NULL
     RETURNING
       access_mode,
       temporary_access_duration_hours,
       temporary_access_started_at,
-      access_expires_at
+      access_expires_at,
+      temporary_access_activation_deadline,
+      temporary_access_expiry_reason,
+      temporary_access_auto_expired_at
     `,
     [user.id]
   );
 
-  return {
-    ...user,
-    ...result.rows[0],
-  };
+  if (result.rows.length > 0) {
+    return { ...user, ...result.rows[0] };
+  }
+
+  const current = await pool.query(
+    `SELECT * FROM users WHERE id = $1 LIMIT 1`,
+    [user.id]
+  );
+
+  return { ...user, ...current.rows[0] };
 }
 
 async function activateTemporaryGuardAccess(guard) {
@@ -1881,6 +1912,8 @@ async function activateTemporaryGuardAccess(guard) {
   ) {
     return guard;
   }
+
+  await refreshTemporaryAccessExpirations();
 
   const result = await pool.query(
     `
@@ -1896,19 +1929,60 @@ async function activateTemporaryGuardAccess(guard) {
           + temporary_access_duration_hours * INTERVAL '1 hour'
       )
     WHERE id = $1
+      AND temporary_access_expiry_reason IS NULL
     RETURNING
       access_mode,
       temporary_access_duration_hours,
       temporary_access_started_at,
-      access_expires_at
+      access_expires_at,
+      temporary_access_activation_deadline,
+      temporary_access_expiry_reason,
+      temporary_access_auto_expired_at
     `,
     [guard.id]
   );
 
-  return {
-    ...guard,
-    ...result.rows[0],
-  };
+  if (result.rows.length > 0) {
+    return { ...guard, ...result.rows[0] };
+  }
+
+  const current = await pool.query(
+    `SELECT * FROM guards WHERE id = $1 LIMIT 1`,
+    [guard.id]
+  );
+
+  return { ...guard, ...current.rows[0] };
+}
+
+const INVALID_ACCOUNT_PASSWORD_HASH =
+  "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+
+function sendAuthenticationThrottle(res, throttle) {
+  res.setHeader("Retry-After", String(throttle.retryAfterSeconds));
+  return res.status(429).json({
+    status: "error",
+    code: "AUTH_THROTTLED",
+    message: "Too many login attempts. Try again later.",
+    retry_after_seconds: throttle.retryAfterSeconds,
+  });
+}
+
+async function rejectInvalidCredentials(req, res, surface, username, accountId) {
+  const throttle = await authProtection.recordFailure(
+    req,
+    surface,
+    username,
+    accountId
+  );
+
+  if (throttle.throttled) {
+    return sendAuthenticationThrottle(res, throttle);
+  }
+
+  return res.status(401).json({
+    status: "error",
+    message: "Invalid username or password.",
+  });
 }
 
 app.post("/auth/login", async (req, res) => {
@@ -1919,6 +1993,18 @@ app.post("/auth/login", async (req, res) => {
       return res.status(400).json({
         status: "error",
         message: "Username and password are required",
+      });
+    }
+
+    const existingThrottle = await authProtection.getThrottle(
+      req,
+      "dashboard",
+      username
+    );
+
+    if (existingThrottle) {
+      return sendAuthenticationThrottle(res, {
+        retryAfterSeconds: existingThrottle.retry_after_seconds,
       });
     }
 
@@ -1938,6 +2024,9 @@ u.access_mode,
 u.temporary_access_duration_hours,
 u.temporary_access_started_at,
 u.access_expires_at,
+u.temporary_access_activation_deadline,
+u.temporary_access_expiry_reason,
+u.temporary_access_auto_expired_at,
 c.name AS company_name,
         c.status AS company_status,
         c.tenant_type
@@ -1950,13 +2039,39 @@ c.name AS company_name,
     );
 
     if (userResult.rows.length === 0) {
-      return res.status(401).json({
-        status: "error",
-        message: "Invalid credentials",
-      });
+      await bcrypt.compare(password, INVALID_ACCOUNT_PASSWORD_HASH);
+      return rejectInvalidCredentials(
+        req,
+        res,
+        "dashboard",
+        username,
+        null
+      );
     }
 
     let user = userResult.rows[0];
+
+    const validPassword = await bcrypt.compare(
+      password,
+      user.password_hash
+    );
+
+    if (!validPassword) {
+      return rejectInvalidCredentials(
+        req,
+        res,
+        "dashboard",
+        username,
+        user.id
+      );
+    }
+
+    await authProtection.recordSuccess(
+      req,
+      "dashboard",
+      username,
+      user.id
+    );
 
     if (user.status !== "active") {
       return res.status(403).json({
@@ -1989,21 +2104,12 @@ c.name AS company_name,
       });
     }
 
-    const validPassword = await bcrypt.compare(
-      password,
-      user.password_hash
-    );
-
-    if (!validPassword) {
-      return res.status(401).json({
-        status: "error",
-        message: "Invalid credentials",
-      });
-    }
-
     user = await activateTemporaryUserAccess(user);
 
-if (isTemporaryAccessExpired(user.access_expires_at)) {
+if (
+  user.temporary_access_expiry_reason ||
+  isTemporaryAccessExpired(user.access_expires_at)
+) {
   await pool.query(
     `
     UPDATE admin_sessions AS ads
@@ -2040,7 +2146,12 @@ if (isTemporaryAccessExpired(user.access_expires_at)) {
   return res.status(403).json({
     status: "error",
     code: "TEMPORARY_ACCESS_EXPIRED",
-    message: "Temporary access has expired",
+    expiry_reason:
+      user.temporary_access_expiry_reason ||
+      "access_period_completed",
+    message: getTemporaryExpiryMessage(
+      user.temporary_access_expiry_reason
+    ),
   });
 }
 
@@ -2119,6 +2230,10 @@ if (isTemporaryAccessExpired(user.access_expires_at)) {
 temporary_access_started_at:
   user.temporary_access_started_at,
 access_expires_at: user.access_expires_at,
+temporary_access_activation_deadline:
+  user.temporary_access_activation_deadline,
+temporary_access_expiry_reason:
+  user.temporary_access_expiry_reason,
       },
     });
   } catch (err) {
@@ -2216,6 +2331,7 @@ u.company_id,
 u.access_mode,
 u.temporary_access_started_at,
 u.access_expires_at,
+u.temporary_access_expiry_reason,
 
 c.name AS company_name,
         c.status AS company_status,
@@ -2251,7 +2367,31 @@ c.name AS company_name,
       });
     }
 
-    if (isTemporaryAccessExpired(auth.access_expires_at)) {
+    if (
+      auth.temporary_access_expiry_reason ||
+      isTemporaryAccessExpired(auth.access_expires_at)
+    ) {
+  if (
+    !auth.temporary_access_expiry_reason &&
+    isTemporaryAccessExpired(auth.access_expires_at)
+  ) {
+    await pool.query(
+      `
+      UPDATE users
+      SET
+        temporary_access_expiry_reason = 'access_period_completed',
+        temporary_access_auto_expired_at = COALESCE(
+          temporary_access_auto_expired_at,
+          access_expires_at
+        )
+      WHERE id = $1
+        AND access_mode = $2
+        AND temporary_access_expiry_reason IS NULL
+      `,
+      [auth.user_id, ACCESS_MODE_READ_ONLY]
+    );
+  }
+
   await pool.query(
     `
     UPDATE admin_sessions AS ads
@@ -2288,7 +2428,12 @@ c.name AS company_name,
   return res.status(403).json({
     status: "error",
     code: "TEMPORARY_ACCESS_EXPIRED",
-    message: "Temporary access has expired",
+    expiry_reason:
+      auth.temporary_access_expiry_reason ||
+      "access_period_completed",
+    message: getTemporaryExpiryMessage(
+      auth.temporary_access_expiry_reason
+    ),
   });
 }
 
@@ -2327,6 +2472,8 @@ access_mode: auth.access_mode,
 temporary_access_started_at:
   auth.temporary_access_started_at,
 access_expires_at: auth.access_expires_at,
+temporary_access_expiry_reason:
+  auth.temporary_access_expiry_reason,
 company_id: auth.company_id,
       company_name: auth.company_name,
       company_status: auth.company_status,
@@ -2383,7 +2530,8 @@ async function requireGuardAuth(req, res, next) {
 g.role,
 g.access_mode,
 g.temporary_access_started_at,
-g.access_expires_at
+g.access_expires_at,
+g.temporary_access_expiry_reason
   FROM guard_sessions gs
   JOIN guards g
     ON g.id = gs.guard_id
@@ -2413,10 +2561,30 @@ g.access_expires_at
     const guardAuth = result.rows[0];
 
 if (
-  isTemporaryAccessExpired(
-    guardAuth.access_expires_at
-  )
+  guardAuth.temporary_access_expiry_reason ||
+  isTemporaryAccessExpired(guardAuth.access_expires_at)
 ) {
+  if (
+    !guardAuth.temporary_access_expiry_reason &&
+    isTemporaryAccessExpired(guardAuth.access_expires_at)
+  ) {
+    await pool.query(
+      `
+      UPDATE guards
+      SET
+        temporary_access_expiry_reason = 'access_period_completed',
+        temporary_access_auto_expired_at = COALESCE(
+          temporary_access_auto_expired_at,
+          access_expires_at
+        )
+      WHERE id = $1
+        AND access_mode = $2
+        AND temporary_access_expiry_reason IS NULL
+      `,
+      [guardAuth.guard_id, ACCESS_MODE_READ_ONLY]
+    );
+  }
+
   await pool.query(
     `
     UPDATE guard_sessions
@@ -2433,7 +2601,12 @@ if (
   return res.status(403).json({
     status: "error",
     code: "TEMPORARY_ACCESS_EXPIRED",
-    message: "Temporary access has expired",
+    expiry_reason:
+      guardAuth.temporary_access_expiry_reason ||
+      "access_period_completed",
+    message: getTemporaryExpiryMessage(
+      guardAuth.temporary_access_expiry_reason
+    ),
   });
 }
 
@@ -2489,6 +2662,8 @@ app.get(
         });
       }
 
+      await refreshTemporaryAccessExpirations();
+
       const [usersResult, guardsResult] =
         await Promise.all([
           pool.query(
@@ -2503,6 +2678,9 @@ app.get(
               u.temporary_access_duration_hours,
               u.temporary_access_started_at,
               u.access_expires_at,
+              u.temporary_access_activation_deadline,
+              u.temporary_access_expiry_reason,
+              u.temporary_access_auto_expired_at,
               u.temporary_access_revoked_at,
               c.name AS company_name
             FROM users u
@@ -2525,6 +2703,9 @@ app.get(
               g.temporary_access_group_id,
               g.temporary_access_started_at,
               g.access_expires_at,
+              g.temporary_access_activation_deadline,
+              g.temporary_access_expiry_reason,
+              g.temporary_access_auto_expired_at,
               g.temporary_access_revoked_at,
               s.name AS site_name
             FROM guards g
@@ -2559,6 +2740,10 @@ app.get(
               startedAt:
                 user.temporary_access_started_at,
               expiresAt: user.access_expires_at,
+              activationDeadline:
+                user.temporary_access_activation_deadline,
+              expiryReason:
+                user.temporary_access_expiry_reason,
             });
 
           const webAppStatus = guard
@@ -2569,6 +2754,10 @@ app.get(
                 startedAt:
                   guard.temporary_access_started_at,
                 expiresAt: guard.access_expires_at,
+                activationDeadline:
+                  guard.temporary_access_activation_deadline,
+                expiryReason:
+                  guard.temporary_access_expiry_reason,
               })
             : "revoked";
 
@@ -2606,6 +2795,14 @@ app.get(
               started_at:
                 user.temporary_access_started_at,
               expires_at: user.access_expires_at,
+              activation_deadline:
+                user.temporary_access_activation_deadline,
+              expiry_reason:
+                user.temporary_access_expiry_reason,
+              auto_expired_at:
+                user.temporary_access_auto_expired_at,
+              status_reason:
+                getTemporaryStatusReason(dashboardStatus),
               status: dashboardStatus,
             },
 
@@ -2617,6 +2814,14 @@ app.get(
                     guard.temporary_access_started_at,
                   expires_at:
                     guard.access_expires_at,
+                  activation_deadline:
+                    guard.temporary_access_activation_deadline,
+                  expiry_reason:
+                    guard.temporary_access_expiry_reason,
+                  auto_expired_at:
+                    guard.temporary_access_auto_expired_at,
+                  status_reason:
+                    getTemporaryStatusReason(webAppStatus),
                   status: webAppStatus,
                 }
               : null,
@@ -2786,6 +2991,7 @@ app.post(
           temporary_access_duration_hours,
           temporary_access_group_id,
           temporary_access_label,
+          temporary_access_activation_deadline,
           created_at
         )
         VALUES (
@@ -2800,6 +3006,7 @@ app.post(
           $6,
           $7,
           $8,
+          NOW() + INTERVAL '14 days',
           NOW()
         )
         RETURNING
@@ -2831,6 +3038,7 @@ app.post(
           temporary_access_duration_hours,
           temporary_access_group_id,
           temporary_access_label,
+          temporary_access_activation_deadline,
           created_at
         )
         VALUES (
@@ -2844,6 +3052,7 @@ app.post(
           $6,
           $7,
           $8,
+          NOW() + INTERVAL '14 days',
           NOW()
         )
         RETURNING
@@ -2869,6 +3078,7 @@ app.post(
         message:
           "Temporary preview access created",
         starts_on_first_login: true,
+        activation_deadline_days: 14,
         group_id: groupId,
         label,
         duration_hours: durationHours,
@@ -2965,6 +3175,7 @@ app.post(
         SET
           status = 'inactive',
           temporary_access_revoked_at = NOW(),
+          temporary_access_expiry_reason = 'manual_revoked',
           updated_at = NOW()
         WHERE temporary_access_group_id = $1
           AND access_mode = $2
@@ -2978,7 +3189,8 @@ app.post(
         UPDATE guards
         SET
           active = false,
-          temporary_access_revoked_at = NOW()
+          temporary_access_revoked_at = NOW(),
+          temporary_access_expiry_reason = 'manual_revoked'
         WHERE temporary_access_group_id = $1
           AND access_mode = $2
         RETURNING id
@@ -4012,21 +4224,36 @@ app.post("/guard/login", async (req, res) => {
       });
     }
 
+    const existingThrottle = await authProtection.getThrottle(
+      req,
+      "guard",
+      username
+    );
+
+    if (existingThrottle) {
+      return sendAuthenticationThrottle(res, {
+        retryAfterSeconds: existingThrottle.retry_after_seconds,
+      });
+    }
+
     const result = await pool.query(
       `
       SELECT *
       FROM guards
       WHERE username = $1
-        AND active = true
       `,
       [username]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({
-        status: "error",
-        message: "Invalid credentials"
-      });
+      await bcrypt.compare(password, INVALID_ACCOUNT_PASSWORD_HASH);
+      return rejectInvalidCredentials(
+        req,
+        res,
+        "guard",
+        username,
+        null
+      );
     }
 
     let guard = result.rows[0];
@@ -4041,18 +4268,34 @@ app.post("/guard/login", async (req, res) => {
     }
 
     if (!validPassword) {
-      return res.status(401).json({
+      return rejectInvalidCredentials(
+        req,
+        res,
+        "guard",
+        username,
+        guard.id
+      );
+    }
+
+    await authProtection.recordSuccess(
+      req,
+      "guard",
+      username,
+      guard.id
+    );
+
+    if (guard.active !== true) {
+      return res.status(403).json({
         status: "error",
-        message: "Invalid credentials"
+        message: "Guard account is inactive",
       });
     }
 
     guard = await activateTemporaryGuardAccess(guard);
 
 if (
-  isTemporaryAccessExpired(
-    guard.access_expires_at
-  )
+  guard.temporary_access_expiry_reason ||
+  isTemporaryAccessExpired(guard.access_expires_at)
 ) {
   await pool.query(
     `
@@ -4070,7 +4313,12 @@ if (
   return res.status(403).json({
     status: "error",
     code: "TEMPORARY_ACCESS_EXPIRED",
-    message: "Temporary access has expired",
+    expiry_reason:
+      guard.temporary_access_expiry_reason ||
+      "access_period_completed",
+    message: getTemporaryExpiryMessage(
+      guard.temporary_access_expiry_reason
+    ),
   });
 }
 
@@ -4198,6 +4446,11 @@ access_mode: guard.access_mode,
 temporary_access_started_at:
   guard.temporary_access_started_at,
 access_expires_at: guard.access_expires_at
+,
+temporary_access_activation_deadline:
+  guard.temporary_access_activation_deadline,
+temporary_access_expiry_reason:
+  guard.temporary_access_expiry_reason
       },
       session: sessionResult.rows[0]
     });
@@ -7625,6 +7878,11 @@ WHERE status IN (
   }
 
 });
+
+app.use(
+  "/admin/patrol-corrections",
+  createPatrolCorrectionsRouter({ pool, requireAuth })
+);
 
 // Public endpoint intentionally exposes platform health only.
 app.get("/system/status", async (_req, res) => {
@@ -12500,7 +12758,14 @@ WHERE id = ANY($1::int[])
   }, {});
 }
 
-const historyWithShift = result.rows.map((row) => {
+const historyWithCorrections = await attachCorrectionsToRows(
+  pool,
+  result.rows,
+  (row) => row.id,
+  () => "MISSED"
+);
+
+const historyWithShift = historyWithCorrections.map((row) => {
   const site = sitesById[row.site_id];
 
   return {
@@ -13352,7 +13617,18 @@ app.get(
         }, {});
       }
 
-      const historyWithShift = result.rows.map((row) => {
+      const historyWithCorrections = await attachCorrectionsToRows(
+        pool,
+        result.rows,
+        (row) => `patrol-log-${row.id}`,
+        (row) =>
+          row.completion_status === "completed_late" ||
+          Number(row.delay_minutes || 0) > 0
+            ? "COMPLETED_LATE"
+            : "COMPLETED"
+      );
+
+      const historyWithShift = historyWithCorrections.map((row) => {
         const site = sitesById[row.site_id];
 
         let displayStatus = "completed";
@@ -13780,6 +14056,8 @@ if (!historyResponse.ok) {
 });
 
 async function startBackend() {
+  await runMigrations(pool);
+  await refreshTemporaryAccessExpirations();
   await systemStatusService.initialize();
 
   const patrolIntegrity =
@@ -13794,6 +14072,12 @@ async function startBackend() {
   startScheduledShiftGenerator();
   startShiftDelayMonitor();
   systemStatusService.startMonitor();
+
+  setInterval(() => {
+    refreshTemporaryAccessExpirations().catch((error) => {
+      console.error("Temporary access expiration refresh failed:", error);
+    });
+  }, 5 * 60 * 1000);
 
   setTimeout(runPatrolPushScheduler, 10000);
   setInterval(runPatrolPushScheduler, 60000);
