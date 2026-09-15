@@ -7460,6 +7460,100 @@ WHERE
 // ----------------------------------------------------------
 // DASHBOARD TEST ALERT
 // ----------------------------------------------------------
+const ALERT_SUCCESS_STATUSES = new Set(["delivered", "completed"]);
+const ALERT_FAILURE_STATUSES = new Set([
+  "failed", "rejected", "busy", "unanswered", "cancelled",
+  "timeout", "expired", "undeliverable",
+]);
+
+function summarizeFinalNotifications(notifications = []) {
+  const attempted = notifications.length;
+  const successful = notifications.filter((item) =>
+    ALERT_SUCCESS_STATUSES.has(String(item.status || "").toLowerCase())
+  ).length;
+  const failed = notifications.filter((item) =>
+    ALERT_FAILURE_STATUSES.has(String(item.status || "").toLowerCase())
+  ).length;
+  const pending = Math.max(0, attempted - successful - failed);
+
+  let status = "not_attempted";
+  if (attempted > 0 && pending > 0) status = failed > 0 ? "partial_failure" : "pending";
+  else if (attempted > 0 && failed === attempted) status = "failed";
+  else if (failed > 0) status = "partial_failure";
+  else if (attempted > 0) status = "completed";
+
+  return { attempted, successful, pending, failed, status };
+}
+
+async function getLatestTestAlertResult(companyId) {
+  const lastTestResult = await pool.query(
+    `
+    SELECT created_at, event_payload
+    FROM alert_events
+    WHERE company_id = $1
+      AND event_type = 'test_alert'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+    `,
+    [companyId]
+  );
+  const lastRow = lastTestResult.rows[0] || null;
+  const savedResult = lastRow?.event_payload?.result || null;
+  if (!savedResult) return null;
+
+  const result = JSON.parse(JSON.stringify(savedResult));
+  const smsNotifications = result.notifications?.sms || [];
+  const voiceNotifications = result.notifications?.voice || [];
+
+  await Promise.all([
+    ...smsNotifications.map(async (notification) => {
+      if (!notification.provider_message_id) return;
+      const receipt = await pool.query(
+        `
+        SELECT status, created_at, event_payload
+        FROM alert_events
+        WHERE event_type = 'SMS_DELIVERY_RECEIPT'
+          AND provider_message_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        `,
+        [notification.provider_message_id]
+      );
+      const row = receipt.rows[0];
+      if (!row) return;
+      notification.status = row.status;
+      notification.final_status_at = row.created_at;
+      notification.error_message = row.event_payload?.error || null;
+    }),
+    ...voiceNotifications.map(async (notification) => {
+      if (!notification.provider_call_uuid) return;
+      const receipt = await pool.query(
+        `
+        SELECT status, created_at, event_payload
+        FROM alert_events
+        WHERE event_type = 'VOICE_WEBHOOK'
+          AND provider_call_uuid = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        `,
+        [notification.provider_call_uuid]
+      );
+      const row = receipt.rows[0];
+      if (!row) return;
+      notification.status = row.status;
+      notification.final_status_at = row.created_at;
+      notification.error_message = row.event_payload?.error || null;
+    }),
+  ]);
+
+  result.sms = { ...result.sms, ...summarizeFinalNotifications(smsNotifications) };
+  result.voice = { ...result.voice, ...summarizeFinalNotifications(voiceNotifications) };
+  const allNotifications = [...smsNotifications, ...voiceNotifications];
+  result.status = summarizeFinalNotifications(allNotifications).status;
+  result.tested_at = result.tested_at || lastRow.created_at;
+  return result;
+}
+
 app.post("/alerts/test", requireAuth, async (req, res) => {
   try {
     const text =
@@ -7495,19 +7589,7 @@ app.get("/settings/alert-configuration", requireAuth, async (req, res) => {
       req.auth.company_id
     );
     const recipients = resolution.recipients;
-    const lastTestResult = await pool.query(
-      `
-      SELECT created_at, status, event_payload
-      FROM alert_events
-      WHERE company_id = $1
-        AND event_type = 'test_alert'
-      ORDER BY created_at DESC, id DESC
-      LIMIT 1
-      `,
-      [req.auth.company_id]
-    );
-    const lastRow = lastTestResult.rows[0] || null;
-    const savedResult = lastRow?.event_payload?.result || null;
+    const savedResult = await getLatestTestAlertResult(req.auth.company_id);
 
     return res.json({
       status: "ok",
@@ -7522,9 +7604,7 @@ app.get("/settings/alert-configuration", requireAuth, async (req, res) => {
         enabled_count: recipients.filter((item) => item.voice_enabled).length,
       },
       escalation: { order: "SMS and Voice in parallel" },
-      last_test: savedResult
-        ? { ...savedResult, tested_at: savedResult.tested_at || lastRow.created_at }
-        : null,
+      last_test: savedResult,
     });
   } catch (err) {
     console.error("Alert configuration error:", err);
@@ -7992,8 +8072,73 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
 
 
 // ----------------------------------------------------------
-// Vonage Voice Webhooks (match Vonage Application URLs)
+// Vonage delivery webhooks
 // ----------------------------------------------------------
+
+async function smsDeliveryHook(req, res) {
+  try {
+    const payload = { ...(req.query || {}), ...(req.body || {}) };
+    const messageId = payload.messageId || payload["message-id"] || null;
+    const deliveryStatus = String(payload.status || "unknown").toLowerCase();
+
+    if (!messageId) return res.status(200).send("ok");
+
+    const submittedLookup = await pool.query(
+      `
+      SELECT company_id, mode, incident_id, site_id, guard_id, recipient_phone
+      FROM alert_events
+      WHERE provider_message_id = $1
+        AND event_type = 'SMS_NOTIFICATION_RESULT'
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [messageId]
+    );
+    const submitted = submittedLookup.rows[0] || {};
+
+    await ensureAlertEventsTable();
+    await pool.query(
+      `
+      INSERT INTO alert_events (
+        event_type, mode, company_id, source, status,
+        incident_id, site_id, guard_id, recipient_phone,
+        provider, provider_message_id, event_payload
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
+      `,
+      [
+        "SMS_DELIVERY_RECEIPT",
+        submitted.mode || null,
+        submitted.company_id || null,
+        "vonage",
+        deliveryStatus,
+        submitted.incident_id || null,
+        submitted.site_id || null,
+        submitted.guard_id || null,
+        submitted.recipient_phone || payload.msisdn || payload.to || null,
+        "vonage",
+        messageId,
+        JSON.stringify({
+          status: deliveryStatus,
+          error: payload["err-code"] && payload["err-code"] !== "0"
+            ? `Vonage delivery error ${payload["err-code"]}`
+            : null,
+          timestamp: payload["message-timestamp"] || payload.timestamp || null,
+          network_code: payload["network-code"] || null,
+        }),
+      ]
+    );
+
+    return res.status(200).send("ok");
+  } catch (err) {
+    console.error("Vonage SMS delivery webhook error:", err);
+    return res.status(200).send("ok");
+  }
+}
+
+app.get("/webhooks/sms-delivery", smsDeliveryHook);
+app.post("/webhooks/sms-delivery", smsDeliveryHook);
+
+// Vonage Voice Webhooks (match Vonage Application URLs)
 
 function answerNcco(req, res) {
   console.log("VONAGE ANSWER HIT:", { method: req.method, query: req.query, body: req.body });
@@ -8023,7 +8168,8 @@ async function eventHook(req, res) {
         mode,
         incident_id,
         site_id,
-        guard_id
+        guard_id,
+        recipient_phone
       FROM alert_events
       WHERE provider_call_uuid = $1
         AND event_type = 'VOICE_CALL_SUBMITTED'
@@ -8052,13 +8198,14 @@ async function eventHook(req, res) {
         incident_id,
         site_id,
         guard_id,
+        recipient_phone,
         voice_attempted,
         voice_status,
         provider,
         provider_call_uuid,
         event_payload
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       `,
       [
         "VOICE_WEBHOOK",
@@ -8070,6 +8217,7 @@ async function eventHook(req, res) {
         incidentInfo.incident_id || null,
         incidentInfo.site_id || null,
         incidentInfo.guard_id || null,
+        incidentInfo.recipient_phone || null,
 
         1,
         callStatus,
@@ -8077,6 +8225,7 @@ async function eventHook(req, res) {
         callUuid,
         JSON.stringify({
           status: callStatus,
+          error: payload.reason || payload.detail || null,
           direction: payload.direction || null,
           timestamp: payload.timestamp || null,
           duration: payload.duration || null,

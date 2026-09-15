@@ -30,12 +30,17 @@ function parseSmsProviderResponse(phone, data, httpOk = true) {
 function createVonageProvider({ env = process.env, fetchImpl = fetch, voiceClient }) {
   async function sendSms(phone, text) {
     try {
+      const baseUrl = (
+        env.PUBLIC_BACKEND_URL ||
+        "https://noctua-panic-backend-production.up.railway.app"
+      ).replace(/\/+$/, "");
       const params = new URLSearchParams();
       params.append("api_key", env.VONAGE_API_KEY || "");
       params.append("api_secret", env.VONAGE_API_SECRET || "");
       params.append("to", phone);
       params.append("from", env.VONAGE_SMS_FROM || "AegisLink");
       params.append("text", text);
+      params.append("callback", `${baseUrl}/webhooks/sms-delivery`);
 
       const response = await fetchImpl("https://rest.nexmo.com/sms/json", {
         method: "POST",
