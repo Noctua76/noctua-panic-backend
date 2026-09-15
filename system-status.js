@@ -193,6 +193,54 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
     try { return JSON.parse(text); } catch { return { body: text.slice(0, 300) }; }
   }
 
+  async function notificationOperationalState(channel) {
+    const result = await pool.query(
+      channel === "sms"
+        ? `
+          SELECT
+            MAX(created_at) FILTER (
+              WHERE event_type = 'SMS_NOTIFICATION_RESULT' AND status = 'submitted'
+            ) AS last_success,
+            MAX(created_at) FILTER (
+              WHERE event_type = 'SMS_NOTIFICATION_RESULT' AND status = 'failed'
+            ) AS last_failure,
+            (ARRAY_AGG(event_payload->>'error' ORDER BY created_at DESC)
+              FILTER (WHERE event_type = 'SMS_NOTIFICATION_RESULT' AND status = 'failed'))[1] AS last_error
+          FROM alert_events
+        `
+        : `
+          SELECT
+            MAX(created_at) FILTER (
+              WHERE event_type IN ('VOICE_CALL_SUBMITTED','VOICE_WEBHOOK')
+                AND status IN ('submitted','answered','completed')
+            ) AS last_success,
+            MAX(created_at) FILTER (
+              WHERE event_type IN ('VOICE_CALL_FAILED','VOICE_WEBHOOK')
+                AND status IN ('failed','rejected','busy','unanswered','cancelled','timeout')
+            ) AS last_failure,
+            (ARRAY_AGG(event_payload->>'error' ORDER BY created_at DESC)
+              FILTER (
+                WHERE event_type IN ('VOICE_CALL_FAILED','VOICE_WEBHOOK')
+                  AND status IN ('failed','rejected','busy','unanswered','cancelled','timeout')
+              ))[1] AS last_error
+          FROM alert_events
+        `
+    );
+    const row = result.rows[0] || {};
+    const lastSuccess = row.last_success ? new Date(row.last_success) : null;
+    const lastFailure = row.last_failure ? new Date(row.last_failure) : null;
+    let status = "unknown";
+    if (lastFailure && (!lastSuccess || lastFailure >= lastSuccess)) status = "degraded";
+    else if (lastSuccess) status = "operational";
+
+    return {
+      status,
+      last_success_at: iso(row.last_success),
+      last_failure_at: iso(row.last_failure),
+      last_error: row.last_error || null,
+    };
+  }
+
   async function checkPlatform() {
     const smsConfigured = Boolean(env.VONAGE_API_KEY && env.VONAGE_API_SECRET && env.VONAGE_SMS_FROM);
     const voiceConfigured = Boolean(env.VONAGE_APPLICATION_ID && env.VONAGE_PRIVATE_KEY && env.VONAGE_FROM_NUMBER);
@@ -219,7 +267,12 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         const query = new URLSearchParams({ api_key: env.VONAGE_API_KEY, api_secret: env.VONAGE_API_SECRET });
         const data = await fetchJson(`https://rest.nexmo.com/account/get-balance?${query.toString()}`);
         if (data.value === undefined) throw new Error("Vonage account response was invalid");
-        return { status: "operational", provider: "Vonage", account_reachable: true };
+        return {
+          ...(await notificationOperationalState("sms")),
+          provider: "Vonage",
+          account_reachable: true,
+          configured: true,
+        };
       }, { ttlMs: 180000, configured: smsConfigured }),
       timedCheck("voice_calls", async () => {
         crypto.createPrivateKey((env.VONAGE_PRIVATE_KEY || "").replace(/\\n/g, "\n"));
@@ -227,7 +280,12 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         if (env.VONAGE_API_KEY && env.VONAGE_API_SECRET) {
           await fetchJson(`https://rest.nexmo.com/account/get-balance?${query.toString()}`);
         }
-        return { status: "operational", provider: "Vonage", private_key_valid: true };
+        return {
+          ...(await notificationOperationalState("voice")),
+          provider: "Vonage",
+          private_key_valid: true,
+          configured: true,
+        };
       }, { ttlMs: 180000, configured: voiceConfigured }),
       timedCheck("email_delivery", async () => {
         const data = await fetchJson("https://api.postmarkapp.com/server", {
@@ -279,13 +337,21 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
     const [sms, voice, email, push, patrol, patrolMissed, incidents, tenantState, platformState] = await Promise.all([
       pool.query(`
         SELECT
-          MAX(ae.created_at) FILTER (WHERE COALESCE(ae.sms_sent, 0) > 0) AS last_success,
-          MAX(ae.created_at) FILTER (WHERE COALESCE(ae.sms_failed, 0) > 0 OR ae.status = 'failed') AS last_failure,
+          MAX(ae.created_at) FILTER (
+            WHERE GREATEST(COALESCE(ae.sms_submitted, 0), COALESCE(ae.sms_sent, 0)) > 0
+               OR (ae.event_type = 'SMS_NOTIFICATION_RESULT' AND ae.status = 'submitted')
+          ) AS last_success,
+          MAX(ae.created_at) FILTER (
+            WHERE COALESCE(ae.sms_failed, 0) > 0
+               OR (ae.event_type = 'SMS_NOTIFICATION_RESULT' AND ae.status = 'failed')
+          ) AS last_failure,
           (ARRAY_AGG(COALESCE(ae.event_payload->>'error', ae.status) ORDER BY ae.created_at DESC)
-            FILTER (WHERE COALESCE(ae.sms_failed, 0) > 0 OR ae.status = 'failed'))[1] AS last_error
+            FILTER (
+              WHERE COALESCE(ae.sms_failed, 0) > 0
+                 OR (ae.event_type = 'SMS_NOTIFICATION_RESULT' AND ae.status = 'failed')
+            ))[1] AS last_error
         FROM alert_events ae
-        JOIN sites s ON s.id = ae.site_id
-        WHERE s.company_id = $1
+        WHERE ae.company_id = $1
       `, [companyId]),
       pool.query(`
         SELECT
@@ -294,8 +360,8 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
           (ARRAY_AGG(COALESCE(ae.event_payload->>'error', ae.status) ORDER BY ae.created_at DESC)
             FILTER (WHERE ae.status IN ('failed','rejected','busy','unanswered','cancelled','timeout')))[1] AS last_error
         FROM alert_events ae
-        JOIN sites s ON s.id = ae.site_id
-        WHERE s.company_id = $1 AND (ae.provider_call_uuid IS NOT NULL OR ae.event_type LIKE 'VOICE%')
+        WHERE ae.company_id = $1
+          AND (ae.provider_call_uuid IS NOT NULL OR ae.event_type LIKE 'VOICE%')
       `, [companyId]),
       pool.query(`
         SELECT
@@ -401,9 +467,11 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
 
     return [
       service("sms_gateway", "SMS Delivery", operationStatus(smsRow), {
+        configured: Boolean(env.VONAGE_API_KEY && env.VONAGE_API_SECRET),
         last_success_at: iso(smsRow.last_success), last_failure_at: iso(smsRow.last_failure), last_error: smsRow.last_error || null,
       }),
       service("voice_calls", "Voice Calls", operationStatus(voiceRow), {
+        configured: Boolean(env.VONAGE_APPLICATION_ID && env.VONAGE_PRIVATE_KEY && env.VONAGE_FROM_NUMBER),
         last_success_at: iso(voiceRow.last_success), last_failure_at: iso(voiceRow.last_failure), last_error: voiceRow.last_error || null,
       }),
       service("email_delivery", "Email Delivery", operationStatus(emailRow), {

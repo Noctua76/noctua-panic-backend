@@ -19,6 +19,7 @@ const { createSystemStatusService } = require("./system-status");
 const { runMigrations } = require("./database/run-migrations");
 const { createCorsOptions } = require("./security/cors-policy");
 const { createAuthProtection } = require("./security/auth-protection");
+const { createAlertDispatcher } = require("./notifications/alert-dispatch");
 const {
   attachCorrectionsToRows,
   createPatrolCorrectionsRouter,
@@ -314,6 +315,13 @@ const VONAGE_PRIVATE_KEY = (process.env.VONAGE_PRIVATE_KEY || '').includes('\\n'
 const vonageVoice = new Vonage({
   applicationId: process.env.VONAGE_APPLICATION_ID,
   privateKey: VONAGE_PRIVATE_KEY
+});
+
+const alertDispatcher = createAlertDispatcher({
+  pool,
+  env: process.env,
+  fetchImpl: fetch,
+  voiceClient: vonageVoice,
 });
 
 
@@ -5858,6 +5866,7 @@ async function ensureAlertRecipientsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS alert_recipients (
       id SERIAL PRIMARY KEY,
+      company_id INTEGER,
       full_name VARCHAR(255),
       phone VARCHAR(50) NOT NULL,
       sms_enabled BOOLEAN DEFAULT true,
@@ -5872,77 +5881,9 @@ async function ensureAlertRecipientsTable() {
 // ALERT HELPERS
 // ----------------------------------------------------------
 
-let lastAlertTestResult = null;
-
-function getAlertRecipients() {
-  const recipientsEnv =
-    process.env.ALERT_RECIPIENTS ||
-    process.env.ALERT_TARGET ||
-    "";
-
-  return recipientsEnv
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-
-async function getAlertRecipientsFromDatabase(companyId) {
-  await ensureAlertRecipientsTable();
-
-  const result = await pool.query(
-    `
-    SELECT
-      id,
-      full_name,
-      phone,
-      sms_enabled,
-      voice_enabled,
-      active,
-      company_id
-    FROM alert_recipients
-    WHERE active = true
-      AND company_id = $1
-    ORDER BY id ASC
-    `,
-    [companyId]
-  );
-
-  return result.rows;
-}
-
 async function getEffectiveAlertRecipients(companyId) {
-  const dbRecipients = await getAlertRecipientsFromDatabase(companyId);
-
-  const envPhones = getAlertRecipients();
-
-  const envRecipients = envPhones.map((phone, index) => ({
-    id: `env-${index + 1}`,
-    full_name: "Railway recipient",
-    phone,
-    sms_enabled: true,
-    voice_enabled: true,
-    active: true,
-    source: "env",
-  }));
-
-  const combined = [...dbRecipients, ...envRecipients];
-
-  const uniqueByPhone = new Map();
-
-  combined.forEach((recipient) => {
-    if (!recipient.phone) return;
-
-    const normalizedPhone = recipient.phone.trim();
-
-    if (!uniqueByPhone.has(normalizedPhone)) {
-      uniqueByPhone.set(normalizedPhone, {
-        ...recipient,
-        phone: normalizedPhone,
-      });
-    }
-  });
-
-  return Array.from(uniqueByPhone.values());
+  const resolution = await alertDispatcher.getAlertRecipientsForCompany(companyId);
+  return resolution.recipients;
 }
 
 async function ensureAlertEventsTable() {
@@ -5950,8 +5891,10 @@ async function ensureAlertEventsTable() {
     CREATE TABLE IF NOT EXISTS alert_events (
       id SERIAL PRIMARY KEY,
       event_type VARCHAR(50) NOT NULL,
+      mode VARCHAR(30),
       source VARCHAR(100),
       status VARCHAR(50),
+      company_id INTEGER,
       recipients_count INTEGER DEFAULT 0,
       sms_sent INTEGER DEFAULT 0,
       sms_failed INTEGER DEFAULT 0,
@@ -7349,14 +7292,13 @@ app.get(
       const result = await pool.query(
         `
         SELECT ae.*
-FROM alert_events ae
-JOIN sites s
-  ON s.id = ae.site_id
-WHERE
-  $1::boolean = true
-  OR s.company_id = $2
-ORDER BY ae.created_at DESC
-LIMIT 50
+        FROM alert_events ae
+        LEFT JOIN sites s ON s.id = ae.site_id
+        WHERE
+          $1::boolean = true
+          OR COALESCE(ae.company_id, s.company_id) = $2
+        ORDER BY ae.created_at DESC
+        LIMIT 50
         `,
         [
           isSystemOwner,
@@ -7520,136 +7462,75 @@ WHERE
 // ----------------------------------------------------------
 app.post("/alerts/test", requireAuth, async (req, res) => {
   try {
-    const allRecipients = await getAlertRecipientsFromDatabase(
-  req.auth.company_id
-);
-
-const smsRecipients = allRecipients
-  .filter((r) => r.sms_enabled)
-  .map((r) => r.phone);
-
-const voiceRecipients = allRecipients
-  .filter((r) => r.voice_enabled)
-  .map((r) => r.phone);
-
-const recipients = allRecipients.map((r) => r.phone);
-
-    if (recipients.length === 0) {
-      return res.status(400).json({
-        status: "error",
-        message: "No alert recipients configured",
-      });
-    }
-
     const text =
       `AEGIS LINK TEST ALERT\n` +
       `Source: Dashboard Settings\n` +
+      `This is a system notification test.\n` +
       `Time: ${new Date().toISOString()}`;
 
-      console.log("TEST ALERT COMPANY:", req.auth.company_id);
-console.log("TEST ALERT SMS RECIPIENTS:", smsRecipients);
-console.log("TEST ALERT VOICE RECIPIENTS:", voiceRecipients);
+    const result = await alertDispatcher.dispatchAlertNotifications({
+      mode: "test",
+      source: "Dashboard Settings",
+      companyId: req.auth.company_id,
+      message: text,
+    });
 
-    const smsResults = await Promise.allSettled(
-      smsRecipients.map((to) => sendVonageSms(to, text))
-    );
-
-    let callResults = [];
-
-try {
-
-console.log(
-"VOICE RECIPIENTS:",
-voiceRecipients
-);
-
-callResults =
-await startVoiceCalls(
-voiceRecipients
-);
-
-} catch (callErr) {
-
-console.error(
-"Test voice call failed:",
-callErr
-);
-
-callResults = [
-{
-status:"error",
-message:callErr.message
-}
-];
-
-}
-
-    const smsSent = smsResults.filter((r) => r.status === "fulfilled").length;
-    const smsFailed = smsResults.filter((r) => r.status === "rejected").length;
-
-    lastAlertTestResult = {
-      tested_at: new Date().toISOString(),
-
-      recipients_count: recipients.length,
-
-      sms: {
-        sent: smsSent,
-        failed: smsFailed,
-        status: smsFailed === 0 ? "online" : "error",
-      },
-
-      voice: {
-  attempted: voiceRecipients.length,
-  status:
-    Array.isArray(callResults) && callResults.length > 0
-      ? "online"
-      : "error",
-},
-    };
-
-    await ensureAlertEventsTable();
-
-await pool.query(
-  `
-  INSERT INTO alert_events (
-    event_type,
-    source,
-    status,
-    recipients_count,
-    sms_sent,
-    sms_failed,
-    voice_attempted,
-    voice_status
-  )
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-  `,
-  [
-    "test_alert",
-    "Dashboard Settings",
-    "completed",
-    recipients.length,
-    smsSent,
-    smsFailed,
-    voiceRecipients.length,
-lastAlertTestResult.voice.status,
-  ]
-);
-
-    res.json({
+    return res.json({
       status: "ok",
-      message: "Test alert executed",
-      result: lastAlertTestResult,
+      message: "Test alert dispatch completed",
+      result,
     });
   } catch (err) {
-    lastAlertTestResult = {
-      tested_at: new Date().toISOString(),
+    console.error("Test alert dispatch error:", err);
+    return res.status(500).json({
       status: "error",
-      message: err.message,
-    };
+      message: "Test alert could not be dispatched",
+    });
+  }
+});
 
-    res.status(500).json({
+app.get("/settings/alert-configuration", requireAuth, async (req, res) => {
+  try {
+    const resolution = await alertDispatcher.getAlertRecipientsForCompany(
+      req.auth.company_id
+    );
+    const recipients = resolution.recipients;
+    const lastTestResult = await pool.query(
+      `
+      SELECT created_at, status, event_payload
+      FROM alert_events
+      WHERE company_id = $1
+        AND event_type = 'test_alert'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+      `,
+      [req.auth.company_id]
+    );
+    const lastRow = lastTestResult.rows[0] || null;
+    const savedResult = lastRow?.event_payload?.result || null;
+
+    return res.json({
+      status: "ok",
+      recipient_source: resolution.source,
+      fallback_used: resolution.fallback_used,
+      sms: {
+        recipients_count: recipients.length,
+        enabled_count: recipients.filter((item) => item.sms_enabled).length,
+      },
+      voice: {
+        recipients_count: recipients.length,
+        enabled_count: recipients.filter((item) => item.voice_enabled).length,
+      },
+      escalation: { order: "SMS and Voice in parallel" },
+      last_test: savedResult
+        ? { ...savedResult, tested_at: savedResult.tested_at || lastRow.created_at }
+        : null,
+    });
+  } catch (err) {
+    console.error("Alert configuration error:", err);
+    return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "Failed to load alert configuration",
     });
   }
 });
@@ -7940,22 +7821,7 @@ app.get("/system/status/global", requireAuth, async (req, res) => {
 // Helper: Αποστολή SMS μέσω Vonage (κοινή λογική)
 // ----------------------------------------------------------
 async function sendVonageSms(to, text) {
-  const params = new URLSearchParams();
-  params.append('api_key', process.env.VONAGE_API_KEY);
-  params.append('api_secret', process.env.VONAGE_API_SECRET);
-  params.append('to', to);
-  params.append('from', process.env.VONAGE_SMS_FROM || 'AegisLink');
-  params.append('text', text);
-
-  const response = await fetch('https://rest.nexmo.com/sms/json', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString()
-  });
-
-  const data = await response.json();
-  console.log('Vonage SMS Response:', data);
-  return data;
+  return alertDispatcher.provider.sendSms(to, text);
 }
 
 
@@ -7985,65 +7851,6 @@ app.post('/test-sms', requireAuth, async (req, res) => {
   }
 });
 
-async function startVoiceCalls(recipients, context = {}) {
-  const baseUrl = (
-    process.env.PUBLIC_BACKEND_URL ||
-    'https://noctua-panic-backend-production.up.railway.app'
-  ).replace(/\/+$/, '');
-
-  const results = [];
-  for (const to of recipients) {
-    const r = await vonageVoice.voice.createOutboundCall({
-  to: [{ type: 'phone', number: to.replace("+", "") }],
-  from: { type: 'phone', number: process.env.VONAGE_FROM_NUMBER },
-  answer_url: [`${baseUrl}/webhooks/answer`],
-  event_url:  [`${baseUrl}/webhooks/event`],
-  event_method: 'POST'
-});
-
-const callUuid = r.uuid || r.call_uuid || null;
-
-await ensureAlertEventsTable();
-
-await pool.query(
-  `
-  INSERT INTO alert_events (
-    event_type,
-    source,
-    status,
-    incident_id,
-    site_id,
-    guard_id,
-    recipient_phone,
-    voice_attempted,
-    voice_status,
-    provider,
-    provider_call_uuid,
-    event_payload
-  )
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-  `,
-  [
-    "VOICE_CALL_SUBMITTED",
-    "vonage",
-    "submitted",
-    context.incidentId || null,
-    context.siteId || null,
-    context.guardId || null,
-    to,
-    1,
-    "submitted",
-    "vonage",
-    callUuid,
-    r
-  ]
-);
-
-results.push({ to, response: r });
-  }
-  return results;
-}
-
 // === ALERT ENDPOINT used by the WebApp ===
 app.post('/alert', requireGuardAuth, async (req, res) => {
   console.log('ALERT ENDPOINT HIT:', req.body);
@@ -8061,24 +7868,9 @@ app.post('/alert', requireGuardAuth, async (req, res) => {
 const {
   guard_id: guardId,
   session_id: sessionId,
-  site_id: siteId
+  site_id: siteId,
+  company_id: companyId,
 } = req.guard;
-
-  const recipientsEnv =
-    process.env.ALERT_RECIPIENTS || process.env.ALERT_TARGET || '';
-
-  const recipients = recipientsEnv
-    .split(',')
-    .map(x => x.trim())
-    .filter(Boolean);
-
-  if (recipients.length === 0) {
-    console.error('No alert recipients configured (ALERT_RECIPIENTS empty)');
-    return res.status(500).json({
-      status: 'error',
-      message: 'No alert recipients configured on server.'
-    });
-  }
 
   const alertTime = new Date();
 
@@ -8159,129 +7951,32 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
 );
 
     const incident = incidentResult.rows[0];
-
-    const smsSettledResults = await Promise.allSettled(
-      recipients.map(to => sendVonageSms(to, text))
-    );
-
-    const smsNotifications = smsSettledResults.map((result, index) => {
-      const providerMessage =
-        result.status === "fulfilled"
-          ? result.value?.messages?.[0]
-          : null;
-      const submitted =
-        result.status === "fulfilled" &&
-        String(providerMessage?.status) === "0";
-
-      return {
-        phone: recipients[index],
-        status: submitted ? "submitted" : "failed",
-        provider: "vonage",
-        providerMessageId:
-          providerMessage?.["message-id"] || null,
-      };
-    });
-
-    const results = smsSettledResults
-      .filter((result) => result.status === "fulfilled")
-      .map((result) => result.value);
-
-    let callResults = [];
-
-    const voiceNotifications = [];
-
-    for (const to of recipients) {
-      try {
-        const recipientCallResults = await startVoiceCalls([to], {
-          incidentId: incident.id,
-          siteId,
-          guardId,
-        });
-
-        callResults.push(...recipientCallResults);
-        voiceNotifications.push({
-          phone: to,
-          status: "submitted",
-          provider: "vonage",
-          providerCallUuid:
-            recipientCallResults[0]?.response?.uuid ||
-            recipientCallResults[0]?.response?.call_uuid ||
-            null,
-        });
-      } catch (callErr) {
-        console.error(
-          `Voice call failed for ${to} (non-blocking):`,
-          callErr
-        );
-        voiceNotifications.push({
-          phone: to,
-          status: "failed",
-          provider: "vonage",
-          providerCallUuid: null,
-        });
-      }
+    if (!incident) {
+      throw new Error("Authenticated site was not found for incident creation");
     }
 
-    const smsSent = smsNotifications.filter(
-      (notification) => notification.status === "submitted"
-    ).length;
-    const smsFailed = smsNotifications.length - smsSent;
-    const voiceSubmitted = voiceNotifications.filter(
-      (notification) => notification.status === "submitted"
-    ).length;
-
-    await ensureAlertEventsTable();
-
-await pool.query(
-  `
-  INSERT INTO alert_events (
-    event_type,
-    source,
-    status,
-    incident_id,
-    site_id,
-    guard_id,
-    recipients_count,
-    sms_sent,
-    sms_failed,
-    voice_attempted,
-    voice_status,
-    provider
-  )
-  VALUES (
-    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
-  )
-  `,
-  [
-    "WEBAPP_ALERT",
-    source || "webapp",
-    "submitted",
-
-    incident.id,
-    siteId,
-    guardId,
-
-    recipients.length,
-    smsSent,
-    smsFailed,
-    recipients.length,
-    voiceSubmitted === recipients.length ? "submitted" : "partial_failure",
-
-    "vonage"
-  ]
-);
+    const dispatchResult = await alertDispatcher.dispatchAlertNotifications({
+      mode: "incident",
+      source: source || "webapp",
+      companyId,
+      message: text,
+      incident_id: incident.id,
+      site_id: siteId,
+      guard_id: guardId,
+    });
 
     return res.json({
       status: 'ok',
       message: 'Alert received, incident created, notification attempts processed',
       incident: incidentResult.rows[0],
-      recipients,
-      smsResults: results,
-      callResults,
-      notifications: {
-        sms: smsNotifications,
-        voice: voiceNotifications,
-      },
+      dispatch: dispatchResult,
+      recipients: [
+        ...new Set([
+          ...dispatchResult.notifications.sms.map((item) => item.phone),
+          ...dispatchResult.notifications.voice.map((item) => item.phone),
+        ]),
+      ],
+      notifications: dispatchResult.notifications,
     });
 
   } catch (err) {
@@ -8324,6 +8019,8 @@ async function eventHook(req, res) {
     const incidentLookup = await pool.query(
       `
       SELECT
+        company_id,
+        mode,
         incident_id,
         site_id,
         guard_id
@@ -8349,7 +8046,7 @@ async function eventHook(req, res) {
     await pool.query(
       `
       INSERT INTO alert_events (
-        event_type,
+        event_type, mode, company_id,
         source,
         status,
         incident_id,
@@ -8361,10 +8058,12 @@ async function eventHook(req, res) {
         provider_call_uuid,
         event_payload
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       `,
       [
         "VOICE_WEBHOOK",
+        incidentInfo.mode || null,
+        incidentInfo.company_id || null,
         "vonage",
         callStatus,
 
@@ -8376,7 +8075,13 @@ async function eventHook(req, res) {
         callStatus,
         "vonage",
         callUuid,
-        payload
+        JSON.stringify({
+          status: callStatus,
+          direction: payload.direction || null,
+          timestamp: payload.timestamp || null,
+          duration: payload.duration || null,
+          rate: payload.rate || null,
+        })
       ]
     );
 
