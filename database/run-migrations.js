@@ -3,6 +3,7 @@ const path = require("path");
 
 const MIGRATIONS = [
   "2026-09-14-operational-security.sql",
+  "2026-09-15-unified-alert-dispatch.sql",
 ];
 
 async function runMigrations(pool) {
