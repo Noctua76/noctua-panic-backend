@@ -7485,10 +7485,103 @@ function summarizeFinalNotifications(notifications = []) {
   return { attempted, successful, pending, failed, status };
 }
 
+async function hydrateTestAlertRows(rows = []) {
+  const prepared = rows
+    .map((row) => ({
+      row,
+      result: row?.event_payload?.result
+        ? JSON.parse(JSON.stringify(row.event_payload.result))
+        : null,
+    }))
+    .filter((item) => item.result);
+
+  const messageIds = [...new Set(prepared.flatMap(({ result }) =>
+    (result.notifications?.sms || [])
+      .map((item) => item.provider_message_id)
+      .filter(Boolean)
+  ))];
+  const callUuids = [...new Set(prepared.flatMap(({ result }) =>
+    (result.notifications?.voice || [])
+      .map((item) => item.provider_call_uuid)
+      .filter(Boolean)
+  ))];
+
+  const [smsReceipts, voiceReceipts] = await Promise.all([
+    messageIds.length
+      ? pool.query(
+          `
+          SELECT DISTINCT ON (provider_message_id)
+            provider_message_id, status, created_at, event_payload
+          FROM alert_events
+          WHERE event_type = 'SMS_DELIVERY_RECEIPT'
+            AND provider_message_id = ANY($1::varchar[])
+          ORDER BY provider_message_id, created_at DESC, id DESC
+          `,
+          [messageIds]
+        )
+      : Promise.resolve({ rows: [] }),
+    callUuids.length
+      ? pool.query(
+          `
+          SELECT DISTINCT ON (provider_call_uuid)
+            provider_call_uuid, status, created_at, event_payload
+          FROM alert_events
+          WHERE event_type = 'VOICE_WEBHOOK'
+            AND provider_call_uuid = ANY($1::varchar[])
+          ORDER BY provider_call_uuid, created_at DESC, id DESC
+          `,
+          [callUuids]
+        )
+      : Promise.resolve({ rows: [] }),
+  ]);
+
+  const smsById = new Map(
+    smsReceipts.rows.map((row) => [row.provider_message_id, row])
+  );
+  const voiceByUuid = new Map(
+    voiceReceipts.rows.map((row) => [row.provider_call_uuid, row])
+  );
+
+  return prepared.map(({ row, result }) => {
+    const smsNotifications = result.notifications?.sms || [];
+    const voiceNotifications = result.notifications?.voice || [];
+
+    for (const notification of smsNotifications) {
+      const receipt = smsById.get(notification.provider_message_id);
+      if (!receipt) continue;
+      notification.status = receipt.status;
+      notification.final_status_at = receipt.created_at;
+      notification.error_message = ALERT_FAILURE_STATUSES.has(
+        String(receipt.status || "").toLowerCase()
+      ) ? receipt.event_payload?.error || null : null;
+    }
+
+    for (const notification of voiceNotifications) {
+      const receipt = voiceByUuid.get(notification.provider_call_uuid);
+      if (!receipt) continue;
+      notification.status = receipt.status;
+      notification.final_status_at = receipt.created_at;
+      notification.error_message = ALERT_FAILURE_STATUSES.has(
+        String(receipt.status || "").toLowerCase()
+      ) ? receipt.event_payload?.error || null : null;
+    }
+
+    result.sms = { ...result.sms, ...summarizeFinalNotifications(smsNotifications) };
+    result.voice = { ...result.voice, ...summarizeFinalNotifications(voiceNotifications) };
+    result.status = summarizeFinalNotifications([
+      ...smsNotifications,
+      ...voiceNotifications,
+    ]).status;
+    result.tested_at = result.tested_at || row.created_at;
+    result.test_id = row.id;
+    return result;
+  });
+}
+
 async function getLatestTestAlertResult(companyId) {
   const lastTestResult = await pool.query(
     `
-    SELECT created_at, event_payload
+    SELECT id, created_at, event_payload
     FROM alert_events
     WHERE company_id = $1
       AND event_type = 'test_alert'
@@ -7497,60 +7590,7 @@ async function getLatestTestAlertResult(companyId) {
     `,
     [companyId]
   );
-  const lastRow = lastTestResult.rows[0] || null;
-  const savedResult = lastRow?.event_payload?.result || null;
-  if (!savedResult) return null;
-
-  const result = JSON.parse(JSON.stringify(savedResult));
-  const smsNotifications = result.notifications?.sms || [];
-  const voiceNotifications = result.notifications?.voice || [];
-
-  await Promise.all([
-    ...smsNotifications.map(async (notification) => {
-      if (!notification.provider_message_id) return;
-      const receipt = await pool.query(
-        `
-        SELECT status, created_at, event_payload
-        FROM alert_events
-        WHERE event_type = 'SMS_DELIVERY_RECEIPT'
-          AND provider_message_id = $1
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        `,
-        [notification.provider_message_id]
-      );
-      const row = receipt.rows[0];
-      if (!row) return;
-      notification.status = row.status;
-      notification.final_status_at = row.created_at;
-      notification.error_message = row.event_payload?.error || null;
-    }),
-    ...voiceNotifications.map(async (notification) => {
-      if (!notification.provider_call_uuid) return;
-      const receipt = await pool.query(
-        `
-        SELECT status, created_at, event_payload
-        FROM alert_events
-        WHERE event_type = 'VOICE_WEBHOOK'
-          AND provider_call_uuid = $1
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        `,
-        [notification.provider_call_uuid]
-      );
-      const row = receipt.rows[0];
-      if (!row) return;
-      notification.status = row.status;
-      notification.final_status_at = row.created_at;
-      notification.error_message = row.event_payload?.error || null;
-    }),
-  ]);
-
-  result.sms = { ...result.sms, ...summarizeFinalNotifications(smsNotifications) };
-  result.voice = { ...result.voice, ...summarizeFinalNotifications(voiceNotifications) };
-  const allNotifications = [...smsNotifications, ...voiceNotifications];
-  result.status = summarizeFinalNotifications(allNotifications).status;
-  result.tested_at = result.tested_at || lastRow.created_at;
+  const [result = null] = await hydrateTestAlertRows(lastTestResult.rows);
   return result;
 }
 
@@ -7579,6 +7619,63 @@ app.post("/alerts/test", requireAuth, async (req, res) => {
     return res.status(500).json({
       status: "error",
       message: "Test alert could not be dispatched",
+    });
+  }
+});
+
+app.get("/settings/test-alert-history", requireAuth, async (req, res) => {
+  try {
+    const requestedPage = Number.parseInt(req.query.page, 10);
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const page = Number.isFinite(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 50)
+      : 10;
+    const offset = (page - 1) * limit;
+
+    const [historyResult, countResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT id, created_at, event_payload
+        FROM alert_events
+        WHERE company_id = $1
+          AND event_type = 'test_alert'
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $3
+        `,
+        [req.auth.company_id, limit, offset]
+      ),
+      pool.query(
+        `
+        SELECT COUNT(*)::int AS total
+        FROM alert_events
+        WHERE company_id = $1
+          AND event_type = 'test_alert'
+        `,
+        [req.auth.company_id]
+      ),
+    ]);
+
+    const items = await hydrateTestAlertRows(historyResult.rows);
+    const total = countResult.rows[0]?.total || 0;
+
+    return res.json({
+      status: "ok",
+      items,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.max(1, Math.ceil(total / limit)),
+      },
+    });
+  } catch (err) {
+    console.error("Test alert history error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load test alert history",
     });
   }
 });
