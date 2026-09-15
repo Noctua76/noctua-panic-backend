@@ -5,7 +5,7 @@ const {
   createAlertDispatcher,
   overallStatus,
 } = require("../notifications/alert-dispatch");
-const { parseSmsProviderResponse } = require("../notifications/vonage");
+const { createVonageProvider, parseSmsProviderResponse } = require("../notifications/vonage");
 
 function mockPool(recipients = []) {
   const queries = [];
@@ -33,6 +33,32 @@ test("SMS success requires Vonage provider status zero", () => {
   assert.equal(success.provider_message_id, "message-1");
   assert.equal(providerFailure.status, "failed");
   assert.equal(providerFailure.provider_status_code, "4");
+});
+
+test("SMS requests include the public delivery receipt callback", async () => {
+  let requestBody = "";
+  const provider = createVonageProvider({
+    env: {
+      PUBLIC_BACKEND_URL: "https://backend.example/",
+      VONAGE_API_KEY: "key",
+      VONAGE_API_SECRET: "secret",
+      VONAGE_SMS_FROM: "AegisLink",
+    },
+    fetchImpl: async (_url, options) => {
+      requestBody = options.body;
+      return {
+        ok: true,
+        async json() {
+          return { messages: [{ status: "0", "message-id": "message-1" }] };
+        },
+      };
+    },
+    voiceClient: { voice: {} },
+  });
+
+  await provider.sendSms("+301", "test");
+  const params = new URLSearchParams(requestBody);
+  assert.equal(params.get("callback"), "https://backend.example/webhooks/sms-delivery");
 });
 
 test("disabled channel is not counted as a failure", () => {
