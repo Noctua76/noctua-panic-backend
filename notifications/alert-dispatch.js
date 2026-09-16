@@ -1,6 +1,9 @@
 const { createAlertRecipientResolver } = require("./recipients");
 const { createVonageProvider, sanitizeProviderError } = require("./vonage");
 
+const NO_ACTIVE_RECIPIENTS_REASON =
+  "No active alert recipients configured for this company";
+
 function channelSummary(results) {
   const attempted = results.length;
   const submitted = results.filter((item) => item.status === "submitted").length;
@@ -89,7 +92,7 @@ function createAlertDispatcher({ pool, env = process.env, fetchImpl = fetch, voi
   }
 
   async function recordSummary({ mode, source, companyId, context, recipientResolution, result }) {
-    await pool.query(
+    const summary = await pool.query(
       `
       INSERT INTO alert_events (
         event_type, mode, source, status, company_id, incident_id,
@@ -99,6 +102,7 @@ function createAlertDispatcher({ pool, env = process.env, fetchImpl = fetch, voi
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,$14,$15,$16,$17,$18::jsonb
       )
+      RETURNING id
       `,
       [
         mode === "test" ? "test_alert" : "WEBAPP_ALERT",
@@ -126,6 +130,8 @@ function createAlertDispatcher({ pool, env = process.env, fetchImpl = fetch, voi
         }),
       ]
     );
+
+    return summary.rows[0] || null;
   }
 
   async function dispatchAlertNotifications({
@@ -166,6 +172,9 @@ function createAlertDispatcher({ pool, env = process.env, fetchImpl = fetch, voi
       voice,
       notifications: { sms: smsNotifications, voice: voiceNotifications },
     };
+    if (recipients.length === 0) {
+      result.reason = NO_ACTIVE_RECIPIENTS_REASON;
+    }
 
     for (const notification of smsNotifications) {
       await recordRecipientResult({ mode, source, companyId, context, channel: "sms", result: notification });
@@ -173,7 +182,17 @@ function createAlertDispatcher({ pool, env = process.env, fetchImpl = fetch, voi
     for (const notification of voiceNotifications) {
       await recordRecipientResult({ mode, source, companyId, context, channel: "voice", result: notification });
     }
-    await recordSummary({ mode, source, companyId, context, recipientResolution, result });
+    const summary = await recordSummary({
+      mode,
+      source,
+      companyId,
+      context,
+      recipientResolution,
+      result,
+    });
+    if (mode === "test" && summary?.id) {
+      result.test_id = summary.id;
+    }
 
     return result;
   }
@@ -188,6 +207,7 @@ function createAlertDispatcher({ pool, env = process.env, fetchImpl = fetch, voi
 module.exports = {
   channelSummary,
   createAlertDispatcher,
+  NO_ACTIVE_RECIPIENTS_REASON,
   overallStatus,
   sanitizeProviderError,
 };
