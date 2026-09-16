@@ -3,11 +3,12 @@ const assert = require("node:assert/strict");
 const {
   channelSummary,
   createAlertDispatcher,
+  NO_ACTIVE_RECIPIENTS_REASON,
   overallStatus,
 } = require("../notifications/alert-dispatch");
 const { createVonageProvider, parseSmsProviderResponse } = require("../notifications/vonage");
 
-function mockPool(recipients = []) {
+function mockPool(recipients = [], summaryId = 1001) {
   const queries = [];
   return {
     queries,
@@ -15,6 +16,9 @@ function mockPool(recipients = []) {
       queries.push({ sql, params });
       if (sql.includes("FROM alert_recipients")) {
         return { rows: recipients };
+      }
+      if (sql.includes("recipients_count") && sql.includes("RETURNING id")) {
+        return { rows: [{ id: summaryId }] };
       }
       return { rows: [] };
     },
@@ -163,13 +167,15 @@ test("dispatcher uses database recipients and reports provider partial failure",
     status: "completed",
   });
   assert.equal(result.status, "partial_failure");
+  assert.equal(result.test_id, 1001);
   assert.equal(result.notifications.sms.some((item) => item.phone === "+399"), false);
   const recipientQuery = pool.queries.find((item) => item.sql.includes("FROM alert_recipients"));
   assert.deepEqual(recipientQuery.params, [7]);
 });
 
-test("environment recipients are used only when the company has no database rows", async () => {
+test("a company without database recipients cannot use global environment numbers", async () => {
   const pool = mockPool([]);
+  let providerCalls = 0;
   const dispatcher = createAlertDispatcher({
     pool,
     env: {
@@ -178,16 +184,15 @@ test("environment recipients are used only when the company has no database rows
       VONAGE_API_SECRET: "secret",
       VONAGE_FROM_NUMBER: "+300",
     },
-    fetchImpl: async () => ({
-      ok: true,
-      async json() {
-        return { messages: [{ status: "0", "message-id": "ok" }] };
-      },
-    }),
+    fetchImpl: async () => {
+      providerCalls += 1;
+      throw new Error("Provider must not be called without company recipients");
+    },
     voiceClient: {
       voice: {
-        async createOutboundCall(payload) {
-          return { uuid: `call-${payload.to[0].number}` };
+        async createOutboundCall() {
+          providerCalls += 1;
+          throw new Error("Provider must not be called without company recipients");
         },
       },
     },
@@ -200,10 +205,69 @@ test("environment recipients are used only when the company has no database rows
     message: "test",
   });
 
-  assert.equal(result.recipient_source, "env_fallback");
-  assert.equal(result.fallback_used, true);
-  assert.equal(result.recipients_count, 2);
-  assert.equal(result.status, "completed");
+  assert.equal(result.recipient_source, "none");
+  assert.equal(result.fallback_used, false);
+  assert.equal(result.recipients_count, 0);
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, NO_ACTIVE_RECIPIENTS_REASON);
+  assert.equal(result.test_id, 1001);
+  assert.equal(providerCalls, 0);
+});
+
+test("recipient lookup remains scoped to the authenticated company", async () => {
+  const queries = [];
+  const pool = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      if (sql.includes("FROM alert_recipients")) {
+        const rowsByCompany = {
+          21: [{
+            id: 1,
+            company_id: 21,
+            full_name: "Company A",
+            phone: "+301",
+            sms_enabled: true,
+            voice_enabled: false,
+            active: true,
+            source: "database",
+          }],
+          22: [],
+        };
+        return { rows: rowsByCompany[params[0]] || [] };
+      }
+      if (sql.includes("recipients_count") && sql.includes("RETURNING id")) {
+        return { rows: [{ id: 2002 }] };
+      }
+      return { rows: [] };
+    },
+  };
+  const dispatcher = createAlertDispatcher({
+    pool,
+    env: {
+      ALERT_RECIPIENTS: "+399",
+      VONAGE_API_KEY: "key",
+      VONAGE_API_SECRET: "secret",
+      VONAGE_FROM_NUMBER: "+300",
+    },
+    fetchImpl: async () => {
+      throw new Error("Company B must not dispatch to Company A or environment recipients");
+    },
+    voiceClient: { voice: {} },
+  });
+
+  const result = await dispatcher.dispatchAlertNotifications({
+    mode: "test",
+    source: "Dashboard Settings",
+    companyId: 22,
+    message: "test",
+  });
+
+  assert.equal(result.recipients_count, 0);
+  assert.equal(result.recipient_source, "none");
+  assert.deepEqual(
+    queries.find((item) => item.sql.includes("FROM alert_recipients")).params,
+    [22]
+  );
 });
 
 test("voice response without UUID is a provider failure", async () => {

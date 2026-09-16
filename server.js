@@ -20,6 +20,7 @@ const { runMigrations } = require("./database/run-migrations");
 const { createCorsOptions } = require("./security/cors-policy");
 const { createAuthProtection } = require("./security/auth-protection");
 const { createAlertDispatcher } = require("./notifications/alert-dispatch");
+const { createTestAlertResultReader } = require("./notifications/alert-result-reader");
 const {
   attachCorrectionsToRows,
   createPatrolCorrectionsRouter,
@@ -7594,6 +7595,11 @@ async function getLatestTestAlertResult(companyId) {
   return result;
 }
 
+const testAlertResultReader = createTestAlertResultReader({
+  pool,
+  hydrateTestAlertRows,
+});
+
 app.post("/alerts/test", requireAuth, async (req, res) => {
   try {
     const text =
@@ -7619,6 +7625,32 @@ app.post("/alerts/test", requireAuth, async (req, res) => {
     return res.status(500).json({
       status: "error",
       message: "Test alert could not be dispatched",
+    });
+  }
+});
+
+app.get("/settings/test-alerts/:testId", requireAuth, async (req, res) => {
+  try {
+    const rawTestId = String(req.params.testId || "");
+    const testId = /^\d+$/.test(rawTestId) ? Number(rawTestId) : NaN;
+    if (!Number.isSafeInteger(testId) || testId <= 0) {
+      return res.status(404).json({ status: "error", message: "Test alert not found" });
+    }
+
+    const result = await testAlertResultReader.getById(
+      req.auth.company_id,
+      testId
+    );
+    if (!result) {
+      return res.status(404).json({ status: "error", message: "Test alert not found" });
+    }
+
+    return res.json({ status: "ok", result });
+  } catch (err) {
+    console.error("Test alert result error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load test alert result",
     });
   }
 });
