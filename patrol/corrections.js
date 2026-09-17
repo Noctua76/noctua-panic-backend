@@ -110,7 +110,6 @@ async function loadOccurrence(pool, occurrenceKey) {
         pl.delay_minutes,
         CASE
           WHEN pl.completion_status = 'completed_late'
-            OR COALESCE(pl.delay_minutes, 0) > 0
           THEN 'COMPLETED_LATE'
           ELSE 'COMPLETED'
         END AS original_outcome,
@@ -161,7 +160,7 @@ async function loadOccurrence(pool, occurrenceKey) {
       WHERE ps.id = $2
         AND ps.schedule_type = 'recurring'
         AND (TO_TIMESTAMP($3::double precision) AT TIME ZONE 'UTC')
-          + INTERVAL '16 minutes' <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
+          + INTERVAL '2 hours' <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
         AND NOT EXISTS (
           SELECT 1
           FROM patrol_logs pl
@@ -207,7 +206,7 @@ async function loadOccurrence(pool, occurrenceKey) {
       JOIN patrol_points pp ON pp.id = ps.patrol_point_id
       WHERE ps.id = $2
         AND ps.schedule_type = 'manual'
-        AND ps.scheduled_date + ps.scheduled_time + INTERVAL '16 minutes'
+        AND ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
           <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
         AND NOT EXISTS (
           SELECT 1 FROM patrol_logs pl WHERE pl.schedule_id = ps.id
@@ -215,6 +214,46 @@ async function loadOccurrence(pool, occurrenceKey) {
       LIMIT 1
       `,
       [occurrenceKey, Number(manualMatch[1])]
+    );
+
+    return result.rows[0] || null;
+  }
+
+  const randomMatch = /^random-missed-(\d+)$/.exec(occurrenceKey);
+
+  if (randomMatch) {
+    const result = await pool.query(
+      `
+      SELECT
+        $1::text AS occurrence_key,
+        NULL::bigint AS patrol_log_id,
+        rpo.site_id,
+        rpo.company_id,
+        s.name AS site_name,
+        rpo.patrol_point_id AS point_id,
+        pp.point_name,
+        NULL::bigint AS schedule_id,
+        'random'::text AS schedule_type,
+        rpo.scheduled_at,
+        NULL::timestamptz AS patrol_time,
+        NULL::int AS delay_minutes,
+        'MISSED'::text AS original_outcome,
+        NULL::numeric AS latitude,
+        NULL::numeric AS longitude,
+        NULL::numeric AS accuracy,
+        NULL::text AS guard_name
+      FROM random_patrol_occurrences rpo
+      JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+      JOIN sites s ON s.id = rpo.site_id AND s.company_id = rpo.company_id
+      JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
+      WHERE rpo.id = $2
+        AND rpo.scheduled_at + INTERVAL '2 hours' <= NOW() AT TIME ZONE rpd.timezone
+        AND NOT EXISTS (
+          SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
+        )
+      LIMIT 1
+      `,
+      [occurrenceKey, Number(randomMatch[1])]
     );
 
     return result.rows[0] || null;
@@ -268,7 +307,6 @@ function createPatrolCorrectionsRouter({ pool, requireAuth }) {
             pl.patrol_time,
             CASE
               WHEN pl.completion_status = 'completed_late'
-                OR COALESCE(pl.delay_minutes, 0) > 0
               THEN 'COMPLETED_LATE'
               ELSE 'COMPLETED'
             END AS original_outcome,
@@ -318,7 +356,7 @@ function createPatrolCorrectionsRouter({ pool, requireAuth }) {
             AND ps.interval_hours > 0
             AND slots.scheduled_at >= $2::date::timestamp
             AND slots.scheduled_at < ($3::date + 1)::timestamp
-            AND slots.scheduled_at + INTERVAL '16 minutes'
+            AND slots.scheduled_at + INTERVAL '2 hours'
               <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
             AND NOT EXISTS (
               SELECT 1
@@ -349,16 +387,42 @@ function createPatrolCorrectionsRouter({ pool, requireAuth }) {
           WHERE ps.site_id = $1
             AND ps.schedule_type = 'manual'
             AND ps.scheduled_date BETWEEN $2::date AND $3::date
-            AND ps.scheduled_date + ps.scheduled_time + INTERVAL '16 minutes'
+            AND ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
               <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
             AND NOT EXISTS (
               SELECT 1 FROM patrol_logs pl WHERE pl.schedule_id = ps.id
+            )
+        ),
+        random_missed AS (
+          SELECT
+            CONCAT('random-missed-', rpo.id) AS occurrence_key,
+            NULL::bigint AS patrol_log_id,
+            rpo.site_id,
+            s.name AS site_name,
+            rpo.patrol_point_id AS point_id,
+            pp.point_name,
+            NULL::bigint AS schedule_id,
+            'random'::text AS schedule_type,
+            rpo.scheduled_at,
+            NULL::timestamptz AS patrol_time,
+            'MISSED'::text AS original_outcome,
+            NULL::text AS guard_name
+          FROM random_patrol_occurrences rpo
+          JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+          JOIN sites s ON s.id = rpo.site_id AND s.company_id = rpo.company_id
+          JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
+          WHERE rpo.site_id = $1
+            AND rpd.local_date BETWEEN $2::date AND $3::date
+            AND rpo.scheduled_at + INTERVAL '2 hours' <= NOW() AT TIME ZONE rpd.timezone
+            AND NOT EXISTS (
+              SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
             )
         ),
         all_occurrences AS (
           SELECT * FROM completed
           UNION ALL SELECT * FROM recurring_missed
           UNION ALL SELECT * FROM manual_missed
+          UNION ALL SELECT * FROM random_missed
         )
         SELECT *
         FROM all_occurrences
