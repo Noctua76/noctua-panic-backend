@@ -25,6 +25,11 @@ const {
   attachCorrectionsToRows,
   createPatrolCorrectionsRouter,
 } = require("./patrol/corrections");
+const {
+  createRandomPatrolRouter,
+  generateRandomPatrolsForCurrentLocalDay,
+} = require("./patrol/random-patrols");
+const { PATROL_TIMING } = require("./patrol/lifecycle");
 
 // ================================
 // TIMEZONE HELPERS
@@ -7974,6 +7979,8 @@ app.use(
   createPatrolCorrectionsRouter({ pool, requireAuth })
 );
 
+app.use(createRandomPatrolRouter({ pool, requireAuth }));
+
 // Public endpoint intentionally exposes platform health only.
 app.get("/system/status", async (_req, res) => {
   try {
@@ -9994,10 +10001,32 @@ app.get(
           AND ps.scheduled_date = (NOW() AT TIME ZONE $4::text)::date
       ),
 
+      random_slots AS (
+        SELECT
+          rpo.id AS schedule_instance_id,
+          rpo.id AS schedule_id,
+          'random' AS schedule_type,
+          rpo.site_id,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ${PATROL_TIMING.revealMinutesBefore}::int AS reminder_minutes_before,
+          rpo.scheduled_at
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN patrol_points pp
+          ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
+        WHERE rpo.site_id = (SELECT site_id FROM active_session)
+          AND rpd.local_date = (NOW() AT TIME ZONE $4::text)::date
+          AND (NOW() AT TIME ZONE $4::text) >=
+            rpo.scheduled_at - INTERVAL '${PATROL_TIMING.revealMinutesBefore} minutes'
+      ),
+
       patrol_items AS (
         SELECT * FROM recurring_slots
         UNION ALL
         SELECT * FROM manual_slots
+        UNION ALL
+        SELECT * FROM random_slots
       ),
 
       enriched AS (
@@ -10005,16 +10034,15 @@ app.get(
           pi.*,
 
           (
-            pi.scheduled_at
-            - (COALESCE(pi.reminder_minutes_before, 5) || ' minutes')::interval
+            pi.scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes'
           ) AS scan_available_from,
 
           (
-            pi.scheduled_at + INTERVAL '15 minutes'
+            pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
           ) AS scan_available_until,
 
           (
-            pi.scheduled_at + INTERVAL '16 minutes'
+            pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
           ) AS missed_at,
 
           EXISTS (
@@ -10029,6 +10057,9 @@ app.get(
                 OR
                 pi.schedule_type = 'recurring'
                 AND pl.scheduled_at = pi.scheduled_at
+                OR
+                pi.schedule_type = 'random'
+                AND pl.random_occurrence_id = pi.schedule_id
               )
           ) AS already_completed
         FROM patrol_items pi
@@ -10109,7 +10140,6 @@ app.get(
     pl.accuracy,
     CASE
       WHEN pl.completion_status = 'completed_late'
-        OR COALESCE(pl.delay_minutes, 0) > 0
         THEN 'completed_late'
       ELSE 'completed'
     END AS status,
@@ -10417,7 +10447,7 @@ async function sendPushNotificationToGuard({
   };
 }
 
-async function sendScanOpenPushIfNeeded({
+async function sendPatrolReminderPushIfNeeded({
   guardId,
   sessionId,
   siteId,
@@ -10426,9 +10456,9 @@ async function sendScanOpenPushIfNeeded({
   scheduledAt,
   checkpoint,
   siteName,
-  scanAvailableFrom,
+  reminderAt,
 }) {
-  const notificationType = "scan_open";
+  const notificationType = "patrol_reminder";
 
   const existing = await pool.query(
     `
@@ -10460,7 +10490,7 @@ async function sendScanOpenPushIfNeeded({
 
   const payload = {
   title: "Patrol Reminder",
-  body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nScan window is now open.`,
+  body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nPatrol scheduled in 15 minutes.`,
   url: "patrol.html",
   schedule_id: scheduleId,
   schedule_type: scheduleType,
@@ -10541,18 +10571,22 @@ async function runPatrolPushScheduler() {
           gs.id AS session_id,
           gs.guard_id,
           gs.site_id,
-          s.name AS site_name
+          s.name AS site_name,
+          s.company_id,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone
         FROM guard_sessions gs
 INNER JOIN guards g
   ON g.id = gs.guard_id
 LEFT JOIN sites s
   ON s.id = gs.site_id
+LEFT JOIN companies c
+  ON c.id = s.company_id
 WHERE gs.logout_time IS NULL
   AND g.access_mode = 'standard'
   AND (
     gs.scheduled_shift_end IS NULL
     OR gs.scheduled_shift_end + INTERVAL '15 minutes'
-       > (NOW() AT TIME ZONE 'Europe/Athens')
+       > (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
   )
 ORDER BY
   gs.guard_id,
@@ -10570,6 +10604,7 @@ ORDER BY
           ps.patrol_point_id AS point_id,
           pp.point_name AS checkpoint,
           ps.reminder_minutes_before,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone,
           gs.expected_slot AS scheduled_at
         FROM patrol_schedules ps
 
@@ -10577,14 +10612,17 @@ ORDER BY
           ON pp.id = ps.patrol_point_id
           AND pp.active = true
 
+        INNER JOIN sites s ON s.id = ps.site_id
+        INNER JOIN companies c ON c.id = s.company_id
+
         CROSS JOIN LATERAL (
           SELECT
             (
-              (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+              (ps.created_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
               + ps.start_time
             ) AS anchor_time,
-            (NOW() AT TIME ZONE 'Europe/Athens')::date AS day_start,
-            ((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day') AS day_end
+            (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date AS day_start,
+            ((NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date + INTERVAL '1 day') AS day_end
         ) w
 
         CROSS JOIN LATERAL generate_series(
@@ -10610,6 +10648,7 @@ ORDER BY
           ps.patrol_point_id AS point_id,
           pp.point_name AS checkpoint,
           ps.reminder_minutes_before,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone,
           (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
         FROM patrol_schedules ps
 
@@ -10617,27 +10656,43 @@ ORDER BY
           ON pp.id = ps.patrol_point_id
           AND pp.active = true
 
+        INNER JOIN sites s ON s.id = ps.site_id
+        INNER JOIN companies c ON c.id = s.company_id
+
         WHERE ps.schedule_type = 'manual'
           AND ps.active = true
-          AND ps.scheduled_date = (NOW() AT TIME ZONE 'Europe/Athens')::date
+          AND ps.scheduled_date = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+      ),
+
+      random_slots AS (
+        SELECT
+          rpo.id AS schedule_instance_id,
+          rpo.id AS schedule_id,
+          'random' AS schedule_type,
+          rpo.site_id,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ${PATROL_TIMING.revealMinutesBefore}::int AS reminder_minutes_before,
+          rpd.timezone,
+          rpo.scheduled_at
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
+        WHERE rpd.local_date = (NOW() AT TIME ZONE rpd.timezone)::date
       ),
 
       patrol_items AS (
         SELECT * FROM recurring_slots
         UNION ALL
         SELECT * FROM manual_slots
+        UNION ALL
+        SELECT * FROM random_slots
       ),
 
       enriched AS (
         SELECT
           pi.*,
-          (
-            pi.scheduled_at
-            - (COALESCE(pi.reminder_minutes_before, 5) || ' minutes')::interval
-          ) AS scan_available_from,
-          (
-            pi.scheduled_at + INTERVAL '15 minutes'
-          ) AS scan_available_until
+          pi.scheduled_at - INTERVAL '${PATROL_TIMING.revealMinutesBefore} minutes' AS reminder_at
         FROM patrol_items pi
       )
 
@@ -10649,8 +10704,7 @@ ORDER BY
         e.checkpoint,
         e.reminder_minutes_before,
         e.scheduled_at,
-        e.scan_available_from,
-        e.scan_available_until,
+        e.reminder_at,
         active_sessions.guard_id,
         active_sessions.session_id,
         active_sessions.site_name
@@ -10659,8 +10713,8 @@ ORDER BY
       JOIN active_sessions
         ON active_sessions.site_id = e.site_id
 
-      WHERE (NOW() AT TIME ZONE 'Europe/Athens') >= e.scan_available_from
-        AND (NOW() AT TIME ZONE 'Europe/Athens') < e.scan_available_until
+      WHERE (NOW() AT TIME ZONE e.timezone) >= e.reminder_at
+        AND (NOW() AT TIME ZONE e.timezone) < e.scheduled_at
 
         AND NOT EXISTS (
           SELECT 1
@@ -10674,6 +10728,9 @@ ORDER BY
               OR
               e.schedule_type = 'recurring'
               AND pl.scheduled_at = e.scheduled_at
+              OR
+              e.schedule_type = 'random'
+              AND pl.random_occurrence_id = e.schedule_id
             )
         )
 
@@ -10684,7 +10741,7 @@ ORDER BY
     duePatrols = dueSoonResult.rows.length;
 
     for (const patrol of dueSoonResult.rows) {
-      const deliveryResult = await sendScanOpenPushIfNeeded({
+      const deliveryResult = await sendPatrolReminderPushIfNeeded({
         guardId: Number(patrol.guard_id),
         sessionId: Number(patrol.session_id),
         siteId: Number(patrol.site_id),
@@ -10693,7 +10750,7 @@ ORDER BY
         scheduledAt: patrol.scheduled_at,
         checkpoint: patrol.checkpoint,
         siteName: patrol.site_name,
-        scanAvailableFrom: patrol.scan_available_from,
+        reminderAt: patrol.reminder_at,
       });
       if (deliveryResult.status === "sent" || deliveryResult.status === "already_sent") {
         delivered += 1;
@@ -10772,6 +10829,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
   try {
     const {
       schedule_id,
+      schedule_type,
       qr_token,
       latitude,
       longitude,
@@ -10779,6 +10837,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
     } = req.body;
 
     const normalizedScheduleId = Number(schedule_id);
+    const normalizedScheduleType = String(schedule_type || "").toLowerCase();
     const normalizedQrToken =
       typeof qr_token === "string" ? qr_token.trim() : "";
 
@@ -10799,8 +10858,35 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
     const companyId = req.guard.company_id;
     const companyTimezone = await getCompanyTimezone(companyId);
 
-    const patrolResult = await pool.query(
-      `
+    const patrolResult = normalizedScheduleType === "random"
+      ? await pool.query(
+        `
+        SELECT
+          rpo.id AS schedule_id,
+          'random' AS schedule_type,
+          rpo.site_id,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name,
+          pp.qr_token,
+          pp.active AS point_active,
+          ${PATROL_TIMING.revealMinutesBefore}::int AS reminder_minutes_before,
+          rpo.scheduled_at
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
+        INNER JOIN sites s ON s.id = rpo.site_id
+        WHERE rpo.id = $1
+          AND rpo.site_id = $2
+          AND rpo.company_id = $3
+          AND rpd.company_id = $3
+          AND s.company_id = $3
+          AND pp.active = TRUE
+        LIMIT 1
+        `,
+        [normalizedScheduleId, siteId, companyId]
+      )
+      : await pool.query(
+        `
       SELECT
         ps.id AS schedule_id,
         ps.schedule_type,
@@ -10825,9 +10911,9 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         AND ps.active = true
         AND pp.active = true
       LIMIT 1
-      `,
-      [normalizedScheduleId, siteId, companyId]
-    );
+        `,
+        [normalizedScheduleId, siteId, companyId]
+      );
 
     if (patrolResult.rows.length === 0) {
       return res.status(404).json({
@@ -10845,8 +10931,32 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
       });
     }
 
-    const windowResult = await pool.query(
-      `
+    const windowResult = patrol.schedule_type === "random"
+      ? await pool.query(
+        `
+        WITH occurrence_window AS (
+          SELECT
+            $1::timestamp AS scheduled_at,
+            (NOW() AT TIME ZONE $2::text) AS local_now
+        )
+        SELECT
+          scheduled_at,
+          scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes' AS scan_available_from,
+          scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes' AS scan_available_until,
+          local_now,
+          CASE
+            WHEN local_now < scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes' THEN 'scheduled'
+            WHEN local_now >= scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes' THEN 'missed'
+            WHEN local_now < scheduled_at THEN 'due_soon'
+            ELSE 'overdue'
+          END AS current_status,
+          GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (local_now - scheduled_at)) / 60))::int AS delay_minutes
+        FROM occurrence_window
+        `,
+        [patrol.scheduled_at, companyTimezone]
+      )
+      : await pool.query(
+        `
       WITH schedule_context AS (
         SELECT
           ps.schedule_type,
@@ -10854,7 +10964,6 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           ps.scheduled_time,
           ps.interval_hours,
           ps.start_time,
-          COALESCE(ps.reminder_minutes_before, 5) AS reminder_minutes_before,
           (NOW() AT TIME ZONE $2::text) AS local_now,
           (
             (ps.created_at AT TIME ZONE $2::text)::date
@@ -10883,8 +10992,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
       candidate_occurrences AS (
         SELECT
           (sc.scheduled_date::timestamp + sc.scheduled_time) AS scheduled_at,
-          sc.local_now,
-          sc.reminder_minutes_before
+          sc.local_now
         FROM schedule_context sc
         WHERE sc.schedule_type = 'manual'
           AND sc.scheduled_date IS NOT NULL
@@ -10897,8 +11005,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
             ri.anchor_time
             + (candidate_index * ri.interval_hours) * INTERVAL '1 hour'
           ) AS scheduled_at,
-          ri.local_now,
-          ri.reminder_minutes_before
+          ri.local_now
         FROM recurring_index ri
         CROSS JOIN LATERAL generate_series(
           GREATEST(ri.base_index, 0),
@@ -10910,11 +11017,10 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         SELECT
           scheduled_at,
           (
-            scheduled_at
-            - (reminder_minutes_before || ' minutes')::interval
+            scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes'
           ) AS scan_available_from,
-          (scheduled_at + INTERVAL '15 minutes') AS scan_available_until,
-          (scheduled_at + INTERVAL '16 minutes') AS missed_at,
+          (scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes') AS scan_available_until,
+          (scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes') AS missed_at,
           local_now
         FROM candidate_occurrences
       )
@@ -10946,9 +11052,9 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         END,
         ABS(EXTRACT(EPOCH FROM (local_now - scheduled_at))) ASC
       LIMIT 1
-      `,
-      [normalizedScheduleId, companyTimezone, siteId]
-    );
+        `,
+        [normalizedScheduleId, companyTimezone, siteId]
+      );
 
     if (windowResult.rows.length === 0) {
       return res.status(409).json({
@@ -10988,9 +11094,11 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
       FROM patrol_logs
       WHERE site_id = $1
         AND point_id = $2
-        AND schedule_id = $3
-        AND schedule_type = $4
-        AND scheduled_at = $5::timestamp
+        AND (
+          ($4 = 'random' AND random_occurrence_id = $3)
+          OR
+          ($4 <> 'random' AND schedule_id = $3 AND schedule_type = $4 AND scheduled_at = $5::timestamp)
+        )
       LIMIT 1
       `,
       [
@@ -11028,6 +11136,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         was_missed,
         schedule_id,
         schedule_type,
+        random_occurrence_id,
         scan_available_from,
         scan_available_until
       )
@@ -11036,11 +11145,12 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         NOW(),
         $9,$10,
         CASE
-          WHEN $10::int > 0 THEN 'completed_late'
+          WHEN (NOW() AT TIME ZONE $16::text) > $9::timestamp + INTERVAL '${PATROL_TIMING.completedGraceMinutes} minutes'
+            THEN 'completed_late'
           ELSE 'completed'
         END,
         false,
-        $11,$12,$13,$14
+        $11,$12,$13,$14,$15
       )
       RETURNING *
       `,
@@ -11055,10 +11165,12 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         accuracy || null,
         scanWindow.scheduled_at,
         scanWindow.delay_minutes,
-        normalizedScheduleId,
+        patrol.schedule_type === "random" ? null : normalizedScheduleId,
         patrol.schedule_type,
+        patrol.schedule_type === "random" ? normalizedScheduleId : null,
         scanWindow.scan_available_from,
         scanWindow.scan_available_until,
+        companyTimezone,
       ]
     );
 
@@ -11095,7 +11207,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
 
     if (
       err.code === "23505" &&
-      err.constraint === "patrol_logs_occurrence_unique_idx"
+      ["patrol_logs_occurrence_unique_idx", "patrol_logs_random_occurrence_unique_idx"].includes(err.constraint)
     ) {
       return res.status(409).json({
         status: "error",
@@ -11920,23 +12032,26 @@ pl.longitude AS last_patrol_longitude
     ps.patrol_point_id AS point_id,
     pp.point_name,
     'recurring' AS schedule_type,
+    COALESCE(c.timezone, 'Europe/Athens') AS timezone,
     gs.expected_slot AS scheduled_at
   FROM patrol_schedules ps
 
   LEFT JOIN patrol_points pp
     ON pp.id = ps.patrol_point_id
+  INNER JOIN sites schedule_site ON schedule_site.id = ps.site_id
+  INNER JOIN companies c ON c.id = schedule_site.company_id
 
   CROSS JOIN LATERAL (
   SELECT
     (
-      (ps.created_at AT TIME ZONE 'Europe/Athens')::date
+      (ps.created_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
       + ps.start_time
     ) AS anchor_time,
 
-    (NOW() AT TIME ZONE 'Europe/Athens')::date AS day_start,
+    (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date AS day_start,
 
     (
-      (NOW() AT TIME ZONE 'Europe/Athens')::date
+      (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
       + INTERVAL '1 day'
     ) AS day_end
 ) w
@@ -11962,16 +12077,36 @@ AND gs.expected_slot < w.day_end
           ps.patrol_point_id AS point_id,
           pp.point_name,
           'manual' AS schedule_type,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone,
           (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
         FROM patrol_schedules ps
 
         LEFT JOIN patrol_points pp
           ON pp.id = ps.patrol_point_id
+        INNER JOIN sites schedule_site ON schedule_site.id = ps.site_id
+        INNER JOIN companies c ON c.id = schedule_site.company_id
 
         WHERE ps.schedule_type = 'manual'
   AND ps.active = true
   AND ps.scheduled_date =
-      (NOW() AT TIME ZONE 'Europe/Athens')::date
+      (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+      ),
+
+      random_next AS (
+        SELECT
+          rpo.site_id,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name,
+          'random' AS schedule_type,
+          rpd.timezone,
+          rpo.scheduled_at
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
+        WHERE rpd.local_date = (NOW() AT TIME ZONE rpd.timezone)::date
+          AND NOT EXISTS (
+            SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
+          )
       ),
 
       upcoming AS (
@@ -11982,6 +12117,11 @@ AND gs.expected_slot < w.day_end
 
         SELECT * FROM manual_next
         WHERE scheduled_at IS NOT NULL
+
+        UNION ALL
+
+        SELECT * FROM random_next
+        WHERE scheduled_at IS NOT NULL
       ),
 
       site_next AS (
@@ -11990,18 +12130,11 @@ AND gs.expected_slot < w.day_end
     point_id AS next_patrol_point_id,
     point_name AS next_patrol_point,
     schedule_type AS next_patrol_type,
+    timezone AS next_timezone,
     scheduled_at AS next_patrol
   FROM upcoming
   WHERE
-  (
-    schedule_type = 'manual'
-    AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
-  )
-  OR
-  (
-    schedule_type = 'recurring'
-AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
-  )
+  scheduled_at >= (NOW() AT TIME ZONE timezone)
   ORDER BY site_id, scheduled_at ASC
 ),
 
@@ -12027,29 +12160,14 @@ AND scheduled_at >= (NOW() AT TIME ZONE 'Europe/Athens')
           END,
         'status',
   CASE
-  WHEN u.schedule_type = 'manual'
-    AND u.scheduled_at + INTERVAL '16 minutes' <= (NOW() AT TIME ZONE 'Europe/Athens')
+  WHEN u.scheduled_at + INTERVAL '2 hours' <= (NOW() AT TIME ZONE u.timezone)
     THEN 'missed'
 
-  WHEN u.schedule_type = 'manual'
-    AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens')
+  WHEN u.scheduled_at < (NOW() AT TIME ZONE u.timezone)
     THEN 'overdue'
 
-  WHEN u.schedule_type = 'manual'
-    AND u.scheduled_at <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes'
+  WHEN u.scheduled_at <= (NOW() AT TIME ZONE u.timezone) + INTERVAL '5 minutes'
     THEN 'due_soon'
-
-  WHEN u.schedule_type = 'recurring'
-  AND u.scheduled_at + INTERVAL '16 minutes' <= (NOW() AT TIME ZONE 'Europe/Athens')
-  THEN 'missed'
-
-WHEN u.schedule_type = 'recurring'
-  AND u.scheduled_at < (NOW() AT TIME ZONE 'Europe/Athens')
-  THEN 'overdue'
-
-WHEN u.schedule_type = 'recurring'
-  AND u.scheduled_at <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes'
-  THEN 'due_soon'
 
   ELSE 'scheduled'
 END,
@@ -12112,9 +12230,9 @@ sn.next_patrol_type,
 
         CASE
   WHEN sn.next_patrol IS NULL THEN 'not_scheduled'
-  WHEN sn.next_patrol + INTERVAL '16 minutes' <= (NOW() AT TIME ZONE 'Europe/Athens') THEN 'missed'
-WHEN sn.next_patrol < (NOW() AT TIME ZONE 'Europe/Athens') THEN 'overdue'
-WHEN sn.next_patrol <= (NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '5 minutes' THEN 'due_soon'
+  WHEN sn.next_patrol + INTERVAL '2 hours' <= (NOW() AT TIME ZONE sn.next_timezone) THEN 'missed'
+WHEN sn.next_patrol < (NOW() AT TIME ZONE sn.next_timezone) THEN 'overdue'
+WHEN sn.next_patrol <= (NOW() AT TIME ZONE sn.next_timezone) + INTERVAL '5 minutes' THEN 'due_soon'
   ELSE 'scheduled'
 END AS patrol_status,
 
@@ -12600,7 +12718,7 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
 
-    AND gs.expected_slot + INTERVAL '16 minutes' <=
+    AND gs.expected_slot + INTERVAL '2 hours' <=
       (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
 
     AND NOT EXISTS (
@@ -12648,7 +12766,7 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
           ON g.id = gs.guard_id
         WHERE ps.schedule_type = 'manual'
           AND (
-            ps.scheduled_date + ps.scheduled_time + INTERVAL '16 minutes'
+            ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
           ) <= (
             NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
           )
@@ -12659,10 +12777,34 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
               AND COALESCE(pl.schedule_type, 'manual') = 'manual'
           )
       ),
+      random_missed AS (
+        SELECT
+          CONCAT('random-missed-', rpo.id) AS id,
+          rpo.site_id,
+          s.name AS site_name,
+          s.location AS site_location,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name,
+          rpo.scheduled_at,
+          'random' AS schedule_type,
+          'missed' AS status,
+          NULL::text AS guard_name
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN sites s ON s.id = rpo.site_id AND s.company_id = rpo.company_id
+        INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
+        WHERE rpo.scheduled_at + INTERVAL '2 hours' <=
+          (NOW() AT TIME ZONE rpd.timezone)
+          AND NOT EXISTS (
+            SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
+          )
+      ),
       combined AS (
         SELECT * FROM recurring_missed
         UNION ALL
         SELECT * FROM manual_missed
+        UNION ALL
+        SELECT * FROM random_missed
       )
       SELECT
   combined.*,
@@ -13261,7 +13403,8 @@ app.get(
           matched_log.id AS patrol_log_id,
           matched_log.patrol_time,
           matched_log.guard_name,
-          matched_log.delay_minutes
+          matched_log.delay_minutes,
+          matched_log.completion_status
 
         FROM patrol_schedules ps
 
@@ -13278,6 +13421,7 @@ app.get(
           SELECT
             pl.id,
             pl.patrol_time,
+            pl.completion_status,
             g.full_name AS guard_name,
             FLOOR(
               EXTRACT(
@@ -13313,21 +13457,21 @@ app.get(
             THEN 'cancelled'
 
           WHEN patrol_log_id IS NOT NULL
-            AND patrol_time <= scheduled_at
+            AND completion_status <> 'completed_late'
             THEN 'completed'
 
           WHEN patrol_log_id IS NOT NULL
-            AND patrol_time > scheduled_at
+            AND completion_status = 'completed_late'
             THEN 'completed_late'
 
           WHEN patrol_log_id IS NULL
             AND (NOW() AT TIME ZONE company_timezone)
-              < scheduled_at + INTERVAL '16 minutes'
+              < scheduled_at + INTERVAL '2 hours'
             THEN 'pending'
 
           WHEN patrol_log_id IS NULL
             AND (NOW() AT TIME ZONE company_timezone)
-              >= scheduled_at + INTERVAL '16 minutes'
+              >= scheduled_at + INTERVAL '2 hours'
             THEN 'missed'
 
           ELSE 'pending'
@@ -14064,6 +14208,13 @@ async function startBackend() {
 
   setTimeout(runPatrolPushScheduler, 10000);
   setInterval(runPatrolPushScheduler, 60000);
+
+  const runRandomPatrolGenerator = () =>
+    generateRandomPatrolsForCurrentLocalDay(pool).catch((error) => {
+      console.error("Random Patrol generator error:", error);
+    });
+  setTimeout(runRandomPatrolGenerator, 15000);
+  setInterval(runRandomPatrolGenerator, 60000);
 }
 
 startBackend().catch((err) => {
