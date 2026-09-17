@@ -6,6 +6,7 @@ const MIGRATIONS = [
   "2026-09-15-unified-alert-dispatch.sql",
   "2026-09-16-alert-delivery-status.sql",
   "2026-09-17-random-daily-patrols.sql",
+  "2026-09-18-same-day-random-activation.sql",
 ];
 
 async function runMigrations(pool) {

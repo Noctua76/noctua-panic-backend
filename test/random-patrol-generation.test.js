@@ -4,7 +4,24 @@ const assert = require("node:assert/strict");
 const {
   generateRandomPatrolsForCurrentLocalDay,
   getAuthorizedSite,
+  resolveConfigurationActivation,
 } = require("../patrol/random-patrols");
+
+test("first enable and re-enable are effective today; active count changes wait", () => {
+  const dates = { today: "2026-09-18", tomorrow: "2026-09-19" };
+  assert.deepEqual(
+    resolveConfigurationActivation({ enabled: true, previousEnabled: undefined, ...dates }),
+    { isActivation: true, effectiveFromDate: dates.today }
+  );
+  assert.deepEqual(
+    resolveConfigurationActivation({ enabled: true, previousEnabled: false, ...dates }),
+    { isActivation: true, effectiveFromDate: dates.today }
+  );
+  assert.deepEqual(
+    resolveConfigurationActivation({ enabled: true, previousEnabled: true, ...dates }),
+    { isActivation: false, effectiveFromDate: dates.tomorrow }
+  );
+});
 
 test("tenant site authorization derives company scope from authenticated context", async () => {
   let captured;

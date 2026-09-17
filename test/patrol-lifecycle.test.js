@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   classifyPatrolLifecycle,
   generateRandomMinuteOffsets,
+  generatePartialDayMinuteOffsets,
 } = require("../patrol/lifecycle");
 
 const scheduledAt = "2026-09-17T12:00:00.000Z";
@@ -47,4 +48,42 @@ test("random daily times are unique, sorted and at least 30 minutes apart", () =
 test("random patrol count accepts only 1 through 20", () => {
   assert.throws(() => generateRandomMinuteOffsets(0));
   assert.throws(() => generateRandomMinuteOffsets(21));
+});
+
+test("partial first day creates only future, reveal-safe, spaced occurrences", () => {
+  let call = 0;
+  const offsets = generatePartialDayMinuteOffsets({
+    currentMinute: 18 * 60,
+    currentSecond: 20,
+    maxCount: 19,
+    randomInt: () => (call++ === 0 ? 0 : 15),
+  });
+
+  assert.ok(offsets.length > 0);
+  assert.ok(offsets.length < 19);
+  assert.ok(offsets[0] >= (18 * 60) + 17);
+  assert.ok(offsets.every((minute) => minute <= 1439));
+  for (let index = 1; index < offsets.length; index += 1) {
+    assert.ok(offsets[index] - offsets[index - 1] >= 30);
+  }
+});
+
+test("late-day activation may create an empty but valid partial schedule", () => {
+  const offsets = generatePartialDayMinuteOffsets({
+    currentMinute: 23 * 60 + 50,
+    currentSecond: 0,
+    maxCount: 20,
+    randomInt: () => 0,
+  });
+  assert.deepEqual(offsets, []);
+});
+
+test("next full day still generates the exact configured count", () => {
+  let value = 0;
+  const offsets = generateRandomMinuteOffsets(19, () => {
+    const result = value;
+    value += 30;
+    return result;
+  });
+  assert.equal(offsets.length, 19);
 });
