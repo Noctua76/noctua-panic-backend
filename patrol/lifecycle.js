@@ -66,7 +66,7 @@ function generateRandomMinuteOffsets(count, randomInt) {
   let attempts = 0;
   while (selected.length < count && attempts < 20000) {
     attempts += 1;
-    const minute = 16 + draw(1424);
+    const minute = 17 + draw(1423);
     if (selected.every((existing) => Math.abs(existing - minute) >= 30)) {
       selected.push(minute);
     }
@@ -77,8 +77,39 @@ function generateRandomMinuteOffsets(count, randomInt) {
   return selected.sort((a, b) => a - b);
 }
 
+function generatePartialDayMinuteOffsets({
+  currentMinute,
+  currentSecond = 0,
+  maxCount,
+  randomInt,
+}) {
+  if (!Number.isInteger(maxCount) || maxCount < 1 || maxCount > 20) {
+    throw new Error("Random patrol count must be an integer between 1 and 20");
+  }
+  if (!Number.isInteger(currentMinute) || currentMinute < 0 || currentMinute > 1439) {
+    throw new Error("currentMinute must be between 0 and 1439");
+  }
+
+  const draw = randomInt || ((max) => require("crypto").randomInt(max));
+  const roundedCurrentMinute = currentMinute + (Number(currentSecond) > 0 ? 1 : 0);
+  const earliestMinute =
+    roundedCurrentMinute + PATROL_TIMING.revealMinutesBefore + 1;
+  const selected = [];
+
+  if (earliestMinute > 1439) return selected;
+
+  let minute = earliestMinute + draw(Math.min(31, 1440 - earliestMinute));
+  while (minute <= 1439 && selected.length < maxCount) {
+    selected.push(minute);
+    minute += 30 + draw(31);
+  }
+
+  return selected;
+}
+
 module.exports = {
   PATROL_TIMING,
   classifyPatrolLifecycle,
   generateRandomMinuteOffsets,
+  generatePartialDayMinuteOffsets,
 };
