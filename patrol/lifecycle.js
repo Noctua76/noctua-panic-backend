@@ -57,24 +57,76 @@ function classifyPatrolLifecycle({ scheduledAt, completedAt = null, now = new Da
   };
 }
 
+const RANDOM_PATROL_MINIMUM_SPACING_MINUTES = 30;
+
+function generateBalancedMinuteOffsets({
+  windowStartMinute,
+  windowEndMinute,
+  count,
+  randomInt,
+}) {
+  if (!Number.isInteger(windowStartMinute) || !Number.isInteger(windowEndMinute)) {
+    throw new Error("Random patrol window boundaries must be whole minutes");
+  }
+  if (windowStartMinute < 0 || windowEndMinute > 1439 || windowStartMinute > windowEndMinute) {
+    return [];
+  }
+  if (!Number.isInteger(count) || count < 1) return [];
+
+  const feasibleCount = Math.floor(
+    (windowEndMinute - windowStartMinute) / RANDOM_PATROL_MINIMUM_SPACING_MINUTES
+  ) + 1;
+  const generatedCount = Math.min(count, feasibleCount);
+  const totalMinutes = windowEndMinute - windowStartMinute + 1;
+  const segments = Array.from({ length: generatedCount }, (_, index) => ({
+    start: windowStartMinute + Math.floor((index * totalMinutes) / generatedCount),
+    end: windowStartMinute
+      + Math.floor(((index + 1) * totalMinutes) / generatedCount)
+      - 1,
+  }));
+
+  // Work backwards to cap each draw at a minute that still leaves a valid
+  // >=30-minute choice inside every later segment.
+  const latest = new Array(generatedCount);
+  latest[generatedCount - 1] = segments[generatedCount - 1].end;
+  for (let index = generatedCount - 2; index >= 0; index -= 1) {
+    latest[index] = Math.min(
+      segments[index].end,
+      latest[index + 1] - RANDOM_PATROL_MINIMUM_SPACING_MINUTES
+    );
+  }
+
+  const draw = randomInt || ((max) => require("crypto").randomInt(max));
+  const selected = [];
+  for (let index = 0; index < generatedCount; index += 1) {
+    const earliest = Math.max(
+      segments[index].start,
+      index === 0
+        ? windowStartMinute
+        : selected[index - 1] + RANDOM_PATROL_MINIMUM_SPACING_MINUTES
+    );
+    const latestAllowed = latest[index];
+    if (earliest > latestAllowed) {
+      throw new Error("Unable to generate balanced random patrol times with 30-minute spacing");
+    }
+    selected.push(earliest + draw(latestAllowed - earliest + 1));
+  }
+
+  return selected;
+}
+
 function generateRandomMinuteOffsets(count, randomInt) {
   if (!Number.isInteger(count) || count < 1 || count > 20) {
     throw new Error("Random patrol count must be an integer between 1 and 20");
   }
-  const draw = randomInt || ((max) => require("crypto").randomInt(max));
-  const selected = [];
-  let attempts = 0;
-  while (selected.length < count && attempts < 20000) {
-    attempts += 1;
-    const minute = 17 + draw(1423);
-    if (selected.every((existing) => Math.abs(existing - minute) >= 30)) {
-      selected.push(minute);
-    }
-  }
-  if (selected.length !== count) {
-    throw new Error("Unable to generate random patrol times with 30-minute spacing");
-  }
-  return selected.sort((a, b) => a - b);
+  return generateBalancedMinuteOffsets({
+    // Full-day generation runs at 00:01. Minute 17 preserves the existing
+    // reveal/notification safety buffer for the first possible occurrence.
+    windowStartMinute: 17,
+    windowEndMinute: 1439,
+    count,
+    randomInt,
+  });
 }
 
 function generatePartialDayMinuteOffsets({
@@ -90,26 +142,22 @@ function generatePartialDayMinuteOffsets({
     throw new Error("currentMinute must be between 0 and 1439");
   }
 
-  const draw = randomInt || ((max) => require("crypto").randomInt(max));
   const roundedCurrentMinute = currentMinute + (Number(currentSecond) > 0 ? 1 : 0);
   const earliestMinute =
     roundedCurrentMinute + PATROL_TIMING.revealMinutesBefore + 1;
-  const selected = [];
-
-  if (earliestMinute > 1439) return selected;
-
-  let minute = earliestMinute + draw(Math.min(31, 1440 - earliestMinute));
-  while (minute <= 1439 && selected.length < maxCount) {
-    selected.push(minute);
-    minute += 30 + draw(31);
-  }
-
-  return selected;
+  return generateBalancedMinuteOffsets({
+    windowStartMinute: earliestMinute,
+    windowEndMinute: 1439,
+    count: maxCount,
+    randomInt,
+  });
 }
 
 module.exports = {
   PATROL_TIMING,
+  RANDOM_PATROL_MINIMUM_SPACING_MINUTES,
   classifyPatrolLifecycle,
+  generateBalancedMinuteOffsets,
   generateRandomMinuteOffsets,
   generatePartialDayMinuteOffsets,
 };
