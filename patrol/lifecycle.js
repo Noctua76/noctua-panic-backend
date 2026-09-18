@@ -9,14 +9,74 @@ function minutesBetween(later, earlier) {
   return Math.floor((later.getTime() - earlier.getTime()) / 60000);
 }
 
-function classifyPatrolLifecycle({ scheduledAt, completedAt = null, now = new Date() }) {
+function getScheduledShiftWindow(scheduledShiftStart, scheduledShiftEnd) {
+  const start = scheduledShiftStart ? new Date(scheduledShiftStart) : null;
+  const end = scheduledShiftEnd ? new Date(scheduledShiftEnd) : null;
+
+  if (
+    !start ||
+    !end ||
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    end <= start
+  ) {
+    return null;
+  }
+
+  return { start, end };
+}
+
+function isWithinScheduledShift({
+  scheduledAt,
+  scheduledShiftStart = null,
+  scheduledShiftEnd = null,
+}) {
+  const scheduled = new Date(scheduledAt);
+  const shift = getScheduledShiftWindow(
+    scheduledShiftStart,
+    scheduledShiftEnd
+  );
+
+  if (!shift) return true;
+  return scheduled >= shift.start && scheduled < shift.end;
+}
+
+function resolveEffectiveMissedAt({
+  scheduledAt,
+  scheduledShiftStart = null,
+  scheduledShiftEnd = null,
+}) {
+  const scheduled = new Date(scheduledAt);
+  const normalMissedAt = new Date(
+    scheduled.getTime() + PATROL_TIMING.missedAfterMinutes * 60000
+  );
+  const shift = getScheduledShiftWindow(
+    scheduledShiftStart,
+    scheduledShiftEnd
+  );
+
+  if (!shift) return normalMissedAt;
+  return shift.end < normalMissedAt ? shift.end : normalMissedAt;
+}
+
+function classifyPatrolLifecycle({
+  scheduledAt,
+  completedAt = null,
+  now = new Date(),
+  scheduledShiftStart = null,
+  scheduledShiftEnd = null,
+}) {
   const scheduled = new Date(scheduledAt);
   const current = new Date(now);
   const completion = completedAt ? new Date(completedAt) : null;
   const revealAt = new Date(scheduled.getTime() - PATROL_TIMING.revealMinutesBefore * 60000);
   const scanOpensAt = new Date(scheduled.getTime() - PATROL_TIMING.scanOpenMinutesBefore * 60000);
   const completedUntil = new Date(scheduled.getTime() + PATROL_TIMING.completedGraceMinutes * 60000);
-  const missedAt = new Date(scheduled.getTime() + PATROL_TIMING.missedAfterMinutes * 60000);
+  const missedAt = resolveEffectiveMissedAt({
+    scheduledAt,
+    scheduledShiftStart,
+    scheduledShiftEnd,
+  });
 
   if (completion) {
     const status = completion <= completedUntil ? "completed" : "completed_late";
@@ -157,6 +217,8 @@ module.exports = {
   PATROL_TIMING,
   RANDOM_PATROL_MINIMUM_SPACING_MINUTES,
   classifyPatrolLifecycle,
+  isWithinScheduledShift,
+  resolveEffectiveMissedAt,
   generateBalancedMinuteOffsets,
   generateRandomMinuteOffsets,
   generatePartialDayMinuteOffsets,

@@ -2540,6 +2540,9 @@ async function requireGuardAuth(req, res, next) {
     gs.guard_id,
     s.company_id,
     gs.site_id,
+    gs.scheduled_shift_start,
+    gs.scheduled_shift_end,
+    gs.scheduled_shift_label,
     g.full_name,
 g.role,
 g.access_mode,
@@ -9903,6 +9906,9 @@ app.get(
         s.company_id,
         gs.login_time,
         gs.logout_time,
+        gs.scheduled_shift_start,
+        gs.scheduled_shift_end,
+        gs.scheduled_shift_label,
         g.full_name AS guard_name,
         s.name AS site_name,
         s.location AS site_location
@@ -9935,7 +9941,33 @@ app.get(
         SELECT
           $1::int AS guard_id,
           $2::int AS session_id,
-          $3::int AS site_id
+          $3::int AS site_id,
+          $5::timestamp AS scheduled_shift_start,
+          $6::timestamp AS scheduled_shift_end
+      ),
+
+      operational_window AS (
+        SELECT
+          CASE
+            WHEN scheduled_shift_start IS NOT NULL
+              AND scheduled_shift_end IS NOT NULL
+              AND scheduled_shift_end > scheduled_shift_start
+              THEN scheduled_shift_start
+            ELSE (NOW() AT TIME ZONE $4::text)::date::timestamp
+          END AS window_start,
+          CASE
+            WHEN scheduled_shift_start IS NOT NULL
+              AND scheduled_shift_end IS NOT NULL
+              AND scheduled_shift_end > scheduled_shift_start
+              THEN scheduled_shift_end
+            ELSE ((NOW() AT TIME ZONE $4::text)::date + INTERVAL '1 day')
+          END AS window_end,
+          (
+            scheduled_shift_start IS NOT NULL
+            AND scheduled_shift_end IS NOT NULL
+            AND scheduled_shift_end > scheduled_shift_start
+          ) AS has_scheduled_shift
+        FROM active_session
       ),
 
       recurring_slots AS (
@@ -9959,9 +9991,7 @@ app.get(
             (
               (ps.created_at AT TIME ZONE $4::text)::date
               + ps.start_time
-            ) AS anchor_time,
-            (NOW() AT TIME ZONE $4::text)::date AS day_start,
-            ((NOW() AT TIME ZONE $4::text)::date + INTERVAL '1 day') AS day_end
+            ) AS anchor_time
         ) w
 
         CROSS JOIN LATERAL generate_series(
@@ -9975,8 +10005,8 @@ app.get(
           AND ps.site_id = (SELECT site_id FROM active_session)
           AND ps.start_time IS NOT NULL
           AND ps.interval_hours IS NOT NULL
-          AND gs.expected_slot >= w.day_start
-          AND gs.expected_slot < w.day_end
+          AND gs.expected_slot >= (SELECT window_start FROM operational_window)
+          AND gs.expected_slot < (SELECT window_end FROM operational_window)
       ),
 
       manual_slots AS (
@@ -9998,7 +10028,10 @@ app.get(
         WHERE ps.schedule_type = 'manual'
           AND ps.active = true
           AND ps.site_id = (SELECT site_id FROM active_session)
-          AND ps.scheduled_date = (NOW() AT TIME ZONE $4::text)::date
+          AND (ps.scheduled_date::timestamp + ps.scheduled_time)
+            >= (SELECT window_start FROM operational_window)
+          AND (ps.scheduled_date::timestamp + ps.scheduled_time)
+            < (SELECT window_end FROM operational_window)
       ),
 
       random_slots AS (
@@ -10016,7 +10049,10 @@ app.get(
         INNER JOIN patrol_points pp
           ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
         WHERE rpo.site_id = (SELECT site_id FROM active_session)
-          AND rpd.local_date = (NOW() AT TIME ZONE $4::text)::date
+          AND rpo.company_id = $7::int
+          AND rpd.company_id = $7::int
+          AND rpo.scheduled_at >= (SELECT window_start FROM operational_window)
+          AND rpo.scheduled_at < (SELECT window_end FROM operational_window)
           AND (NOW() AT TIME ZONE $4::text) >=
             rpo.scheduled_at - INTERVAL '${PATROL_TIMING.revealMinutesBefore} minutes'
       ),
@@ -10037,13 +10073,23 @@ app.get(
             pi.scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes'
           ) AS scan_available_from,
 
-          (
-            pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
-          ) AS scan_available_until,
+          CASE
+            WHEN ow.has_scheduled_shift
+              THEN LEAST(
+                pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                ow.window_end
+              )
+            ELSE pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS scan_available_until,
 
-          (
-            pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
-          ) AS missed_at,
+          CASE
+            WHEN ow.has_scheduled_shift
+              THEN LEAST(
+                pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                ow.window_end
+              )
+            ELSE pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS missed_at,
 
           EXISTS (
             SELECT 1
@@ -10063,6 +10109,7 @@ app.get(
               )
           ) AS already_completed
         FROM patrol_items pi
+        CROSS JOIN operational_window ow
       )
 
       SELECT
@@ -10118,7 +10165,15 @@ app.get(
 
       ORDER BY scheduled_at ASC, point_id ASC
       `,
-      [guard_id, session_id, session.site_id, companyTimezone]
+      [
+        guard_id,
+        session_id,
+        session.site_id,
+        companyTimezone,
+        session.scheduled_shift_start,
+        session.scheduled_shift_end,
+        session.company_id,
+      ]
     );
 
     const completedResult = await pool.query(
@@ -10149,11 +10204,33 @@ app.get(
     ON pp.id = pl.point_id
   WHERE pl.guard_id = $1
     AND pl.site_id = $2
-    AND pl.patrol_time >= NOW() - INTERVAL '24 hours'
+    AND (
+      (
+        $3::timestamp IS NOT NULL
+        AND $4::timestamp IS NOT NULL
+        AND $4::timestamp > $3::timestamp
+        AND pl.scheduled_at >= $3::timestamp
+        AND pl.scheduled_at < $4::timestamp
+      )
+      OR
+      (
+        NOT (
+          $3::timestamp IS NOT NULL
+          AND $4::timestamp IS NOT NULL
+          AND $4::timestamp > $3::timestamp
+        )
+        AND pl.patrol_time >= NOW() - INTERVAL '24 hours'
+      )
+    )
   ORDER BY pl.patrol_time DESC
   LIMIT 20
   `,
-  [guard_id, session.site_id]
+  [
+    guard_id,
+    session.site_id,
+    session.scheduled_shift_start,
+    session.scheduled_shift_end,
+  ]
 );
 
     res.json({
@@ -10166,6 +10243,9 @@ app.get(
         id: session.session_id,
         site_id: session.site_id,
         login_time: session.login_time,
+        scheduled_shift_start: session.scheduled_shift_start,
+        scheduled_shift_end: session.scheduled_shift_end,
+        scheduled_shift_label: session.scheduled_shift_label,
       },
       site: {
         id: session.site_id,
@@ -10571,6 +10651,8 @@ async function runPatrolPushScheduler() {
           gs.id AS session_id,
           gs.guard_id,
           gs.site_id,
+          gs.scheduled_shift_start,
+          gs.scheduled_shift_end,
           s.name AS site_name,
           s.company_id,
           COALESCE(c.timezone, 'Europe/Athens') AS timezone
@@ -10712,6 +10794,16 @@ ORDER BY
 
       JOIN active_sessions
         ON active_sessions.site_id = e.site_id
+        AND (
+          active_sessions.scheduled_shift_start IS NULL
+          OR active_sessions.scheduled_shift_end IS NULL
+          OR active_sessions.scheduled_shift_end
+            <= active_sessions.scheduled_shift_start
+          OR (
+            e.scheduled_at >= active_sessions.scheduled_shift_start
+            AND e.scheduled_at < active_sessions.scheduled_shift_end
+          )
+        )
 
       WHERE (NOW() AT TIME ZONE e.timezone) >= e.reminder_at
         AND (NOW() AT TIME ZONE e.timezone) < e.scheduled_at
@@ -10856,6 +10948,8 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
     const sessionId = req.guard.session_id;
     const siteId = req.guard.site_id;
     const companyId = req.guard.company_id;
+    const scheduledShiftStart = req.guard.scheduled_shift_start;
+    const scheduledShiftEnd = req.guard.scheduled_shift_end;
     const companyTimezone = await getCompanyTimezone(companyId);
 
     const patrolResult = normalizedScheduleType === "random"
@@ -10937,23 +11031,54 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         WITH occurrence_window AS (
           SELECT
             $1::timestamp AS scheduled_at,
-            (NOW() AT TIME ZONE $2::text) AS local_now
+            (NOW() AT TIME ZONE $2::text) AS local_now,
+            $3::timestamp AS scheduled_shift_start,
+            $4::timestamp AS scheduled_shift_end,
+            (
+              $3::timestamp IS NOT NULL
+              AND $4::timestamp IS NOT NULL
+              AND $4::timestamp > $3::timestamp
+            ) AS has_scheduled_shift
         )
         SELECT
           scheduled_at,
           scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes' AS scan_available_from,
-          scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes' AS scan_available_until,
+          CASE
+            WHEN has_scheduled_shift
+              THEN LEAST(
+                scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                scheduled_shift_end
+              )
+            ELSE scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS scan_available_until,
           local_now,
           CASE
             WHEN local_now < scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes' THEN 'scheduled'
-            WHEN local_now >= scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes' THEN 'missed'
+            WHEN local_now >= CASE
+              WHEN has_scheduled_shift
+                THEN LEAST(
+                  scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                  scheduled_shift_end
+                )
+              ELSE scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+            END THEN 'missed'
             WHEN local_now < scheduled_at THEN 'due_soon'
             ELSE 'overdue'
           END AS current_status,
           GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (local_now - scheduled_at)) / 60))::int AS delay_minutes
         FROM occurrence_window
+        WHERE NOT has_scheduled_shift
+          OR (
+            scheduled_at >= scheduled_shift_start
+            AND scheduled_at < scheduled_shift_end
+          )
         `,
-        [patrol.scheduled_at, companyTimezone]
+        [
+          patrol.scheduled_at,
+          companyTimezone,
+          scheduledShiftStart,
+          scheduledShiftEnd,
+        ]
       )
       : await pool.query(
         `
@@ -10965,6 +11090,13 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           ps.interval_hours,
           ps.start_time,
           (NOW() AT TIME ZONE $2::text) AS local_now,
+          $4::timestamp AS scheduled_shift_start,
+          $5::timestamp AS scheduled_shift_end,
+          (
+            $4::timestamp IS NOT NULL
+            AND $5::timestamp IS NOT NULL
+            AND $5::timestamp > $4::timestamp
+          ) AS has_scheduled_shift,
           (
             (ps.created_at AT TIME ZONE $2::text)::date
             + ps.start_time
@@ -10992,7 +11124,10 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
       candidate_occurrences AS (
         SELECT
           (sc.scheduled_date::timestamp + sc.scheduled_time) AS scheduled_at,
-          sc.local_now
+          sc.local_now,
+          sc.scheduled_shift_start,
+          sc.scheduled_shift_end,
+          sc.has_scheduled_shift
         FROM schedule_context sc
         WHERE sc.schedule_type = 'manual'
           AND sc.scheduled_date IS NOT NULL
@@ -11005,7 +11140,10 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
             ri.anchor_time
             + (candidate_index * ri.interval_hours) * INTERVAL '1 hour'
           ) AS scheduled_at,
-          ri.local_now
+          ri.local_now,
+          ri.scheduled_shift_start,
+          ri.scheduled_shift_end,
+          ri.has_scheduled_shift
         FROM recurring_index ri
         CROSS JOIN LATERAL generate_series(
           GREATEST(ri.base_index, 0),
@@ -11019,9 +11157,26 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           (
             scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes'
           ) AS scan_available_from,
-          (scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes') AS scan_available_until,
-          (scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes') AS missed_at,
-          local_now
+          CASE
+            WHEN has_scheduled_shift
+              THEN LEAST(
+                scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                scheduled_shift_end
+              )
+            ELSE scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS scan_available_until,
+          CASE
+            WHEN has_scheduled_shift
+              THEN LEAST(
+                scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                scheduled_shift_end
+              )
+            ELSE scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS missed_at,
+          local_now,
+          scheduled_shift_start,
+          scheduled_shift_end,
+          has_scheduled_shift
         FROM candidate_occurrences
       )
 
@@ -11043,6 +11198,11 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           )
         )::int AS delay_minutes
       FROM occurrence_windows
+      WHERE NOT has_scheduled_shift
+        OR (
+          scheduled_at >= scheduled_shift_start
+          AND scheduled_at < scheduled_shift_end
+        )
       ORDER BY
         CASE
           WHEN local_now >= scan_available_from
@@ -11053,7 +11213,13 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
         ABS(EXTRACT(EPOCH FROM (local_now - scheduled_at))) ASC
       LIMIT 1
         `,
-        [normalizedScheduleId, companyTimezone, siteId]
+        [
+          normalizedScheduleId,
+          companyTimezone,
+          siteId,
+          scheduledShiftStart,
+          scheduledShiftEnd,
+        ]
       );
 
     if (windowResult.rows.length === 0) {
@@ -12682,7 +12848,17 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
 
     'recurring' AS schedule_type,
     'missed' AS status,
-    NULL::text AS guard_name
+    shift_owner.guard_name,
+    shift_owner.guard_session_id,
+    shift_owner.scheduled_shift_start,
+    shift_owner.scheduled_shift_end,
+    CASE
+      WHEN shift_owner.scheduled_shift_end IS NOT NULL
+        AND shift_owner.scheduled_shift_end
+          < gs.expected_slot + INTERVAL '2 hours'
+        THEN 'shift_end'
+      ELSE NULL::text
+    END AS missed_reason
 
   FROM patrol_schedules ps
 
@@ -12713,13 +12889,40 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
     (ps.interval_hours || ' hours')::interval
   ) AS gs(expected_slot)
 
+  LEFT JOIN LATERAL (
+    SELECT
+      guard_session.id AS guard_session_id,
+      guard_session.scheduled_shift_start,
+      guard_session.scheduled_shift_end,
+      guard.full_name AS guard_name
+    FROM guard_sessions guard_session
+    INNER JOIN guards guard
+      ON guard.id = guard_session.guard_id
+      AND guard.access_mode = 'standard'
+    WHERE guard_session.site_id = ps.site_id
+      AND guard_session.scheduled_shift_start IS NOT NULL
+      AND guard_session.scheduled_shift_end IS NOT NULL
+      AND guard_session.scheduled_shift_end
+        > guard_session.scheduled_shift_start
+      AND gs.expected_slot >= guard_session.scheduled_shift_start
+      AND gs.expected_slot < guard_session.scheduled_shift_end
+    ORDER BY guard_session.login_time DESC, guard_session.id DESC
+    LIMIT 1
+  ) shift_owner ON true
+
   WHERE ps.schedule_type = 'recurring'
     AND ps.active = true
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
 
-    AND gs.expected_slot + INTERVAL '2 hours' <=
-      (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
+    AND CASE
+      WHEN shift_owner.scheduled_shift_end IS NOT NULL
+        THEN LEAST(
+          gs.expected_slot + INTERVAL '2 hours',
+          shift_owner.scheduled_shift_end
+        )
+      ELSE gs.expected_slot + INTERVAL '2 hours'
+    END <= (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
 
     AND NOT EXISTS (
       SELECT 1
@@ -12740,7 +12943,17 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
           (ps.scheduled_date + ps.scheduled_time) AS scheduled_at,
           'manual' AS schedule_type,
           'missed' AS status,
-          g.full_name AS guard_name
+          shift_owner.guard_name,
+          shift_owner.guard_session_id,
+          shift_owner.scheduled_shift_start,
+          shift_owner.scheduled_shift_end,
+          CASE
+            WHEN shift_owner.scheduled_shift_end IS NOT NULL
+              AND shift_owner.scheduled_shift_end
+                < (ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours')
+              THEN 'shift_end'
+            ELSE NULL::text
+          END AS missed_reason
         FROM patrol_schedules ps
         LEFT JOIN sites s
           ON s.id = ps.site_id
@@ -12749,25 +12962,37 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
           ON c.id = s.company_id
         LEFT JOIN patrol_points pp
           ON pp.id = ps.patrol_point_id
-        LEFT JOIN guard_sessions gs
-          ON gs.site_id = ps.site_id
-          AND gs.login_time <= (ps.scheduled_date + ps.scheduled_time)
-          AND (
-            gs.logout_time IS NULL
-            OR gs.logout_time >= (ps.scheduled_date + ps.scheduled_time)
-          )
-            AND EXISTS (
-  SELECT 1
-  FROM guards operational_guard
-  WHERE operational_guard.id = gs.guard_id
-    AND operational_guard.access_mode = 'standard'
-)
-        LEFT JOIN guards g
-          ON g.id = gs.guard_id
+        LEFT JOIN LATERAL (
+          SELECT
+            guard_session.id AS guard_session_id,
+            guard_session.scheduled_shift_start,
+            guard_session.scheduled_shift_end,
+            guard.full_name AS guard_name
+          FROM guard_sessions guard_session
+          INNER JOIN guards guard
+            ON guard.id = guard_session.guard_id
+            AND guard.access_mode = 'standard'
+          WHERE guard_session.site_id = ps.site_id
+            AND guard_session.scheduled_shift_start IS NOT NULL
+            AND guard_session.scheduled_shift_end IS NOT NULL
+            AND guard_session.scheduled_shift_end
+              > guard_session.scheduled_shift_start
+            AND (ps.scheduled_date + ps.scheduled_time)
+              >= guard_session.scheduled_shift_start
+            AND (ps.scheduled_date + ps.scheduled_time)
+              < guard_session.scheduled_shift_end
+          ORDER BY guard_session.login_time DESC, guard_session.id DESC
+          LIMIT 1
+        ) shift_owner ON true
         WHERE ps.schedule_type = 'manual'
-          AND (
-            ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
-          ) <= (
+          AND CASE
+            WHEN shift_owner.scheduled_shift_end IS NOT NULL
+              THEN LEAST(
+                ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours',
+                shift_owner.scheduled_shift_end
+              )
+            ELSE ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
+          END <= (
             NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
           )
           AND NOT EXISTS (
@@ -12788,13 +13013,49 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
           rpo.scheduled_at,
           'random' AS schedule_type,
           'missed' AS status,
-          NULL::text AS guard_name
+          shift_owner.guard_name,
+          shift_owner.guard_session_id,
+          shift_owner.scheduled_shift_start,
+          shift_owner.scheduled_shift_end,
+          CASE
+            WHEN shift_owner.scheduled_shift_end IS NOT NULL
+              AND shift_owner.scheduled_shift_end
+                < rpo.scheduled_at + INTERVAL '2 hours'
+              THEN 'shift_end'
+            ELSE NULL::text
+          END AS missed_reason
         FROM random_patrol_occurrences rpo
         INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
         INNER JOIN sites s ON s.id = rpo.site_id AND s.company_id = rpo.company_id
         INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
-        WHERE rpo.scheduled_at + INTERVAL '2 hours' <=
-          (NOW() AT TIME ZONE rpd.timezone)
+        LEFT JOIN LATERAL (
+          SELECT
+            guard_session.id AS guard_session_id,
+            guard_session.scheduled_shift_start,
+            guard_session.scheduled_shift_end,
+            guard.full_name AS guard_name
+          FROM guard_sessions guard_session
+          INNER JOIN guards guard
+            ON guard.id = guard_session.guard_id
+            AND guard.access_mode = 'standard'
+          WHERE guard_session.site_id = rpo.site_id
+            AND guard_session.scheduled_shift_start IS NOT NULL
+            AND guard_session.scheduled_shift_end IS NOT NULL
+            AND guard_session.scheduled_shift_end
+              > guard_session.scheduled_shift_start
+            AND rpo.scheduled_at >= guard_session.scheduled_shift_start
+            AND rpo.scheduled_at < guard_session.scheduled_shift_end
+          ORDER BY guard_session.login_time DESC, guard_session.id DESC
+          LIMIT 1
+        ) shift_owner ON true
+        WHERE CASE
+          WHEN shift_owner.scheduled_shift_end IS NOT NULL
+            THEN LEAST(
+              rpo.scheduled_at + INTERVAL '2 hours',
+              shift_owner.scheduled_shift_end
+            )
+          ELSE rpo.scheduled_at + INTERVAL '2 hours'
+        END <= (NOW() AT TIME ZONE rpd.timezone)
           AND NOT EXISTS (
             SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
           )
@@ -13003,13 +13264,22 @@ if (!historyResponse.ok) {
             <td>${escapeHtml(
               item.schedule_type === "manual"
                 ? "Manual Patrol"
+                : item.schedule_type === "random"
+                ? "Random Patrol"
                 : "Routine Patrol"
             )}</td>
             <td>
   <strong>Guard:</strong> ${escapeHtml(item.guard_name || "-")}<br/>
-  <strong>Shift:</strong> ${escapeHtml(item.shift_label || "-")}
+  <strong>Shift:</strong> ${escapeHtml(item.shift_label || "-")}<br/>
+  <strong>Session:</strong> ${escapeHtml(item.guard_session_id ? `#${item.guard_session_id}` : "-")}
 </td>
-<td>${escapeHtml(item.status === "missed" ? "Missed" : item.status)}</td>
+<td>${escapeHtml(
+  item.status === "missed"
+    ? item.missed_reason === "shift_end"
+      ? "Missed - Shift ended"
+      : "Missed"
+    : item.status
+)}</td>
           </tr>
         `
       )
@@ -13386,6 +13656,24 @@ app.get(
           ps.scheduled_date,
           ps.scheduled_time,
           (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at,
+          CASE
+            WHEN shift_owner.scheduled_shift_end IS NOT NULL
+              THEN LEAST(
+                ps.scheduled_date::timestamp + ps.scheduled_time + INTERVAL '2 hours',
+                shift_owner.scheduled_shift_end
+              )
+            ELSE ps.scheduled_date::timestamp + ps.scheduled_time + INTERVAL '2 hours'
+          END AS missed_at,
+          shift_owner.guard_session_id,
+          shift_owner.scheduled_shift_start,
+          shift_owner.scheduled_shift_end,
+          CASE
+            WHEN shift_owner.scheduled_shift_end IS NOT NULL
+              AND shift_owner.scheduled_shift_end
+                < ps.scheduled_date::timestamp + ps.scheduled_time + INTERVAL '2 hours'
+              THEN 'shift_end'
+            ELSE NULL::text
+          END AS missed_reason,
 
           ps.reminder_minutes_before,
           ps.active,
@@ -13416,6 +13704,28 @@ app.get(
 
         LEFT JOIN patrol_points pp
           ON pp.id = ps.patrol_point_id
+
+        LEFT JOIN LATERAL (
+          SELECT
+            guard_session.id AS guard_session_id,
+            guard_session.scheduled_shift_start,
+            guard_session.scheduled_shift_end
+          FROM guard_sessions guard_session
+          INNER JOIN guards guard
+            ON guard.id = guard_session.guard_id
+            AND guard.access_mode = 'standard'
+          WHERE guard_session.site_id = ps.site_id
+            AND guard_session.scheduled_shift_start IS NOT NULL
+            AND guard_session.scheduled_shift_end IS NOT NULL
+            AND guard_session.scheduled_shift_end
+              > guard_session.scheduled_shift_start
+            AND (ps.scheduled_date::timestamp + ps.scheduled_time)
+              >= guard_session.scheduled_shift_start
+            AND (ps.scheduled_date::timestamp + ps.scheduled_time)
+              < guard_session.scheduled_shift_end
+          ORDER BY guard_session.login_time DESC, guard_session.id DESC
+          LIMIT 1
+        ) shift_owner ON true
 
         LEFT JOIN LATERAL (
           SELECT
@@ -13466,12 +13776,12 @@ app.get(
 
           WHEN patrol_log_id IS NULL
             AND (NOW() AT TIME ZONE company_timezone)
-              < scheduled_at + INTERVAL '2 hours'
+              < missed_at
             THEN 'pending'
 
           WHEN patrol_log_id IS NULL
             AND (NOW() AT TIME ZONE company_timezone)
-              >= scheduled_at + INTERVAL '2 hours'
+              >= missed_at
             THEN 'missed'
 
           ELSE 'pending'

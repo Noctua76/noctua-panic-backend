@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 
 const {
   classifyPatrolLifecycle,
+  isWithinScheduledShift,
+  resolveEffectiveMissedAt,
   generateBalancedMinuteOffsets,
   generateRandomMinuteOffsets,
   generatePartialDayMinuteOffsets,
@@ -34,6 +36,76 @@ test("completion after plus 15 and before plus 2 hours is late completed", () =>
     completedAt: "2026-09-17T12:15:00.001Z",
   });
   assert.equal(result.status, "completed_late");
+});
+
+test("scheduled shift end truncates the two-hour scan window", () => {
+  const input = {
+    scheduledAt: "2026-09-18T22:30:00.000Z",
+    scheduledShiftStart: "2026-09-18T15:00:00.000Z",
+    scheduledShiftEnd: "2026-09-18T23:00:00.000Z",
+  };
+
+  assert.equal(
+    resolveEffectiveMissedAt(input).toISOString(),
+    "2026-09-18T23:00:00.000Z"
+  );
+  assert.equal(
+    classifyPatrolLifecycle({
+      ...input,
+      now: "2026-09-18T22:59:59.999Z",
+    }).scanEnabled,
+    true
+  );
+  const closed = classifyPatrolLifecycle({
+    ...input,
+    now: "2026-09-18T23:00:00.000Z",
+  });
+  assert.equal(closed.status, "missed");
+  assert.equal(closed.scanEnabled, false);
+});
+
+test("cross-midnight shift keeps its pre-midnight patrol active", () => {
+  const result = classifyPatrolLifecycle({
+    scheduledAt: "2026-09-18T23:25:00.000Z",
+    scheduledShiftStart: "2026-09-18T23:00:00.000Z",
+    scheduledShiftEnd: "2026-09-19T07:00:00.000Z",
+    now: "2026-09-19T00:10:00.000Z",
+  });
+
+  assert.equal(result.status, "overdue");
+  assert.equal(result.scanEnabled, true);
+});
+
+test("shift ownership uses a half-open interval", () => {
+  const boundaryPatrol = "2026-09-18T23:00:00.000Z";
+
+  assert.equal(
+    isWithinScheduledShift({
+      scheduledAt: boundaryPatrol,
+      scheduledShiftStart: "2026-09-18T15:00:00.000Z",
+      scheduledShiftEnd: "2026-09-18T23:00:00.000Z",
+    }),
+    false
+  );
+  assert.equal(
+    isWithinScheduledShift({
+      scheduledAt: boundaryPatrol,
+      scheduledShiftStart: "2026-09-18T23:00:00.000Z",
+      scheduledShiftEnd: "2026-09-19T07:00:00.000Z",
+    }),
+    true
+  );
+});
+
+test("sessions without valid shift boundaries keep the two-hour fallback", () => {
+  assert.equal(
+    resolveEffectiveMissedAt({
+      scheduledAt,
+      scheduledShiftStart: null,
+      scheduledShiftEnd: null,
+    }).toISOString(),
+    "2026-09-17T14:00:00.000Z"
+  );
 });
 
 function expectedSegments(start, end, count) {
