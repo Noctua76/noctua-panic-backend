@@ -30,6 +30,8 @@ const {
   generateRandomPatrolsForCurrentLocalDay,
 } = require("./patrol/random-patrols");
 const { PATROL_TIMING } = require("./patrol/lifecycle");
+const { createShiftReportsRouter } = require("./reports/shift-reports");
+const { createSupabaseGuardReportsStorage } = require("./storage/supabase-storage");
 
 // ================================
 // TIMEZONE HELPERS
@@ -7983,6 +7985,16 @@ app.use(
 );
 
 app.use(createRandomPatrolRouter({ pool, requireAuth }));
+
+app.use(
+  createShiftReportsRouter({
+    pool,
+    requireAuth,
+    requireGuardAuth,
+    storage: createSupabaseGuardReportsStorage(),
+    puppeteer,
+  })
+);
 
 // Public endpoint intentionally exposes platform health only.
 app.get("/system/status", async (_req, res) => {
