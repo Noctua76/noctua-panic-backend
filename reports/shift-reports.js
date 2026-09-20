@@ -83,6 +83,22 @@ function normalizePositiveInteger(value, fieldName) {
   return parsed;
 }
 
+function normalizeIsoDate(value, fieldName) {
+  if (value === undefined || value === null || value === "") return null;
+  const normalized = String(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw badRequest(`Invalid ${fieldName}`);
+  }
+  const [year, month, day] = normalized.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) throw badRequest(`Invalid ${fieldName}`);
+  return normalized;
+}
+
 function buildAdminFilters(query, auth, startIndex = 1) {
   const clauses = [];
   const values = [];
@@ -109,8 +125,18 @@ function buildAdminFilters(query, auth, startIndex = 1) {
     if (!STATUSES.includes(value)) throw badRequest("Invalid status");
     add("r.status = ?", value);
   }
-  if (query.from) add("r.created_at >= ?::timestamptz", query.from);
-  if (query.to) add("r.created_at < (?::date + INTERVAL '1 day')", query.to);
+  if (query.from) {
+    add(
+      "r.created_at >= (?::date::timestamp AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))",
+      normalizeIsoDate(query.from, "from date")
+    );
+  }
+  if (query.to) {
+    add(
+      "r.created_at < ((?::date + 1)::timestamp AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))",
+      normalizeIsoDate(query.to, "to date")
+    );
+  }
   return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", values };
 }
 
@@ -143,12 +169,14 @@ function mapReport(row) {
     acknowledged_by_admin_id: row.acknowledged_by_admin_id,
     acknowledged_by_admin_name: row.acknowledged_by_admin_name,
     attachment_count: Number(row.attachment_count || 0),
+    company_timezone: row.company_timezone || "Europe/Athens",
   };
 }
 
 const REPORT_SELECT = `
   r.*,
   c.name AS company_name,
+  COALESCE(c.timezone, 'Europe/Athens') AS company_timezone,
   s.name AS site_name,
   g.full_name AS guard_name,
   reader.full_name AS read_by_admin_name,
@@ -160,6 +188,53 @@ JOIN sites s ON s.id = r.site_id
 JOIN guards g ON g.id = r.guard_id
 LEFT JOIN users reader ON reader.id = r.read_by_admin_id
 LEFT JOIN users acknowledger ON acknowledger.id = r.acknowledged_by_admin_id`;
+
+function pdfDisposition(value) {
+  return String(value || "").toLowerCase() === "inline" ? "inline" : "attachment";
+}
+
+function formatPdfDate(value, timezone = "Europe/Athens") {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(date);
+}
+
+function describeFilters(query = {}) {
+  const entries = [
+    ["Company", query.company_id],
+    ["Site", query.site_id],
+    ["Guard", query.guard_id],
+    ["From", query.from],
+    ["To", query.to],
+    ["Category", query.category],
+    ["Priority", query.priority],
+    ["Status", query.status],
+  ].filter(([, value]) => value);
+  return entries.length
+    ? entries.map(([name, value]) => `${name}: ${value}`).join(" · ")
+    : "No filters applied";
+}
+
+async function removeStorageWithRetry(storage, paths, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await storage.remove(paths);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+      }
+    }
+  }
+  throw lastError;
+}
 
 function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage, puppeteer }) {
   if (!pool || !requireAuth || !requireGuardAuth || !storage || !puppeteer) {
@@ -227,7 +302,11 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
       return res.status(201).json({ status: "ok", report: inserted.rows[0] });
     } catch (error) {
       if (client) await client.query("ROLLBACK").catch(() => {});
-      if (uploadedPaths.length) await storage.remove(uploadedPaths).catch((cleanupError) => console.error("Shift Report storage cleanup failed:", cleanupError));
+      if (uploadedPaths.length) {
+        await removeStorageWithRetry(storage, uploadedPaths).catch((cleanupError) =>
+          console.error("Shift Report storage cleanup failed after retries:", cleanupError)
+        );
+      }
       const status = error instanceof multer.MulterError ? 400 : (error.statusCode || 500);
       console.error("Create Shift Report error:", error);
       return res.status(status).json({ status: "error", message: status === 500 ? "Could not create Shift Report" : error.message });
@@ -264,8 +343,13 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
              COUNT(*) FILTER (WHERE r.status='NEW')::int AS "NEW",
              COUNT(*) FILTER (WHERE r.status='READ')::int AS "READ",
              COUNT(*) FILTER (WHERE r.status='ACKNOWLEDGED')::int AS "ACKNOWLEDGED",
-             COUNT(*) FILTER (WHERE r.created_at >= CURRENT_DATE)::int AS "TODAY"
-           FROM guard_shift_reports r ${filters.where}`,
+             COUNT(*) FILTER (
+               WHERE (r.created_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+                 = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+             )::int AS "TODAY"
+           FROM guard_shift_reports r
+           JOIN companies c ON c.id = r.company_id
+           ${filters.where}`,
           filters.values
         ),
       ]);
@@ -315,9 +399,31 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
     try {
       const filters = buildAdminFilters(req.query, req.auth);
       const result = await pool.query(`SELECT ${REPORT_SELECT} ${filters.where} ORDER BY r.created_at DESC LIMIT 500`, filters.values);
-      const rows = result.rows.map((row) => `<tr><td>${escapeHtml(row.report_number)}</td><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.site_name)}</td><td>${escapeHtml(row.guard_name)}</td><td>${escapeHtml(row.category)}</td><td>${escapeHtml(row.priority)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.message)}</td></tr>`).join("");
-      const html = pdfShell("Shift Reports", `<table><thead><tr><th>Report</th><th>Created</th><th>Site</th><th>Guard</th><th>Category</th><th>Priority</th><th>Status</th><th>Message</th></tr></thead><tbody>${rows || '<tr><td colspan="8">No reports</td></tr>'}</tbody></table>`);
-      return sendPdf(res, puppeteer, html, `shift-reports-${Date.now()}.pdf`);
+      const reports = result.rows;
+      const rows = reports.map((row) => `<tr><td>${escapeHtml(row.report_number)}</td><td>${escapeHtml(formatPdfDate(row.created_at, row.company_timezone))}</td><td>${escapeHtml(row.company_name)}</td><td>${escapeHtml(row.site_name)}</td><td>${escapeHtml(row.guard_name)}</td><td>${escapeHtml(row.session_id)}</td><td>${escapeHtml(formatPdfDate(row.scheduled_shift_start, row.company_timezone))}<br>→ ${escapeHtml(formatPdfDate(row.scheduled_shift_end, row.company_timezone))}</td><td>${escapeHtml(row.category)}</td><td>${escapeHtml(row.priority)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.message)}</td></tr>`).join("");
+      const reportIds = reports.map((row) => row.id);
+      const attachments = reportIds.length
+        ? await pool.query(
+          `SELECT report_id, storage_path, mime_type, original_filename
+           FROM guard_shift_report_attachments
+           WHERE report_id = ANY($1::bigint[])
+           ORDER BY report_id, created_at`,
+          [reportIds]
+        )
+        : { rows: [] };
+      const reportById = new Map(reports.map((row) => [String(row.id), row]));
+      const appendix = [];
+      for (const attachment of attachments.rows) {
+        const owner = reportById.get(String(attachment.report_id));
+        if (!owner) continue;
+        const data = await storage.download(attachment.storage_path);
+        appendix.push(`<section class="photo-page"><h3>${escapeHtml(owner.report_number)} · ${escapeHtml(owner.site_name)} · ${escapeHtml(owner.guard_name)}</h3><p>${escapeHtml(attachment.original_filename || "Photographic evidence")}</p><img class="attachment" src="data:${attachment.mime_type};base64,${data.toString("base64")}" alt="Shift Report attachment"></section>`);
+      }
+      const metadata = `<div class="pdf-meta"><strong>Applied Filters:</strong> ${escapeHtml(describeFilters(req.query))}<br><strong>Generated At:</strong> ${escapeHtml(formatPdfDate(new Date(), req.auth.company_timezone || "Europe/Athens"))}<br><strong>Generated By:</strong> ${escapeHtml(req.auth.full_name || req.auth.username || `Admin ${req.auth.user_id}`)}</div>`;
+      const table = `<table><thead><tr><th>Report</th><th>Created</th><th>Company</th><th>Site</th><th>Guard</th><th>Session</th><th>Shift</th><th>Category</th><th>Priority</th><th>Status</th><th>Message</th></tr></thead><tbody>${rows || '<tr><td colspan="11">No reports</td></tr>'}</tbody></table>`;
+      const appendixHtml = appendix.length ? `<h2 class="appendix-title">Photographic Appendix</h2>${appendix.join("")}` : "";
+      const html = pdfShell("Aegis Link · Shift Reports", `${metadata}${table}${appendixHtml}`);
+      return sendPdf(res, puppeteer, html, `Aegis-Link-Shift-Reports-${new Date().toISOString().slice(0, 10)}.pdf`, pdfDisposition(req.query.disposition));
     } catch (error) {
       return res.status(error.statusCode || 500).json({ status: "error", message: error.statusCode ? error.message : "Could not export Shift Reports" });
     }
@@ -409,8 +515,10 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
         const data = await storage.download(attachment.storage_path);
         images.push(`<img class="attachment" src="data:${attachment.mime_type};base64,${data.toString("base64")}" alt="Shift Report attachment">`);
       }
-      const content = `<h2>${escapeHtml(row.report_number)}</h2><dl><dt>Created</dt><dd>${escapeHtml(row.created_at)}</dd><dt>Site</dt><dd>${escapeHtml(row.site_name)}</dd><dt>Guard</dt><dd>${escapeHtml(row.guard_name)}</dd><dt>Shift</dt><dd>${escapeHtml(row.scheduled_shift_start || "—")} – ${escapeHtml(row.scheduled_shift_end || "—")}</dd><dt>Category</dt><dd>${escapeHtml(row.category)}</dd><dt>Priority</dt><dd>${escapeHtml(row.priority)}</dd><dt>Status</dt><dd>${escapeHtml(row.status)}</dd></dl><h3>Operational note</h3><p class="message">${escapeHtml(row.message)}</p>${images.join("")}`;
-      return sendPdf(res, puppeteer, pdfShell("Shift Report", content), `${row.report_number}.pdf`);
+      const timezone = row.company_timezone || "Europe/Athens";
+      const generatedBy = req.auth.full_name || req.auth.username || `Admin ${req.auth.user_id}`;
+      const content = `<h2>${escapeHtml(row.report_number)}</h2><dl><dt>Company</dt><dd>${escapeHtml(row.company_name)}</dd><dt>Site</dt><dd>${escapeHtml(row.site_name)}</dd><dt>Guard</dt><dd>${escapeHtml(row.guard_name)}</dd><dt>Session ID</dt><dd>${escapeHtml(row.session_id)}</dd><dt>Created</dt><dd>${escapeHtml(formatPdfDate(row.created_at, timezone))}</dd><dt>Shift</dt><dd>${escapeHtml(formatPdfDate(row.scheduled_shift_start, timezone))} – ${escapeHtml(formatPdfDate(row.scheduled_shift_end, timezone))}</dd><dt>Category</dt><dd>${escapeHtml(row.category)}</dd><dt>Priority</dt><dd>${escapeHtml(row.priority)}</dd><dt>Status</dt><dd>${escapeHtml(row.status)}</dd><dt>Read</dt><dd>${escapeHtml(row.read_by_admin_name || "—")} · ${escapeHtml(formatPdfDate(row.read_at, timezone))}</dd><dt>Acknowledged</dt><dd>${escapeHtml(row.acknowledged_by_admin_name || "—")} · ${escapeHtml(formatPdfDate(row.acknowledged_at, timezone))}</dd><dt>Generated At</dt><dd>${escapeHtml(formatPdfDate(new Date(), timezone))}</dd><dt>Generated By</dt><dd>${escapeHtml(generatedBy)}</dd></dl><h3>Operational note</h3><p class="message">${escapeHtml(row.message)}</p>${images.length ? '<h3 class="appendix-title">Photographic Evidence</h3>' : ""}${images.join("")}`;
+      return sendPdf(res, puppeteer, pdfShell("Aegis Link · Shift Report", content), `Aegis-Link-Shift-Report-${row.report_number}.pdf`, pdfDisposition(req.query.disposition));
     } catch (error) {
       return res.status(error.statusCode || 500).json({ status: "error", message: error.statusCode ? error.message : "Could not export Shift Report" });
     }
@@ -424,17 +532,17 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
 }
 
 function pdfShell(title, content) {
-  return `<!doctype html><html><head><meta charset="utf-8"><style>@page{size:A4;margin:16mm}body{font:12px Arial;color:#15202b}h1{margin:0 0 18px}table{border-collapse:collapse;width:100%;font-size:9px}th,td{border:1px solid #ccd5df;padding:6px;text-align:left;vertical-align:top}th{background:#eef2f6}dl{display:grid;grid-template-columns:110px 1fr;gap:6px}dt{font-weight:bold}.message{white-space:pre-wrap}.attachment{display:block;max-width:100%;max-height:650px;margin:16px auto;page-break-inside:avoid}</style></head><body><h1>${escapeHtml(title)}</h1>${content}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>@page{size:A4 landscape;margin:12mm}body{font:11px Arial;color:#15202b}h1{margin:0 0 14px}h2{margin-top:18px}table{border-collapse:collapse;width:100%;font-size:7.5px;table-layout:auto}th,td{border:1px solid #ccd5df;padding:5px;text-align:left;vertical-align:top;overflow-wrap:anywhere}th{background:#eef2f6}dl{display:grid;grid-template-columns:125px 1fr;gap:7px}dt{font-weight:bold}.message{white-space:pre-wrap;font-size:12px;line-height:1.5}.pdf-meta{margin:0 0 14px;padding:10px;background:#eef2f6;line-height:1.6}.appendix-title{page-break-before:always}.photo-page{page-break-before:always}.photo-page:first-of-type{page-break-before:auto}.photo-page h3,.photo-page p{margin:0 0 8px}.attachment{display:block;max-width:100%;max-height:680px;margin:14px auto;page-break-inside:avoid}</style></head><body><h1>${escapeHtml(title)}</h1>${content}</body></html>`;
 }
 
-async function sendPdf(res, puppeteer, html, filename) {
+async function sendPdf(res, puppeteer, html, filename, disposition = "attachment") {
   const browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox", "--disable-setuid-sandbox"] });
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
     const pdf = await page.pdf({ format: "A4", printBackground: true });
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Disposition", `${pdfDisposition(disposition)}; filename="${filename}"`);
     return res.send(pdf);
   } finally {
     await browser.close();
@@ -451,5 +559,11 @@ module.exports = {
   validateReportInput,
   buildAdminFilters,
   reportNumber,
+  pdfDisposition,
+  formatPdfDate,
+  describeFilters,
+  removeStorageWithRetry,
+  pdfShell,
+  sendPdf,
   createShiftReportsRouter,
 };
