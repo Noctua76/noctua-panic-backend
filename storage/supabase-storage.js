@@ -1,4 +1,5 @@
 const { createClient } = require("@supabase/supabase-js");
+const WebSocket = require("ws");
 
 function createSupabaseGuardReportsStorage({
   env = process.env,
@@ -16,6 +17,7 @@ function createSupabaseGuardReportsStorage({
 
   const client = createClientImpl(url, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
+    realtime: { transport: WebSocket },
   });
 
   return Object.freeze({
