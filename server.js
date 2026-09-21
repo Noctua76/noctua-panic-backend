@@ -34,11 +34,12 @@ const { createShiftReportsRouter } = require("./reports/shift-reports");
 const { createSupabaseGuardReportsStorage } = require("./storage/supabase-storage");
 const {
   PASSWORD_SETUP_TOKEN_TTL_MINUTES,
+  commitGuardPasswordReset,
   createPasswordSetupToken,
+  evaluatePasswordChangeCredential,
   generateTemporaryPassword,
   getTempPasswordTtlHours,
   parsePasswordSetupToken,
-  setupTokenMatches,
   validateGuardPassword,
 } = require("./auth/guard-password-lifecycle");
 
@@ -4000,8 +4001,8 @@ async function recordGuardPasswordAudit(queryable, {
   );
 }
 
-async function syncScheduledShiftsForSession(sessionId) {
-  await pool.query(
+async function syncScheduledShiftsForSession(sessionId, queryable = pool) {
+  await queryable.query(
     `
     INSERT INTO scheduled_shift_sessions (
       scheduled_shift_id,
@@ -4064,7 +4065,7 @@ WHERE gs.id = $1
     [sessionId]
   );
 
-  await pool.query(
+  await queryable.query(
     `
     UPDATE scheduled_shifts ss
     SET
@@ -4569,13 +4570,21 @@ app.post("/guard/change-password", async (req, res) => {
       [parsedToken.guardId]
     );
     const guard = result.rows[0];
-    const tokenValid = guard && guard.active === true &&
-      guard.access_mode === "standard" && guard.must_change_password === true &&
-      guard.password_setup_token_expires_at &&
-      new Date(guard.password_setup_token_expires_at).getTime() > Date.now() &&
-      setupTokenMatches(parsedToken.secret, guard.password_setup_token_hash);
+    const credentialState = evaluatePasswordChangeCredential(
+      guard,
+      parsedToken.secret
+    );
 
-    if (!tokenValid) {
+    if (credentialState.code === "TEMP_PASSWORD_EXPIRED") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        status: "error",
+        code: "TEMP_PASSWORD_EXPIRED",
+        message: "The temporary password has expired. Ask an administrator to reset it.",
+      });
+    }
+
+    if (!credentialState.valid) {
       await client.query("ROLLBACK");
       return res.status(403).json({ status: "error", code: "PASSWORD_SETUP_TOKEN_EXPIRED", message: "This password setup link is invalid or expired. Sign in again or contact an administrator." });
     }
@@ -4593,6 +4602,8 @@ app.post("/guard/change-password", async (req, res) => {
            password_setup_token_expires_at = NULL
        WHERE id = $2 AND must_change_password = TRUE
          AND password_setup_token_hash = $3
+         AND temporary_password_expires_at > NOW()
+         AND password_setup_token_expires_at > NOW()
        RETURNING id`,
       [passwordHash, guard.id, guard.password_setup_token_hash]
     );
@@ -7356,7 +7367,9 @@ async function resetGuardPassword(req, res) {
 
     const closed = await client.query(
       `UPDATE guard_sessions
-       SET logout_time = NOW(), status = 'password_reset', last_heartbeat = NOW()
+       SET logout_time = (NOW() AT TIME ZONE 'Europe/Athens'),
+           status = 'password_reset',
+           last_heartbeat = (NOW() AT TIME ZONE 'Europe/Athens')
        WHERE guard_id = $1 AND logout_time IS NULL
        RETURNING id`,
       [guardId]
@@ -7376,9 +7389,12 @@ async function resetGuardPassword(req, res) {
       actorUserId: req.auth.user_id, eventType: "GUARD_PASSWORD_RESET",
       metadata: { revoked_session_count: closedSessionIds.length, expires_at: guard.temporary_password_expires_at },
     });
-    await client.query("COMMIT");
 
-    for (const sessionId of closedSessionIds) await syncScheduledShiftsForSession(sessionId);
+    await commitGuardPasswordReset({
+      client,
+      closedSessionIds,
+      syncScheduledShiftsForSession,
+    });
 
     return res.json({
       status: "ok",
@@ -7387,7 +7403,11 @@ async function resetGuardPassword(req, res) {
       temporary_password_expires_at: guard.temporary_password_expires_at,
       guard: {
         id: guard.id, full_name: guard.full_name, username: guard.username,
-        site_id: guard.site_id, password_status: "temporary_pending",
+        site_id: guard.site_id,
+        password_status: "temporary_pending",
+        must_change_password: true,
+        temporary_password_expires_at: guard.temporary_password_expires_at,
+        password_changed_at: null,
       },
     });
   } catch (err) {

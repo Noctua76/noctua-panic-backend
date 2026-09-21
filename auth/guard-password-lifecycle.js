@@ -70,10 +70,43 @@ function setupTokenMatches(secret, storedHash) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
+function evaluatePasswordChangeCredential(guard, secret, now = Date.now()) {
+  if (!guard || guard.active !== true || guard.access_mode !== "standard" ||
+      guard.must_change_password !== true) {
+    return { valid: false, code: "PASSWORD_SETUP_TOKEN_EXPIRED" };
+  }
+
+  const temporaryPasswordExpiresAt = new Date(guard.temporary_password_expires_at).getTime();
+  if (!Number.isFinite(temporaryPasswordExpiresAt) || temporaryPasswordExpiresAt <= now) {
+    return { valid: false, code: "TEMP_PASSWORD_EXPIRED" };
+  }
+
+  const setupTokenExpiresAt = new Date(guard.password_setup_token_expires_at).getTime();
+  if (!Number.isFinite(setupTokenExpiresAt) || setupTokenExpiresAt <= now ||
+      !setupTokenMatches(secret, guard.password_setup_token_hash)) {
+    return { valid: false, code: "PASSWORD_SETUP_TOKEN_EXPIRED" };
+  }
+
+  return { valid: true, code: null };
+}
+
+async function commitGuardPasswordReset({
+  client,
+  closedSessionIds,
+  syncScheduledShiftsForSession,
+}) {
+  for (const sessionId of closedSessionIds) {
+    await syncScheduledShiftsForSession(sessionId, client);
+  }
+  await client.query("COMMIT");
+}
+
 module.exports = {
   DEFAULT_TEMP_PASSWORD_TTL_HOURS,
   PASSWORD_SETUP_TOKEN_TTL_MINUTES,
   createPasswordSetupToken,
+  commitGuardPasswordReset,
+  evaluatePasswordChangeCredential,
   generateTemporaryPassword,
   getTempPasswordTtlHours,
   parsePasswordSetupToken,
