@@ -25,6 +25,11 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       "utf8"
     );
     await client.query(migration);
+    const guardPasswordMigration = fs.readFileSync(
+      path.join(__dirname, "../database/2026-09-21-guard-password-lifecycle.sql"),
+      "utf8"
+    );
+    await client.query(guardPasswordMigration);
     await client.query(`
       INSERT INTO companies (id, name, timezone) VALUES (1, 'Noctua', 'Europe/Athens');
       INSERT INTO sites (id, company_id, name) VALUES (1, 1, 'Ekali');
@@ -70,6 +75,21 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       read_by_admin_id: 1,
       acknowledged_by_admin_id: 1,
     });
+
+    const passwordState = await client.query(
+      "SELECT must_change_password FROM guards WHERE id=1"
+    );
+    assert.equal(passwordState.rows[0].must_change_password, false);
+
+    await client.query(`
+      INSERT INTO guard_password_audit_events
+        (company_id, site_id, guard_id, actor_user_id, event_type)
+      VALUES (1, 1, 1, 1, 'GUARD_PASSWORD_RESET')
+    `);
+    await assert.rejects(
+      client.query("DELETE FROM guard_password_audit_events WHERE guard_id=1"),
+      /Guard password audit events are immutable/
+    );
   } finally {
     await client.end();
   }

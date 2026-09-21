@@ -32,6 +32,15 @@ const {
 const { PATROL_TIMING } = require("./patrol/lifecycle");
 const { createShiftReportsRouter } = require("./reports/shift-reports");
 const { createSupabaseGuardReportsStorage } = require("./storage/supabase-storage");
+const {
+  PASSWORD_SETUP_TOKEN_TTL_MINUTES,
+  createPasswordSetupToken,
+  generateTemporaryPassword,
+  getTempPasswordTtlHours,
+  parsePasswordSetupToken,
+  setupTokenMatches,
+  validateGuardPassword,
+} = require("./auth/guard-password-lifecycle");
 
 // ================================
 // TIMEZONE HELPERS
@@ -2559,6 +2568,7 @@ g.temporary_access_expiry_reason
   WHERE
     gs.session_token = $1
     AND gs.logout_time IS NULL
+    AND COALESCE(g.must_change_password, FALSE) = FALSE
     AND (
       g.access_mode <> 'standard'
       OR gs.scheduled_shift_end IS NULL
@@ -3979,6 +3989,17 @@ function startShiftDelayMonitor() {
   setInterval(runMonitor, 60000);
 }
 
+async function recordGuardPasswordAudit(queryable, {
+  companyId, siteId, guardId, actorUserId = null, eventType, metadata = {},
+}) {
+  await queryable.query(
+    `INSERT INTO guard_password_audit_events (
+       company_id, site_id, guard_id, actor_user_id, event_type, metadata
+     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+    [companyId, siteId, guardId, actorUserId, eventType, JSON.stringify(metadata)]
+  );
+}
+
 async function syncScheduledShiftsForSession(sessionId) {
   await pool.query(
     `
@@ -4310,6 +4331,44 @@ app.post("/guard/login", async (req, res) => {
       });
     }
 
+    if (guard.access_mode === "standard" && guard.must_change_password === true) {
+      const temporaryPasswordExpired = guard.temporary_password_expires_at &&
+        new Date(guard.temporary_password_expires_at).getTime() <= Date.now();
+
+      if (temporaryPasswordExpired) {
+        return res.status(403).json({
+          status: "error",
+          code: "TEMP_PASSWORD_EXPIRED",
+          message: "The temporary password has expired. Ask an administrator to reset it.",
+        });
+      }
+
+      const setup = createPasswordSetupToken(guard.id);
+      const setupResult = await pool.query(
+        `UPDATE guards g
+         SET password_setup_token_hash = $1,
+             password_setup_token_expires_at = NOW() + ($2 * INTERVAL '1 minute')
+         FROM sites s
+         WHERE g.id = $3 AND s.id = g.site_id
+           AND g.active = TRUE AND g.must_change_password = TRUE
+         RETURNING s.company_id, g.site_id`,
+        [setup.hash, PASSWORD_SETUP_TOKEN_TTL_MINUTES, guard.id]
+      );
+
+      if (setupResult.rows.length === 0) {
+        return res.status(403).json({ status: "error", message: "Password setup is unavailable." });
+      }
+
+      return res.json({
+        status: "password_change_required",
+        code: "GUARD_PASSWORD_CHANGE_REQUIRED",
+        message: "Create a permanent password before signing in.",
+        password_setup_token: setup.token,
+        password_setup_token_expires_in_minutes: PASSWORD_SETUP_TOKEN_TTL_MINUTES,
+        guard: { id: guard.id, username: guard.username, full_name: guard.full_name },
+      });
+    }
+
     guard = await activateTemporaryGuardAccess(guard);
 
 if (
@@ -4480,6 +4539,77 @@ temporary_access_expiry_reason:
       status: "error",
       message: err.message
     });
+  }
+});
+
+app.post("/guard/change-password", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { password_setup_token, new_password, confirm_password } = req.body || {};
+    const parsedToken = parsePasswordSetupToken(password_setup_token);
+
+    if (!parsedToken) {
+      return res.status(400).json({ status: "error", code: "INVALID_PASSWORD_SETUP_TOKEN", message: "Invalid password setup token." });
+    }
+    if (new_password !== confirm_password) {
+      return res.status(400).json({ status: "error", code: "PASSWORD_CONFIRMATION_MISMATCH", message: "Passwords do not match." });
+    }
+    const policy = validateGuardPassword(new_password);
+    if (!policy.valid) {
+      return res.status(400).json({ status: "error", code: "PASSWORD_POLICY_FAILED", message: policy.message, requirements: policy.errors });
+    }
+
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT g.*, s.company_id
+       FROM guards g
+       INNER JOIN sites s ON s.id = g.site_id
+       WHERE g.id = $1
+       FOR UPDATE OF g`,
+      [parsedToken.guardId]
+    );
+    const guard = result.rows[0];
+    const tokenValid = guard && guard.active === true &&
+      guard.access_mode === "standard" && guard.must_change_password === true &&
+      guard.password_setup_token_expires_at &&
+      new Date(guard.password_setup_token_expires_at).getTime() > Date.now() &&
+      setupTokenMatches(parsedToken.secret, guard.password_setup_token_hash);
+
+    if (!tokenValid) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", code: "PASSWORD_SETUP_TOKEN_EXPIRED", message: "This password setup link is invalid or expired. Sign in again or contact an administrator." });
+    }
+    if (await bcrypt.compare(new_password, guard.password_hash)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ status: "error", code: "PASSWORD_REUSE_NOT_ALLOWED", message: "The permanent password must differ from the temporary password." });
+    }
+
+    const passwordHash = await bcrypt.hash(new_password, 10);
+    const updated = await client.query(
+      `UPDATE guards
+       SET password_hash = $1, must_change_password = FALSE,
+           password_changed_at = NOW(), temporary_password_created_at = NULL,
+           temporary_password_expires_at = NULL, password_setup_token_hash = NULL,
+           password_setup_token_expires_at = NULL
+       WHERE id = $2 AND must_change_password = TRUE
+         AND password_setup_token_hash = $3
+       RETURNING id`,
+      [passwordHash, guard.id, guard.password_setup_token_hash]
+    );
+    if (updated.rows.length === 0) throw new Error("Password setup token was already used.");
+
+    await recordGuardPasswordAudit(client, {
+      companyId: guard.company_id, siteId: guard.site_id, guardId: guard.id,
+      eventType: "GUARD_PASSWORD_CHANGED", metadata: { source_ip: req.ip || null },
+    });
+    await client.query("COMMIT");
+    return res.json({ status: "ok", message: "Password created. Sign in with your new password." });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Guard change password error:", err);
+    return res.status(500).json({ status: "error", message: "Unable to change password." });
+  } finally {
+    client.release();
   }
 });
 
@@ -6817,6 +6947,14 @@ app.get(
           g.guard_notes,
           g.assignment_status,
           g.employment_status,
+          g.must_change_password,
+          g.temporary_password_expires_at,
+          g.password_changed_at,
+          CASE
+            WHEN g.must_change_password = FALSE THEN 'active'
+            WHEN g.temporary_password_expires_at <= NOW() THEN 'temporary_expired'
+            ELSE 'temporary_pending'
+          END AS password_status,
           s.name AS site_name
         FROM guards g
         INNER JOIN sites s
@@ -6854,6 +6992,7 @@ app.post(
   "/settings/guards",
   requireAuth,
   async (req, res) => {
+    const client = await pool.connect();
     try {
       const {
         full_name,
@@ -6872,11 +7011,23 @@ app.post(
         });
       }
 
+      const passwordPolicy = validateGuardPassword(password);
+      if (!passwordPolicy.valid) {
+        return res.status(400).json({
+          status: "error",
+          code: "PASSWORD_POLICY_FAILED",
+          message: passwordPolicy.message,
+          requirements: passwordPolicy.errors,
+        });
+      }
+
       const isSystemOwner = req.auth.role === "system_owner";
 
-      const siteResult = await pool.query(
+      await client.query("BEGIN");
+
+      const siteResult = await client.query(
         `
-        SELECT id
+        SELECT id, company_id
         FROM sites
         WHERE id = $1
           AND (
@@ -6892,6 +7043,7 @@ app.post(
       );
 
       if (siteResult.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({
           status: "error",
           message: "Site not found",
@@ -6900,7 +7052,8 @@ app.post(
 
       const passwordHash = await bcrypt.hash(password, 10);
 
-      const result = await pool.query(
+      const temporaryPasswordTtlHours = getTempPasswordTtlHours();
+      const result = await client.query(
         `
         INSERT INTO guards (
           full_name,
@@ -6910,9 +7063,13 @@ app.post(
           site_id,
           active,
           password_hash,
+          must_change_password,
+          temporary_password_created_at,
+          temporary_password_expires_at,
+          password_changed_at,
           created_at
         )
-        VALUES ($1,$2,$3,$4,$5,true,$6,NOW())
+        VALUES ($1,$2,$3,$4,$5,true,$6,true,NOW(),NOW() + ($7 * INTERVAL '1 hour'),NULL,NOW())
         RETURNING
           id,
           full_name,
@@ -6921,6 +7078,9 @@ app.post(
           role,
           site_id,
           active,
+          must_change_password,
+          temporary_password_expires_at,
+          password_changed_at,
           created_at
         `,
         [
@@ -6930,20 +7090,39 @@ app.post(
           role,
           site_id,
           passwordHash,
+          temporaryPasswordTtlHours,
         ]
       );
 
-      return res.json({
+      await recordGuardPasswordAudit(client, {
+        companyId: siteResult.rows[0].company_id,
+        siteId: Number(site_id),
+        guardId: result.rows[0].id,
+        actorUserId: req.auth.user_id,
+        eventType: "GUARD_TEMP_PASSWORD_ISSUED",
+        metadata: { reason: "guard_created", expires_at: result.rows[0].temporary_password_expires_at },
+      });
+      await client.query("COMMIT");
+
+      return res.status(201).json({
         status: "ok",
+        temporary_password: password,
+        temporary_password_expires_at: result.rows[0].temporary_password_expires_at,
         guard: result.rows[0],
       });
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
       console.error("Settings guard POST error:", err);
 
+      if (err.code === "23505") {
+        return res.status(409).json({ status: "error", message: "Username already exists" });
+      }
       return res.status(500).json({
         status: "error",
         message: err.message,
       });
+    } finally {
+      client.release();
     }
   }
 );
@@ -7139,73 +7318,89 @@ app.put(
   }
 );
 
-app.put(
-  "/settings/guards/:id/reset-password",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { password } = req.body;
-
-      if (!password) {
-        return res.status(400).json({
-          status: "error",
-          message: "Password is required",
-        });
-      }
-
-      const isSystemOwner = req.auth.role === "system_owner";
-
-      const passwordHash = await bcrypt.hash(password, 10);
-
-      const result = await pool.query(
-        `
-        UPDATE guards g
-        SET password_hash = $1
-        FROM sites s
-        WHERE g.id = $2
-          AND s.id = g.site_id
-          AND (
-            $3::boolean = true
-            OR s.company_id = $4
-          )
-        RETURNING
-          g.id,
-          g.full_name,
-          g.username
-        `,
-        [
-          passwordHash,
-          id,
-          isSystemOwner,
-          req.auth.company_id,
-        ]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          status: "error",
-          message: "Guard not found",
-        });
-      }
-
-      return res.json({
-        status: "ok",
-        guard: result.rows[0],
-      });
-    } catch (err) {
-      console.error(
-        "Settings guard reset password error:",
-        err
-      );
-
-      return res.status(500).json({
-        status: "error",
-        message: err.message,
-      });
+async function resetGuardPassword(req, res) {
+  const client = await pool.connect();
+  const closedSessionIds = [];
+  try {
+    const guardId = Number(req.params.id);
+    if (!Number.isInteger(guardId) || guardId <= 0) {
+      return res.status(400).json({ status: "error", message: "Invalid guard id" });
     }
+
+    const isSystemOwner = req.auth.role === "system_owner";
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    const temporaryPasswordTtlHours = getTempPasswordTtlHours();
+
+    await client.query("BEGIN");
+    const result = await client.query(
+      `UPDATE guards g
+       SET password_hash = $1, must_change_password = TRUE,
+           temporary_password_created_at = NOW(),
+           temporary_password_expires_at = NOW() + ($2 * INTERVAL '1 hour'),
+           password_changed_at = NULL, password_setup_token_hash = NULL,
+           password_setup_token_expires_at = NULL
+       FROM sites s
+       WHERE g.id = $3 AND s.id = g.site_id
+         AND g.access_mode = 'standard'
+         AND ($4::boolean = TRUE OR s.company_id = $5)
+       RETURNING g.id, g.full_name, g.username, g.site_id,
+                 g.temporary_password_expires_at, s.company_id`,
+      [passwordHash, temporaryPasswordTtlHours, guardId, isSystemOwner, req.auth.company_id]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ status: "error", message: "Guard not found" });
+    }
+
+    const closed = await client.query(
+      `UPDATE guard_sessions
+       SET logout_time = NOW(), status = 'password_reset', last_heartbeat = NOW()
+       WHERE guard_id = $1 AND logout_time IS NULL
+       RETURNING id`,
+      [guardId]
+    );
+    closedSessionIds.push(...closed.rows.map((row) => row.id));
+
+    await client.query(
+      `UPDATE push_subscriptions
+       SET active = FALSE, last_seen = NOW()
+       WHERE guard_id = $1 AND active = TRUE`,
+      [guardId]
+    );
+
+    const guard = result.rows[0];
+    await recordGuardPasswordAudit(client, {
+      companyId: guard.company_id, siteId: guard.site_id, guardId,
+      actorUserId: req.auth.user_id, eventType: "GUARD_PASSWORD_RESET",
+      metadata: { revoked_session_count: closedSessionIds.length, expires_at: guard.temporary_password_expires_at },
+    });
+    await client.query("COMMIT");
+
+    for (const sessionId of closedSessionIds) await syncScheduledShiftsForSession(sessionId);
+
+    return res.json({
+      status: "ok",
+      message: "Temporary guard password issued. Active sessions were revoked.",
+      temporary_password: temporaryPassword,
+      temporary_password_expires_at: guard.temporary_password_expires_at,
+      guard: {
+        id: guard.id, full_name: guard.full_name, username: guard.username,
+        site_id: guard.site_id, password_status: "temporary_pending",
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Settings guard reset password error:", err);
+    return res.status(500).json({ status: "error", message: "Unable to reset guard password." });
+  } finally {
+    client.release();
   }
-);
+}
+
+app.post("/settings/guards/:id/reset-password", requireAuth, resetGuardPassword);
+app.put("/settings/guards/:id/reset-password", requireAuth, resetGuardPassword);
 
 // ----------------------------------------------------------
 // ALERT CONFIGURATION STATUS
