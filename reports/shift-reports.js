@@ -13,6 +13,8 @@ const PRIORITIES = Object.freeze(["NORMAL", "IMPORTANT"]);
 const STATUSES = Object.freeze(["NEW", "READ", "ACKNOWLEDGED"]);
 const MAX_ATTACHMENTS = 5;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const BULK_PDF_MAX_REPORTS = 50;
+const BULK_PDF_MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 
 function detectImageType(buffer) {
   if (!Buffer.isBuffer(buffer)) return null;
@@ -155,8 +157,8 @@ function mapReport(row) {
     guard_id: row.guard_id,
     guard_name: row.guard_name,
     session_id: row.session_id,
-    scheduled_shift_start: row.scheduled_shift_start,
-    scheduled_shift_end: row.scheduled_shift_end,
+    scheduled_shift_start: row.scheduled_shift_start_local ?? row.scheduled_shift_start,
+    scheduled_shift_end: row.scheduled_shift_end_local ?? row.scheduled_shift_end,
     category: row.category,
     priority: row.priority,
     message: row.message,
@@ -175,6 +177,8 @@ function mapReport(row) {
 
 const REPORT_SELECT = `
   r.*,
+  to_char(r.scheduled_shift_start, 'YYYY-MM-DD"T"HH24:MI:SS') AS scheduled_shift_start_local,
+  to_char(r.scheduled_shift_end, 'YYYY-MM-DD"T"HH24:MI:SS') AS scheduled_shift_end_local,
   c.name AS company_name,
   COALESCE(c.timezone, 'Europe/Athens') AS company_timezone,
   s.name AS site_name,
@@ -202,6 +206,16 @@ function formatPdfDate(value, timezone = "Europe/Athens") {
     dateStyle: "medium",
     timeStyle: "medium",
   }).format(date);
+}
+
+function formatShiftWallClock(value) {
+  if (!value) return "—";
+  const match = String(value).match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+  if (!match) return String(value);
+  const [, year, month, day, hour, minute, second = "00"] = match;
+  return `${day}/${month}/${year}, ${hour}:${minute}:${second}`;
 }
 
 function describeFilters(query = {}) {
@@ -398,19 +412,38 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
   router.get("/shift-reports/report/pdf", requireAuth, async (req, res) => {
     try {
       const filters = buildAdminFilters(req.query, req.auth);
-      const result = await pool.query(`SELECT ${REPORT_SELECT} ${filters.where} ORDER BY r.created_at DESC LIMIT 500`, filters.values);
+      const result = await pool.query(
+        `SELECT ${REPORT_SELECT} ${filters.where} ORDER BY r.created_at DESC LIMIT ${BULK_PDF_MAX_REPORTS + 1}`,
+        filters.values
+      );
+      if (result.rows.length > BULK_PDF_MAX_REPORTS) {
+        throw badRequest(
+          `Bulk PDF is limited to ${BULK_PDF_MAX_REPORTS} reports. Apply narrower filters and try again.`,
+          413
+        );
+      }
       const reports = result.rows;
-      const rows = reports.map((row) => `<tr><td>${escapeHtml(row.report_number)}</td><td>${escapeHtml(formatPdfDate(row.created_at, row.company_timezone))}</td><td>${escapeHtml(row.company_name)}</td><td>${escapeHtml(row.site_name)}</td><td>${escapeHtml(row.guard_name)}</td><td>${escapeHtml(row.session_id)}</td><td>${escapeHtml(formatPdfDate(row.scheduled_shift_start, row.company_timezone))}<br>→ ${escapeHtml(formatPdfDate(row.scheduled_shift_end, row.company_timezone))}</td><td>${escapeHtml(row.category)}</td><td>${escapeHtml(row.priority)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.message)}</td></tr>`).join("");
+      const rows = reports.map((row) => `<tr><td>${escapeHtml(row.report_number)}</td><td>${escapeHtml(formatPdfDate(row.created_at, row.company_timezone))}</td><td>${escapeHtml(row.company_name)}</td><td>${escapeHtml(row.site_name)}</td><td>${escapeHtml(row.guard_name)}</td><td>${escapeHtml(row.session_id)}</td><td>${escapeHtml(formatShiftWallClock(row.scheduled_shift_start_local ?? row.scheduled_shift_start))}<br>→ ${escapeHtml(formatShiftWallClock(row.scheduled_shift_end_local ?? row.scheduled_shift_end))}</td><td>${escapeHtml(row.category)}</td><td>${escapeHtml(row.priority)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.message)}</td></tr>`).join("");
       const reportIds = reports.map((row) => row.id);
       const attachments = reportIds.length
         ? await pool.query(
-          `SELECT report_id, storage_path, mime_type, original_filename
+          `SELECT report_id, storage_path, mime_type, original_filename, file_size
            FROM guard_shift_report_attachments
            WHERE report_id = ANY($1::bigint[])
            ORDER BY report_id, created_at`,
           [reportIds]
         )
         : { rows: [] };
+      const attachmentBytes = attachments.rows.reduce(
+        (total, attachment) => total + Number(attachment.file_size || 0),
+        0
+      );
+      if (attachmentBytes > BULK_PDF_MAX_ATTACHMENT_BYTES) {
+        throw badRequest(
+          "Bulk PDF attachments exceed the 50 MB limit. Apply narrower filters and try again.",
+          413
+        );
+      }
       const reportById = new Map(reports.map((row) => [String(row.id), row]));
       const appendix = [];
       for (const attachment of attachments.rows) {
@@ -517,7 +550,7 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
       }
       const timezone = row.company_timezone || "Europe/Athens";
       const generatedBy = req.auth.full_name || req.auth.username || `Admin ${req.auth.user_id}`;
-      const content = `<h2>${escapeHtml(row.report_number)}</h2><dl><dt>Company</dt><dd>${escapeHtml(row.company_name)}</dd><dt>Site</dt><dd>${escapeHtml(row.site_name)}</dd><dt>Guard</dt><dd>${escapeHtml(row.guard_name)}</dd><dt>Session ID</dt><dd>${escapeHtml(row.session_id)}</dd><dt>Created</dt><dd>${escapeHtml(formatPdfDate(row.created_at, timezone))}</dd><dt>Shift</dt><dd>${escapeHtml(formatPdfDate(row.scheduled_shift_start, timezone))} – ${escapeHtml(formatPdfDate(row.scheduled_shift_end, timezone))}</dd><dt>Category</dt><dd>${escapeHtml(row.category)}</dd><dt>Priority</dt><dd>${escapeHtml(row.priority)}</dd><dt>Status</dt><dd>${escapeHtml(row.status)}</dd><dt>Read</dt><dd>${escapeHtml(row.read_by_admin_name || "—")} · ${escapeHtml(formatPdfDate(row.read_at, timezone))}</dd><dt>Acknowledged</dt><dd>${escapeHtml(row.acknowledged_by_admin_name || "—")} · ${escapeHtml(formatPdfDate(row.acknowledged_at, timezone))}</dd><dt>Generated At</dt><dd>${escapeHtml(formatPdfDate(new Date(), timezone))}</dd><dt>Generated By</dt><dd>${escapeHtml(generatedBy)}</dd></dl><h3>Operational note</h3><p class="message">${escapeHtml(row.message)}</p>${images.length ? '<h3 class="appendix-title">Photographic Evidence</h3>' : ""}${images.join("")}`;
+      const content = `<h2>${escapeHtml(row.report_number)}</h2><dl><dt>Company</dt><dd>${escapeHtml(row.company_name)}</dd><dt>Site</dt><dd>${escapeHtml(row.site_name)}</dd><dt>Guard</dt><dd>${escapeHtml(row.guard_name)}</dd><dt>Session ID</dt><dd>${escapeHtml(row.session_id)}</dd><dt>Created</dt><dd>${escapeHtml(formatPdfDate(row.created_at, timezone))}</dd><dt>Shift</dt><dd>${escapeHtml(formatShiftWallClock(row.scheduled_shift_start_local ?? row.scheduled_shift_start))} – ${escapeHtml(formatShiftWallClock(row.scheduled_shift_end_local ?? row.scheduled_shift_end))}</dd><dt>Category</dt><dd>${escapeHtml(row.category)}</dd><dt>Priority</dt><dd>${escapeHtml(row.priority)}</dd><dt>Status</dt><dd>${escapeHtml(row.status)}</dd><dt>Read</dt><dd>${escapeHtml(row.read_by_admin_name || "—")} · ${escapeHtml(formatPdfDate(row.read_at, timezone))}</dd><dt>Acknowledged</dt><dd>${escapeHtml(row.acknowledged_by_admin_name || "—")} · ${escapeHtml(formatPdfDate(row.acknowledged_at, timezone))}</dd><dt>Generated At</dt><dd>${escapeHtml(formatPdfDate(new Date(), timezone))}</dd><dt>Generated By</dt><dd>${escapeHtml(generatedBy)}</dd></dl><h3>Operational note</h3><p class="message">${escapeHtml(row.message)}</p>${images.length ? '<h3 class="appendix-title">Photographic Evidence</h3>' : ""}${images.join("")}`;
       return sendPdf(res, puppeteer, pdfShell("Aegis Link · Shift Report", content), `Aegis-Link-Shift-Report-${row.report_number}.pdf`, pdfDisposition(req.query.disposition));
     } catch (error) {
       return res.status(error.statusCode || 500).json({ status: "error", message: error.statusCode ? error.message : "Could not export Shift Report" });
@@ -555,12 +588,15 @@ module.exports = {
   STATUSES,
   MAX_ATTACHMENTS,
   MAX_FILE_SIZE,
+  BULK_PDF_MAX_REPORTS,
+  BULK_PDF_MAX_ATTACHMENT_BYTES,
   detectImageType,
   validateReportInput,
   buildAdminFilters,
   reportNumber,
   pdfDisposition,
   formatPdfDate,
+  formatShiftWallClock,
   describeFilters,
   removeStorageWithRetry,
   pdfShell,

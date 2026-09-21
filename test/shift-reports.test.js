@@ -6,11 +6,14 @@ const express = require("express");
 const {
   MAX_ATTACHMENTS,
   MAX_FILE_SIZE,
+  BULK_PDF_MAX_REPORTS,
+  BULK_PDF_MAX_ATTACHMENT_BYTES,
   detectImageType,
   validateReportInput,
   buildAdminFilters,
   reportNumber,
   pdfDisposition,
+  formatShiftWallClock,
   removeStorageWithRetry,
   createShiftReportsRouter,
 } = require("../reports/shift-reports");
@@ -131,6 +134,17 @@ test("PDF disposition explicitly supports inline preview", () => {
   assert.equal(pdfDisposition("inline"), "inline");
   assert.equal(pdfDisposition("attachment"), "attachment");
   assert.equal(pdfDisposition("anything-else"), "attachment");
+});
+
+test("shift wall-clock formatting never applies a timezone conversion", () => {
+  assert.equal(
+    formatShiftWallClock("2026-09-19T23:00:00"),
+    "19/09/2026, 23:00:00"
+  );
+  assert.equal(
+    formatShiftWallClock("2026-09-20 07:00:00"),
+    "20/09/2026, 07:00:00"
+  );
 });
 
 test("migration enforces immutable content and lifecycle statuses", () => {
@@ -334,8 +348,8 @@ test("bulk PDF supports inline preview, shift metadata and private photographic 
     id: 22, report_number: "SR-20260920-000022", company_id: 9,
     company_name: "Noctua", company_timezone: "Europe/Athens",
     site_id: 8, site_name: "Ekali", guard_id: 7, guard_name: "Guard",
-    session_id: 6, scheduled_shift_start: "2026-09-19T20:00:00Z",
-    scheduled_shift_end: "2026-09-20T04:00:00Z", category: "OBSERVATION",
+    session_id: 6, scheduled_shift_start_local: "2026-09-19T23:00:00",
+    scheduled_shift_end_local: "2026-09-20T07:00:00", category: "OBSERVATION",
     priority: "NORMAL", status: "READ", message: "Secure photo", created_at: "2026-09-19T21:00:00Z",
   };
   const pool = {
@@ -368,6 +382,69 @@ test("bulk PDF supports inline preview, shift metadata and private photographic 
   assert.match(renderedHtml, /data:image\/jpeg;base64/);
   assert.match(renderedHtml, /Session/);
   assert.match(renderedHtml, /Shift/);
+  assert.match(renderedHtml, /19\/09\/2026, 23:00:00/);
+  assert.match(renderedHtml, /20\/09\/2026, 07:00:00/);
+});
+
+test("bulk PDF rejects more than fifty reports before loading attachments", async () => {
+  let attachmentQueryRan = false;
+  let storageDownloadRan = false;
+  const reports = Array.from({ length: BULK_PDF_MAX_REPORTS + 1 }, (_, index) => ({
+    id: index + 1,
+    report_number: `SR-20260920-${String(index + 1).padStart(6, "0")}`,
+  }));
+  const pool = {
+    async query(sql) {
+      if (sql.includes("ANY($1::bigint[])")) {
+        attachmentQueryRan = true;
+        return { rows: [] };
+      }
+      return { rows: reports };
+    },
+  };
+  const storage = { async download() { storageDownloadRan = true; } };
+  await withRouter({ pool, storage, guard: guardContext, admin: adminContext }, async (base) => {
+    const response = await fetch(`${base}/shift-reports/report/pdf`);
+    assert.equal(response.status, 413);
+    assert.match((await response.json()).message, /limited to 50 reports/);
+  });
+  assert.equal(attachmentQueryRan, false);
+  assert.equal(storageDownloadRan, false);
+});
+
+test("bulk PDF rejects attachment payloads over fifty MB before downloading", async () => {
+  let storageDownloadRan = false;
+  let puppeteerRan = false;
+  const report = {
+    id: 22,
+    report_number: "SR-20260920-000022",
+    company_timezone: "Europe/Athens",
+  };
+  const pool = {
+    async query(sql) {
+      if (sql.includes("ANY($1::bigint[])")) {
+        return {
+          rows: [{
+            report_id: 22,
+            storage_path: "private/large.jpg",
+            mime_type: "image/jpeg",
+            original_filename: "large.jpg",
+            file_size: BULK_PDF_MAX_ATTACHMENT_BYTES + 1,
+          }],
+        };
+      }
+      return { rows: [report] };
+    },
+  };
+  const storage = { async download() { storageDownloadRan = true; } };
+  const puppeteer = { async launch() { puppeteerRan = true; } };
+  await withRouter({ pool, storage, guard: guardContext, admin: adminContext, puppeteer }, async (base) => {
+    const response = await fetch(`${base}/shift-reports/report/pdf`);
+    assert.equal(response.status, 413);
+    assert.match((await response.json()).message, /50 MB limit/);
+  });
+  assert.equal(storageDownloadRan, false);
+  assert.equal(puppeteerRan, false);
 });
 
 test("individual PDF contains complete audit metadata and descriptive filename", async () => {
@@ -376,8 +453,8 @@ test("individual PDF contains complete audit metadata and descriptive filename",
     id: 22, report_number: "SR-20260920-000022", company_id: 9,
     company_name: "Noctua", company_timezone: "Europe/Athens",
     site_id: 8, site_name: "Ekali", guard_id: 7, guard_name: "Guard",
-    session_id: 6, scheduled_shift_start: "2026-09-19T20:00:00Z",
-    scheduled_shift_end: "2026-09-20T04:00:00Z", category: "OBSERVATION",
+    session_id: 6, scheduled_shift_start_local: "2026-09-19T23:00:00",
+    scheduled_shift_end_local: "2026-09-20T07:00:00", category: "OBSERVATION",
     priority: "IMPORTANT", status: "ACKNOWLEDGED", message: "Handover",
     created_at: "2026-09-19T21:00:00Z", read_at: "2026-09-19T21:10:00Z",
     read_by_admin_name: "Reader", acknowledged_at: "2026-09-19T21:15:00Z",
@@ -407,6 +484,8 @@ test("individual PDF contains complete audit metadata and descriptive filename",
   for (const value of ["Company", "Session ID", "Reader", "Acknowledger", "Generated At", "Generator"]) {
     assert.match(renderedHtml, new RegExp(value));
   }
+  assert.match(renderedHtml, /19\/09\/2026, 23:00:00/);
+  assert.match(renderedHtml, /20\/09\/2026, 07:00:00/);
 });
 
 test("production guard auth remains the mutation gate for read-only Shift Reports", () => {
