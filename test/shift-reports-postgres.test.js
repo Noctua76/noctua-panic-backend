@@ -18,7 +18,10 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       CREATE TABLE sites (id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL);
       CREATE TABLE guards (id SERIAL PRIMARY KEY, site_id INTEGER NOT NULL REFERENCES sites(id), full_name TEXT NOT NULL);
       CREATE TABLE guard_sessions (id SERIAL PRIMARY KEY, guard_id INTEGER NOT NULL REFERENCES guards(id), site_id INTEGER NOT NULL REFERENCES sites(id));
-      CREATE TABLE users (id SERIAL PRIMARY KEY, company_id INTEGER REFERENCES companies(id), full_name TEXT NOT NULL);
+      CREATE TABLE users (id SERIAL PRIMARY KEY, company_id INTEGER REFERENCES companies(id), full_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'viewer', status TEXT NOT NULL DEFAULT 'active');
+      CREATE TABLE admin_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), is_active BOOLEAN DEFAULT TRUE,
+        logout_time TIMESTAMPTZ, session_end_reason TEXT);
     `);
     const migration = fs.readFileSync(
       path.join(__dirname, "../database/2026-09-20-shift-reports.sql"),
@@ -30,6 +33,11 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       "utf8"
     );
     await client.query(guardPasswordMigration);
+    const rbacMigration = fs.readFileSync(
+      path.join(__dirname, "../database/2026-09-22-dashboard-rbac.sql"),
+      "utf8"
+    );
+    await client.query(rbacMigration);
     await client.query(`
       INSERT INTO companies (id, name, timezone) VALUES (1, 'Noctua', 'Europe/Athens');
       INSERT INTO sites (id, company_id, name) VALUES (1, 1, 'Ekali');
@@ -89,6 +97,25 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
     await assert.rejects(
       client.query("DELETE FROM guard_password_audit_events WHERE guard_id=1"),
       /Guard password audit events are immutable/
+    );
+
+    const roleState = await client.query(
+      `SELECT r.code, array_agg(p.code ORDER BY p.code) AS permissions
+       FROM dashboard_roles r JOIN dashboard_role_permissions rp ON rp.role_id=r.id
+       JOIN dashboard_permissions p ON p.id=rp.permission_id
+       WHERE r.code='viewer' GROUP BY r.code`
+    );
+    assert.equal(roleState.rows[0].code, "viewer");
+    assert.ok(roleState.rows[0].permissions.includes("dashboard.view"));
+    assert.equal(roleState.rows[0].permissions.includes("users.manage"), false);
+
+    await client.query(
+      `INSERT INTO dashboard_rbac_audit_events(event_type, actor_user_id, company_id)
+       VALUES('ROLE_CREATED', 1, 1)`
+    );
+    await assert.rejects(
+      client.query("DELETE FROM dashboard_rbac_audit_events"),
+      /Dashboard RBAC audit events are immutable/
     );
   } finally {
     await client.end();

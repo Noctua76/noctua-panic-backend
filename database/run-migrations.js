@@ -9,6 +9,7 @@ const MIGRATIONS = [
   "2026-09-18-same-day-random-activation.sql",
   "2026-09-20-shift-reports.sql",
   "2026-09-21-guard-password-lifecycle.sql",
+  "2026-09-22-dashboard-rbac.sql",
 ];
 
 async function runMigrations(pool) {

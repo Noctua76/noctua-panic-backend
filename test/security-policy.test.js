@@ -5,7 +5,7 @@ const { accountAction, ipAction } = require("../security/auth-protection");
 const {
   createCorsOptions,
 } = require("../security/cors-policy");
-const { requireSystemOwner } = require("../patrol/corrections");
+const { requirePatrolCorrectionPermission } = require("../patrol/corrections");
 
 function corsDecision(options, origin) {
   return new Promise((resolve) => {
@@ -62,7 +62,7 @@ test("development CORS preserves loopback VS Code ports", async () => {
   assert.ok((await corsDecision(options, "https://example.com")).error);
 });
 
-test("patrol corrections are restricted to system_owner", () => {
+test("patrol corrections require the canonical permission", () => {
   let nextCalled = false;
   const response = {
     statusCode: null,
@@ -77,13 +77,13 @@ test("patrol corrections are restricted to system_owner", () => {
     },
   };
 
-  requireSystemOwner({ auth: { role: "administrator" } }, response, () => {
+  requirePatrolCorrectionPermission({ auth: { permissions: [] } }, response, () => {
     nextCalled = true;
   });
   assert.equal(response.statusCode, 403);
   assert.equal(nextCalled, false);
 
-  requireSystemOwner({ auth: { role: "system_owner" } }, response, () => {
+  requirePatrolCorrectionPermission({ auth: { permissions: ["patrols.correct"] } }, response, () => {
     nextCalled = true;
   });
   assert.equal(nextCalled, true);

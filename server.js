@@ -42,6 +42,7 @@ const {
   parsePasswordSetupToken,
   validateGuardPassword,
 } = require("./auth/guard-password-lifecycle");
+const { createDashboardRbac } = require("./auth/dashboard-rbac");
 
 // ================================
 // TIMEZONE HELPERS
@@ -344,6 +345,7 @@ const alertDispatcher = createAlertDispatcher({
 
 
 const app = express();
+const dashboardRbac = createDashboardRbac({ pool });
 app.set("trust proxy", 1);
 const authProtection = createAuthProtection({ pool });
 const systemStatusService = createSystemStatusService({
@@ -1198,6 +1200,11 @@ app.get("/admin/users", requireAuth, async (req, res) => {
         mobile_phone,
         backup_phone,
         role,
+        (SELECT ur.role_id FROM user_dashboard_roles ur WHERE ur.user_id = users.id) AS role_id,
+        COALESCE((SELECT r.code FROM user_dashboard_roles ur JOIN dashboard_roles r ON r.id=ur.role_id WHERE ur.user_id=users.id), role) AS role_code,
+        COALESCE((SELECT r.name FROM user_dashboard_roles ur JOIN dashboard_roles r ON r.id=ur.role_id WHERE ur.user_id=users.id),
+          CASE WHEN role='guard' THEN 'Legacy Dashboard Role' ELSE role END) AS role_name,
+        (role = 'guard' AND NOT EXISTS (SELECT 1 FROM user_dashboard_roles ur WHERE ur.user_id=users.id)) AS is_legacy_role,
         status,
         must_change_password,
         company_id,
@@ -1213,7 +1220,9 @@ ORDER BY id ASC
     return res.json({
       status: "ok",
       company_id: companyId,
-      users: result.rows,
+      users: req.auth.is_system_owner
+        ? result.rows
+        : result.rows.filter((user) => !user.is_legacy_role),
     });
   } catch (err) {
     console.error("Fetch admin users error:", err);
@@ -1262,6 +1271,11 @@ app.get("/admin/users/:id", requireAuth, async (req, res) => {
         mobile_phone,
         backup_phone,
         role,
+        (SELECT ur.role_id FROM user_dashboard_roles ur WHERE ur.user_id = users.id) AS role_id,
+        COALESCE((SELECT r.code FROM user_dashboard_roles ur JOIN dashboard_roles r ON r.id=ur.role_id WHERE ur.user_id=users.id), role) AS role_code,
+        COALESCE((SELECT r.name FROM user_dashboard_roles ur JOIN dashboard_roles r ON r.id=ur.role_id WHERE ur.user_id=users.id),
+          CASE WHEN role='guard' THEN 'Legacy Dashboard Role' ELSE role END) AS role_name,
+        (role = 'guard' AND NOT EXISTS (SELECT 1 FROM user_dashboard_roles ur WHERE ur.user_id=users.id)) AS is_legacy_role,
         status,
         must_change_password,
         company_id,
@@ -1281,6 +1295,10 @@ WHERE id = $1
       });
     }
 
+    if (result.rows[0].is_legacy_role && !req.auth.is_system_owner) {
+      return res.status(404).json({ status: "error", message: "User not found" });
+    }
+
     return res.json({
       status: "ok",
       company_id: companyId,
@@ -1297,334 +1315,149 @@ WHERE id = $1
 });
 
 app.post("/admin/users", requireAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const {
-      full_name,
-      username,
-      email,
-      secondary_email,
-      phone,
-      mobile_phone,
-      backup_phone,
-      role = "supervisor",
-      status = "active",
-      company_id
-    } = req.body;
-
-    const normalizedFullName =
-      typeof full_name === "string" ? full_name.trim() : "";
-
-    const normalizedUsername =
-      typeof username === "string" ? username.trim() : "";
-
+    const { full_name, username, email, secondary_email, phone, mobile_phone,
+      backup_phone, role = "viewer", role_id, status = "active", company_id } = req.body;
+    const normalizedFullName = typeof full_name === "string" ? full_name.trim() : "";
+    const normalizedUsername = typeof username === "string" ? username.trim() : "";
     if (!normalizedFullName || !normalizedUsername) {
-      return res.status(400).json({
-        status: "error",
-        message: "full_name and username are required"
-      });
+      return res.status(400).json({ status: "error", message: "full_name and username are required" });
+    }
+    if (!["active", "inactive"].includes(status)) {
+      return res.status(400).json({ status: "error", message: "Invalid user status" });
     }
 
-    const allowedRoles = ["guard", "supervisor", "system_owner"];
-    const allowedStatuses = ["active", "inactive"];
-
-    if (!allowedRoles.includes(role)) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid user role"
-      });
+    const targetRole = await resolveAssignableDashboardRole(client, role_id || role, "viewer");
+    if (!targetRole || targetRole.code === "guard") {
+      return res.status(400).json({ status: "error", message: "Invalid Dashboard role" });
     }
-
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid user status"
-      });
-    }
-
-    if (
-      req.auth.role !== "system_owner" &&
-      role === "system_owner"
-    ) {
-      return res.status(403).json({
-        status: "error",
-        message: "Only the system owner can create a system owner user"
-      });
+    if (!req.auth.is_system_owner && targetRole.code === "system_owner") {
+      return res.status(403).json({ status: "error", message: "Only the System Owner can assign System Owner" });
     }
 
     let targetCompanyId = req.auth.company_id;
-
-    if (req.auth.role === "system_owner") {
-      const requestedCompanyId =
-        company_id ?? req.auth.company_id;
-
-      const parsedCompanyId = Number(requestedCompanyId);
-
-      if (
-        !Number.isInteger(parsedCompanyId) ||
-        parsedCompanyId <= 0
-      ) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid company_id"
-        });
+    if (req.auth.is_system_owner) {
+      const parsedCompanyId = Number(company_id ?? req.auth.company_id);
+      if (!Number.isInteger(parsedCompanyId) || parsedCompanyId <= 0) {
+        return res.status(400).json({ status: "error", message: "Invalid company_id" });
       }
-
       targetCompanyId = parsedCompanyId;
     }
+    const companyResult = await client.query(`SELECT id FROM companies WHERE id=$1`, [targetCompanyId]);
+    if (!companyResult.rows.length) return res.status(404).json({ status: "error", message: "Company not found" });
 
-    const companyResult = await pool.query(
-      `
-      SELECT
-        id,
-        name,
-        status
-      FROM companies
-      WHERE id = $1
-      `,
-      [targetCompanyId]
+    const temporaryPassword = crypto.randomBytes(9).toString("base64").replace(/[+/=]/g, "").slice(0, 12);
+    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    await client.query("BEGIN");
+    const result = await client.query(
+      `INSERT INTO users (full_name,username,email,secondary_email,phone,mobile_phone,backup_phone,
+         role,status,company_id,password_hash,must_change_password,created_at)
+       VALUES($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,TRUE,NOW())
+       RETURNING id,full_name,username,email,secondary_email,phone,mobile_phone,backup_phone,role,status,
+         must_change_password,company_id,created_at`,
+      [normalizedFullName, normalizedUsername, email, secondary_email, phone, mobile_phone, backup_phone,
+        targetRole.code, status, targetCompanyId, passwordHash]
     );
-
-    if (companyResult.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "Company not found"
-      });
-    }
-
-    const temporaryPassword = crypto
-      .randomBytes(9)
-      .toString("base64")
-      .replace(/[+/=]/g, "")
-      .slice(0, 12);
-
-    const passwordHash = await bcrypt.hash(
-      temporaryPassword,
-      10
-    );
-
-    const result = await pool.query(
-      `
-      INSERT INTO users (
-        full_name,
-        username,
-        email,
-        secondary_email,
-        phone,
-        mobile_phone,
-        backup_phone,
-        role,
-        status,
-        company_id,
-        password_hash,
-        must_change_password,
-        created_at
-      )
-      VALUES (
-        $1,
-        $2,
-        NULLIF($3, ''),
-        NULLIF($4, ''),
-        NULLIF($5, ''),
-        NULLIF($6, ''),
-        NULLIF($7, ''),
-        $8,
-        $9,
-        $10,
-        $11,
-        true,
-        NOW()
-      )
-      RETURNING
-        id,
-        full_name,
-        username,
-        email,
-        secondary_email,
-        phone,
-        mobile_phone,
-        backup_phone,
-        role,
-        status,
-        must_change_password,
-        company_id,
-        created_at
-      `,
-      [
-        normalizedFullName,
-        normalizedUsername,
-        email,
-        secondary_email,
-        phone,
-        mobile_phone,
-        backup_phone,
-        role,
-        status,
-        targetCompanyId,
-        passwordHash
-      ]
-    );
-
-    return res.status(201).json({
-      status: "ok",
-      message: "User created successfully",
+    const user = result.rows[0];
+    await client.query(`INSERT INTO user_dashboard_roles(user_id,role_id,assigned_by) VALUES($1,$2,$3)`,
+      [user.id, targetRole.id, req.auth.user_id]);
+    await recordRbacAudit(client, { type: "USER_ROLE_ASSIGNED", actorUserId: req.auth.user_id,
+      targetUserId: user.id, roleId: targetRole.id, companyId: targetCompanyId,
+      after: { role_code: targetRole.code } });
+    await client.query("COMMIT");
+    return res.status(201).json({ status: "ok", message: "User created successfully",
       temporary_password: temporaryPassword,
-      user: result.rows[0]
-    });
+      user: { ...user, role_id: targetRole.id, role_code: targetRole.code, role_name: targetRole.name } });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("Create admin user error:", err);
-
-    if (err.code === "23505") {
-      return res.status(409).json({
-        status: "error",
-        message: "Username already exists"
-      });
-    }
-
-    return res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
+    if (err.code === "23505") return res.status(409).json({ status: "error", message: "Username already exists" });
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
 });
 
 app.put("/admin/users/:id", requireAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { id } = req.params;
+    const userId = Number(req.params.id);
+    if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ status: "error", message: "Invalid user id" });
+    const { full_name, username, email, secondary_email, phone, mobile_phone, backup_phone,
+      role, role_id, status } = req.body;
+    if (status && !["active", "inactive"].includes(status)) return res.status(400).json({ status: "error", message: "Invalid user status" });
+    const { companyId, error } = resolveAdminUsersCompanyScope(req);
+    if (error) return res.status(400).json({ status: "error", message: error });
 
-    const userId = Number(id);
-
-    if (!Number.isInteger(userId) || userId <= 0) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid user id"
-      });
-    }
-
-    const {
-      full_name,
-      username,
-      email,
-      secondary_email,
-      phone,
-      mobile_phone,
-      backup_phone,
-      role,
-      status
-    } = req.body;
-
-    const allowedRoles = ["guard", "supervisor", "system_owner"];
-    const allowedStatuses = ["active", "inactive"];
-
-    if (role && !allowedRoles.includes(role)) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid user role"
-      });
-    }
-
-    if (status && !allowedStatuses.includes(status)) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid user status"
-      });
-    }
-
-    if (
-      req.auth.role !== "system_owner" &&
-      role === "system_owner"
-    ) {
-      return res.status(403).json({
-        status: "error",
-        message: "Only the system owner can assign the system owner role"
-      });
-    }
-
-    const {
-      companyId,
-      error
-    } = resolveAdminUsersCompanyScope(req);
-
-    if (error) {
-      return res.status(400).json({
-        status: "error",
-        message: error
-      });
-    }
-
-    const result = await pool.query(
-      `
-      UPDATE users
-      SET
-        full_name = COALESCE(NULLIF($1, ''), full_name),
-        username = COALESCE(NULLIF($2, ''), username),
-        email = NULLIF($3, ''),
-        secondary_email = NULLIF($4, ''),
-        phone = NULLIF($5, ''),
-        mobile_phone = NULLIF($6, ''),
-        backup_phone = NULLIF($7, ''),
-        role = COALESCE(NULLIF($8, ''), role),
-        status = COALESCE(NULLIF($9, ''), status),
-        updated_at = NOW()
-      WHERE id = $10
-        AND company_id = $11
-      RETURNING
-        id,
-        full_name,
-        username,
-        email,
-        secondary_email,
-        phone,
-        mobile_phone,
-        backup_phone,
-        role,
-        status,
-        must_change_password,
-        company_id,
-        created_at,
-        updated_at
-      `,
-      [
-        full_name,
-        username,
-        email,
-        secondary_email,
-        phone,
-        mobile_phone,
-        backup_phone,
-        role,
-        status,
-        userId,
-        companyId
-      ]
+    await client.query("BEGIN");
+    const currentResult = await client.query(
+      `SELECT u.*, ur.role_id, r.code AS role_code, r.name AS role_name
+       FROM users u LEFT JOIN user_dashboard_roles ur ON ur.user_id=u.id
+       LEFT JOIN dashboard_roles r ON r.id=ur.role_id
+       WHERE u.id=$1 AND u.company_id=$2 FOR UPDATE OF u`, [userId, companyId]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "User not found"
-      });
+    const current = currentResult.rows[0];
+    if (!current) { await client.query("ROLLBACK"); return res.status(404).json({ status: "error", message: "User not found" }); }
+    if (!req.auth.is_system_owner && (current.role_code === "system_owner" || current.role === "system_owner")) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", message: "Only the System Owner can manage a System Owner" });
     }
 
-    return res.json({
-      status: "ok",
-      message: "User updated successfully",
-      user: result.rows[0]
-    });
+    const requestedRole = role_id || role;
+    const targetRole = requestedRole ? await resolveAssignableDashboardRole(client, requestedRole) :
+      (current.role_id ? await resolveAssignableDashboardRole(client, current.role_id) : null);
+    if (requestedRole && (!targetRole || targetRole.code === "guard")) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ status: "error", message: "Invalid Dashboard role" });
+    }
+    if (!req.auth.is_system_owner && targetRole?.code === "system_owner") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", message: "Only the System Owner can assign System Owner" });
+    }
+
+    const removesSystemOwner = (current.role_code === "system_owner" || current.role === "system_owner") &&
+      (targetRole?.code !== "system_owner" || status === "inactive");
+    if (removesSystemOwner) {
+      const ownerCount = await client.query(
+        `SELECT COUNT(*)::int AS count FROM users u JOIN user_dashboard_roles ur ON ur.user_id=u.id
+         JOIN dashboard_roles r ON r.id=ur.role_id WHERE r.code='system_owner' AND u.status='active'`
+      );
+      if (ownerCount.rows[0].count <= 1) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ status: "error", message: "The last active System Owner cannot be removed or deactivated" });
+      }
+    }
+
+    const canonicalRole = targetRole?.code || current.role;
+    const result = await client.query(
+      `UPDATE users SET full_name=COALESCE(NULLIF($1,''),full_name), username=COALESCE(NULLIF($2,''),username),
+         email=NULLIF($3,''), secondary_email=NULLIF($4,''), phone=NULLIF($5,''), mobile_phone=NULLIF($6,''),
+         backup_phone=NULLIF($7,''), role=$8, status=COALESCE(NULLIF($9,''),status), updated_at=NOW()
+       WHERE id=$10 RETURNING id,full_name,username,email,secondary_email,phone,mobile_phone,backup_phone,
+         role,status,must_change_password,company_id,created_at,updated_at`,
+      [full_name, username, email, secondary_email, phone, mobile_phone, backup_phone,
+        canonicalRole, status, userId]
+    );
+    if (targetRole && Number(current.role_id) !== Number(targetRole.id)) {
+      await client.query(
+        `INSERT INTO user_dashboard_roles(user_id,role_id,assigned_by,assigned_at) VALUES($1,$2,$3,NOW())
+         ON CONFLICT(user_id) DO UPDATE SET role_id=EXCLUDED.role_id, assigned_by=EXCLUDED.assigned_by, assigned_at=NOW()`,
+        [userId, targetRole.id, req.auth.user_id]
+      );
+      await recordRbacAudit(client, { type: current.role_id ? "USER_ROLE_CHANGED" : "USER_ROLE_ASSIGNED",
+        actorUserId: req.auth.user_id, targetUserId: userId, roleId: targetRole.id, companyId,
+        before: { role_id: current.role_id, role_code: current.role_code || current.role },
+        after: { role_id: targetRole.id, role_code: targetRole.code } });
+    }
+    await dashboardRbac.revokeAuthorizationSessions(client, [userId]);
+    await client.query("COMMIT");
+    return res.json({ status: "ok", message: "User updated successfully",
+      user: { ...result.rows[0], role_id: targetRole?.id || null, role_code: canonicalRole, role_name: targetRole?.name || "Legacy Dashboard Role" } });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("Update admin user error:", err);
-
-    if (err.code === "23505") {
-      return res.status(409).json({
-        status: "error",
-        message: "Username already exists"
-      });
-    }
-
-    return res.status(500).json({
-      status: "error",
-      message: err.message
-    });
-  }
+    if (err.code === "23505") return res.status(409).json({ status: "error", message: "Username already exists" });
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
 });
 
 const ACCESS_MODE_READ_ONLY = "read_only";
@@ -2046,6 +1879,7 @@ app.post("/auth/login", async (req, res) => {
         u.company_id,
         u.password_hash,
         u.must_change_password,
+        u.authorization_version,
 u.access_mode,
 u.temporary_access_duration_hours,
 u.temporary_access_started_at,
@@ -2181,6 +2015,12 @@ if (
   });
 }
 
+    const authorization = await dashboardRbac.resolveAuthorization({
+      user_id: user.id,
+      role: user.role,
+      authorization_version: user.authorization_version,
+    });
+
     const sessionToken = crypto.randomBytes(32).toString("hex");
 
     const sessionResult = await pool.query(
@@ -2243,6 +2083,11 @@ if (
         username: user.username,
         email: user.email,
         role: user.role,
+        role_id: authorization.role_id,
+        role_code: authorization.role_code,
+        role_name: authorization.role_name,
+        permissions: authorization.permissions,
+        legacy_role: authorization.legacy_role,
         company_id: user.company_id,
         company_name: user.company_name,
         company_status: user.company_status,
@@ -2274,7 +2119,7 @@ temporary_access_expiry_reason:
 
 function resolveAdminUsersCompanyScope(req) {
   // Customer users are always restricted to their authenticated company.
-  if (req.auth.role !== "system_owner") {
+  if (!req.auth.is_system_owner) {
     return {
       companyId: req.auth.company_id,
       error: null,
@@ -2352,6 +2197,7 @@ async function requireAuth(req, res, next) {
         u.username,
         u.email,
         u.role,
+        u.authorization_version,
         u.status AS user_status,
 u.company_id,
 u.access_mode,
@@ -2494,6 +2340,7 @@ c.name AS company_name,
       username: auth.username,
       email: auth.email,
       role: auth.role,
+authorization_version: auth.authorization_version,
 access_mode: auth.access_mode,
 temporary_access_started_at:
   auth.temporary_access_started_at,
@@ -2510,6 +2357,11 @@ company_id: auth.company_id,
           : "company",
     };
 
+    Object.assign(
+      req.auth,
+      await dashboardRbac.resolveAuthorization(req.auth)
+    );
+
     if (
   blockReadOnlyMutation(
     req,
@@ -2521,7 +2373,7 @@ company_id: auth.company_id,
   return;
 }
 
-    next();
+    dashboardRbac.enforceRequestPermission(req, res, next);
   } catch (err) {
     console.error("Authentication middleware error:", err);
 
@@ -2684,7 +2536,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      if (req.auth.role !== "system_owner") {
+      if (!req.auth.is_system_owner) {
         return res.status(403).json({
           status: "error",
           message:
@@ -2884,7 +2736,7 @@ app.post(
     const client = await pool.connect();
 
     try {
-      if (req.auth.role !== "system_owner") {
+      if (!req.auth.is_system_owner) {
         return res.status(403).json({
           status: "error",
           message:
@@ -3175,7 +3027,7 @@ app.post(
     const client = await pool.connect();
 
     try {
-      if (req.auth.role !== "system_owner") {
+      if (!req.auth.is_system_owner) {
         return res.status(403).json({
           status: "error",
           message:
@@ -3372,6 +3224,17 @@ app.put("/admin/users/:id/reset-password", requireAuth, async (req, res) => {
         status: "error",
         message: error
       });
+    }
+
+    const targetResult = await pool.query(
+      `SELECT u.id, COALESCE(r.code, u.role) AS role_code
+       FROM users u LEFT JOIN user_dashboard_roles ur ON ur.user_id=u.id
+       LEFT JOIN dashboard_roles r ON r.id=ur.role_id
+       WHERE u.id=$1 AND u.company_id=$2`, [userId, companyId]
+    );
+    if (!targetResult.rows.length) return res.status(404).json({ status: "error", message: "User not found" });
+    if (!req.auth.is_system_owner && targetResult.rows[0].role_code === "system_owner") {
+      return res.status(403).json({ status: "error", message: "Company Administrator cannot reset a System Owner password" });
     }
 
     const temporaryPassword = crypto
@@ -4001,6 +3864,160 @@ async function recordGuardPasswordAudit(queryable, {
   );
 }
 
+async function resolveAssignableDashboardRole(queryable, requestedRole, fallbackCode = "viewer") {
+  const numericRoleId = Number(requestedRole);
+  const result = Number.isInteger(numericRoleId) && numericRoleId > 0
+    ? await queryable.query(`SELECT * FROM dashboard_roles WHERE id = $1 AND is_active = TRUE`, [numericRoleId])
+    : await queryable.query(`SELECT * FROM dashboard_roles WHERE code = $1 AND is_active = TRUE`, [requestedRole || fallbackCode]);
+  return result.rows[0] || null;
+}
+
+async function recordRbacAudit(queryable, event) {
+  await queryable.query(
+    `INSERT INTO dashboard_rbac_audit_events
+       (event_type, actor_user_id, target_user_id, role_id, company_id, before_state, after_state)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)`,
+    [event.type, event.actorUserId || null, event.targetUserId || null, event.roleId || null,
+      event.companyId || null, JSON.stringify(event.before || null), JSON.stringify(event.after || null)]
+  );
+}
+
+app.get("/admin/roles", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.id, r.code, r.name, r.description, r.scope, r.is_system_role,
+              r.is_active, r.authorization_version, COUNT(DISTINCT ur.user_id)::int AS user_count,
+              COALESCE(array_agg(p.code ORDER BY p.code) FILTER (WHERE p.code IS NOT NULL), '{}') AS permissions
+       FROM dashboard_roles r
+       LEFT JOIN user_dashboard_roles ur ON ur.role_id = r.id
+       LEFT JOIN dashboard_role_permissions rp ON rp.role_id = r.id
+       LEFT JOIN dashboard_permissions p ON p.id = rp.permission_id
+       WHERE r.is_active = TRUE OR $1::boolean = TRUE
+       GROUP BY r.id ORDER BY r.is_system_role DESC, r.name ASC`,
+      [req.auth.is_system_owner]
+    );
+    const roles = result.rows.filter((role) => req.auth.is_system_owner || role.code !== "system_owner");
+    return res.json({ status: "ok", roles });
+  } catch (err) {
+    console.error("Fetch dashboard roles error:", err);
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+app.get("/admin/roles/permissions", requireAuth, async (_req, res) => {
+  const result = await pool.query(`SELECT id, code, name, description, category FROM dashboard_permissions ORDER BY category, code`);
+  return res.json({ status: "ok", permissions: result.rows });
+});
+
+app.post("/admin/roles", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const name = String(req.body.name || "").trim();
+    if (!name) return res.status(400).json({ status: "error", message: "Role name is required" });
+    const code = dashboardRbac.createCustomRoleCode(name);
+    const permissionCodes = [...new Set(Array.isArray(req.body.permissions) ? req.body.permissions : [])];
+    await client.query("BEGIN");
+    const result = await client.query(
+      `INSERT INTO dashboard_roles(code,name,description,scope,is_system_role)
+       VALUES($1,$2,$3,'company',FALSE) RETURNING *`,
+      [code, name, String(req.body.description || "").trim()]
+    );
+    const role = result.rows[0];
+    if (permissionCodes.length) {
+      await client.query(
+        `INSERT INTO dashboard_role_permissions(role_id, permission_id)
+         SELECT $1, id FROM dashboard_permissions WHERE code = ANY($2::text[])`,
+        [role.id, permissionCodes]
+      );
+    }
+    await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id, roleId: role.id, companyId: req.auth.company_id, after: { ...role, permissions: permissionCodes } });
+    await client.query("COMMIT");
+    dashboardRbac.invalidateAll();
+    return res.status(201).json({ status: "ok", role: { ...role, permissions: permissionCodes, user_count: 0 } });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Create dashboard role error:", err);
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
+});
+
+app.post("/admin/roles/:id/clone", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const roleId = Number(req.params.id);
+    await client.query("BEGIN");
+    const source = await client.query(
+      `SELECT r.*, COALESCE(array_agg(p.code) FILTER (WHERE p.code IS NOT NULL), '{}') AS permissions
+       FROM dashboard_roles r LEFT JOIN dashboard_role_permissions rp ON rp.role_id=r.id
+       LEFT JOIN dashboard_permissions p ON p.id=rp.permission_id WHERE r.id=$1 GROUP BY r.id`, [roleId]
+    );
+    if (!source.rows.length) { await client.query("ROLLBACK"); return res.status(404).json({ status: "error", message: "Role not found" }); }
+    const original = source.rows[0];
+    const name = String(req.body.name || `${original.name} Copy`).trim();
+    const code = dashboardRbac.createCustomRoleCode(name);
+    const inserted = await client.query(
+      `INSERT INTO dashboard_roles(code,name,description,scope,is_system_role)
+       VALUES($1,$2,$3,'company',FALSE) RETURNING *`, [code, name, original.description]
+    );
+    const role = inserted.rows[0];
+    await client.query(
+      `INSERT INTO dashboard_role_permissions(role_id,permission_id)
+       SELECT $1,permission_id FROM dashboard_role_permissions WHERE role_id=$2`, [role.id, roleId]
+    );
+    await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id,
+      roleId: role.id, companyId: req.auth.company_id, after: { ...role, cloned_from: roleId, permissions: original.permissions } });
+    await client.query("COMMIT");
+    return res.status(201).json({ status: "ok", role: { ...role, permissions: original.permissions, user_count: 0 } });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
+});
+
+app.put("/admin/roles/:id", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const roleId = Number(req.params.id);
+    if (!Number.isInteger(roleId) || roleId <= 0) return res.status(400).json({ status: "error", message: "Invalid role id" });
+    await client.query("BEGIN");
+    const locked = await client.query(`SELECT * FROM dashboard_roles WHERE id=$1 FOR UPDATE`, [roleId]);
+    const before = locked.rows[0];
+    if (!before) { await client.query("ROLLBACK"); return res.status(404).json({ status: "error", message: "Role not found" }); }
+    if (before.code === "system_owner") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", message: "System Owner is protected" });
+    }
+    const name = String(req.body.name ?? before.name).trim();
+    const description = String(req.body.description ?? before.description).trim();
+    const isActive = before.is_system_role
+      ? true
+      : (typeof req.body.is_active === "boolean" ? req.body.is_active : before.is_active);
+    const permissionCodes = [...new Set(Array.isArray(req.body.permissions) ? req.body.permissions : [])];
+    const updated = await client.query(
+      `UPDATE dashboard_roles SET name=$1, description=$2, is_active=$3,
+         authorization_version=authorization_version+1, updated_at=NOW()
+       WHERE id=$4 RETURNING *`, [name, description, isActive, roleId]
+    );
+    await client.query(`DELETE FROM dashboard_role_permissions WHERE role_id=$1`, [roleId]);
+    if (permissionCodes.length) {
+      await client.query(
+        `INSERT INTO dashboard_role_permissions(role_id, permission_id)
+         SELECT $1,id FROM dashboard_permissions WHERE code=ANY($2::text[])`, [roleId, permissionCodes]
+      );
+    }
+    const affected = await client.query(`SELECT user_id FROM user_dashboard_roles WHERE role_id=$1`, [roleId]);
+    await dashboardRbac.revokeAuthorizationSessions(client, affected.rows.map((row) => row.user_id));
+    await recordRbacAudit(client, { type: isActive ? "ROLE_PERMISSION_CHANGED" : "ROLE_DEACTIVATED", actorUserId: req.auth.user_id, roleId, companyId: req.auth.company_id, before, after: { ...updated.rows[0], permissions: permissionCodes } });
+    await client.query("COMMIT");
+    dashboardRbac.invalidateAll();
+    return res.json({ status: "ok", role: { ...updated.rows[0], permissions: permissionCodes } });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Update dashboard role error:", err);
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
+});
+
 async function syncScheduledShiftsForSession(sessionId, queryable = pool) {
   await queryable.query(
     `
@@ -4296,6 +4313,7 @@ app.post("/guard/login", async (req, res) => {
         null
       );
     }
+
 
     let guard = result.rows[0];
     const sessionToken = crypto.randomBytes(32).toString("hex");
@@ -8196,7 +8214,7 @@ WHERE status IN (
 
 app.use(
   "/admin/patrol-corrections",
-  createPatrolCorrectionsRouter({ pool, requireAuth })
+  createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission: dashboardRbac.requirePermission })
 );
 
 app.use(createRandomPatrolRouter({ pool, requireAuth }));
@@ -8243,7 +8261,7 @@ app.get("/system/status/tenant", requireAuth, async (req, res) => {
 });
 
 app.get("/system/status/global", requireAuth, async (req, res) => {
-  if (req.auth.role !== "system_owner") {
+  if (!req.auth.is_system_owner) {
     return res.status(403).json({
       status: "error",
       message: "System owner access required",

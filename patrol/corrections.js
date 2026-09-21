@@ -6,8 +6,8 @@ const OUTCOME_VALUES = new Set([
   "COMPLETED_LATE",
 ]);
 
-function requireSystemOwner(req, res, next) {
-  if (req.auth?.role !== "system_owner") {
+function requirePatrolCorrectionPermission(req, res, next) {
+  if (!req.auth?.is_system_owner && !req.auth?.permissions?.includes("patrols.correct")) {
     return res.status(403).json({
       status: "error",
       message: "Only the system owner can manage patrol corrections",
@@ -262,10 +262,10 @@ async function loadOccurrence(pool, occurrenceKey) {
   return null;
 }
 
-function createPatrolCorrectionsRouter({ pool, requireAuth }) {
+function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission }) {
   const router = express.Router();
 
-  router.use(requireAuth, requireSystemOwner);
+  router.use(requireAuth, requirePermission ? requirePermission("patrols.correct") : requirePatrolCorrectionPermission);
 
   router.get("/occurrences", async (req, res) => {
     try {
@@ -544,5 +544,5 @@ module.exports = {
   attachCorrectionsToRows,
   createPatrolCorrectionsRouter,
   loadOccurrence,
-  requireSystemOwner,
+  requirePatrolCorrectionPermission,
 };
