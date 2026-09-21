@@ -12,6 +12,33 @@ test("critical Dashboard routes map to canonical permissions", () => {
   assert.equal(routePermission("POST", "/admin/patrol-corrections"), "patrols.correct");
   assert.equal(routePermission("PATCH", "/shift-reports/2/acknowledge"), "shift_reports.acknowledge");
   assert.equal(routePermission("GET", "/system/status/global"), "system_status.global");
+  assert.deepEqual(routePermission("GET", "/admin/roles"), ["users.view", "roles.view"]);
+  assert.equal(routePermission("POST", "/admin/roles"), "roles.manage");
+});
+
+test("roles list accepts either users.view or roles.view", () => {
+  const rbac = createDashboardRbac({ pool: { query: async () => ({ rows: [] }) } });
+  for (const permission of ["users.view", "roles.view"]) {
+    const req = { method: "GET", originalUrl: "/admin/roles", auth: { permissions: [permission] } };
+    let nextCalled = false;
+    rbac.enforceRequestPermission(req, { status() { return this; }, json() { return this; } }, () => { nextCalled = true; });
+    assert.equal(nextCalled, true);
+  }
+});
+
+test("Role Management mutations require System Owner in addition to permission", () => {
+  const rbac = createDashboardRbac({ pool: { query: async () => ({ rows: [] }) } });
+  const response = { statusCode: 200, body: null,
+    status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+  let nextCalled = false;
+  rbac.requireSystemOwner(
+    { auth: { is_system_owner: false, permissions: ["roles.manage"] } },
+    response,
+    () => { nextCalled = true; }
+  );
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.body.code, "SYSTEM_OWNER_REQUIRED");
+  assert.equal(nextCalled, false);
 });
 
 test("direct HTTP-style enforcement returns 403 without permission", () => {
@@ -54,3 +81,14 @@ test("server defaults new Dashboard users to Viewer and never allows Guard", () 
   assert.doesNotMatch(source, /allowedRoles\s*=\s*\[[^\]]*"guard"/);
 });
 
+test("RBAC correction widens compatibility role code and wires exact Random Patrol permissions", () => {
+  const migration = fs.readFileSync(path.join(__dirname, "../database/2026-09-23-dashboard-rbac-corrections.sql"), "utf8");
+  const randomPatrols = fs.readFileSync(path.join(__dirname, "../patrol/random-patrols.js"), "utf8");
+  const server = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
+  assert.match(migration, /ALTER COLUMN role TYPE VARCHAR\(96\)/);
+  assert.doesNotMatch(randomPatrols, /requirePatrolAdministrator/);
+  assert.match(randomPatrols, /requirePermission\("patrols\.view"\)/);
+  assert.match(randomPatrols, /requirePermission\("patrols\.manage"\)/);
+  assert.match(randomPatrols, /requireAllPermissions\(\["patrols\.view", "exports\.view"\]\)/);
+  assert.match(server, /app\.post\("\/admin\/roles", requireAuth, dashboardRbac\.requireSystemOwner/);
+});

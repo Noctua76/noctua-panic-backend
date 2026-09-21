@@ -24,7 +24,7 @@ function routePermission(method, path) {
 
   if (path === "/admin/heartbeat" || path === "/admin/logout" || path === "/auth/change-password") return null;
   if (path.startsWith("/admin/temporary-access")) return "temporary_access.manage";
-  if (path === "/admin/roles") return mutation ? "roles.manage" : "users.view";
+  if (path === "/admin/roles") return mutation ? "roles.manage" : ["users.view", "roles.view"];
   if (path.startsWith("/admin/roles")) return mutation ? "roles.manage" : "roles.view";
   if (path.startsWith("/admin/users")) {
     if (/\/reset-password$/.test(path)) return "users.reset_password";
@@ -128,9 +128,25 @@ function createDashboardRbac({ pool }) {
     return (req, res, next) => codes.every((code) => hasPermission(req.auth, code)) ? next() : deny(res, codes.join(" and "));
   }
 
+  function requireSystemOwner(req, res, next) {
+    return req.auth?.is_system_owner
+      ? next()
+      : res.status(403).json({
+        status: "error",
+        code: "SYSTEM_OWNER_REQUIRED",
+        message: "System Owner access required",
+      });
+  }
+
   function enforceRequestPermission(req, res, next) {
     const code = routePermission(req.method, (req.originalUrl || req.path).split("?")[0]);
-    return !code || hasPermission(req.auth, code) ? next() : deny(res, code);
+    if (!code) return next();
+    if (Array.isArray(code)) {
+      return code.some((item) => hasPermission(req.auth, item))
+        ? next()
+        : deny(res, code.join(" or "));
+    }
+    return hasPermission(req.auth, code) ? next() : deny(res, code);
   }
 
   function invalidateUser(userId) { permissionCache.delete(Number(userId)); }
@@ -163,6 +179,7 @@ function createDashboardRbac({ pool }) {
     requireAllPermissions,
     requireAnyPermission,
     requirePermission,
+    requireSystemOwner,
     resolveAuthorization,
     revokeAuthorizationSessions,
   };

@@ -3909,7 +3909,7 @@ app.get("/admin/roles/permissions", requireAuth, async (_req, res) => {
   return res.json({ status: "ok", permissions: result.rows });
 });
 
-app.post("/admin/roles", requireAuth, async (req, res) => {
+app.post("/admin/roles", requireAuth, dashboardRbac.requireSystemOwner, async (req, res) => {
   const client = await pool.connect();
   try {
     const name = String(req.body.name || "").trim();
@@ -3941,7 +3941,7 @@ app.post("/admin/roles", requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-app.post("/admin/roles/:id/clone", requireAuth, async (req, res) => {
+app.post("/admin/roles/:id/clone", requireAuth, dashboardRbac.requireSystemOwner, async (req, res) => {
   const client = await pool.connect();
   try {
     const roleId = Number(req.params.id);
@@ -3974,7 +3974,7 @@ app.post("/admin/roles/:id/clone", requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-app.put("/admin/roles/:id", requireAuth, async (req, res) => {
+app.put("/admin/roles/:id", requireAuth, dashboardRbac.requireSystemOwner, async (req, res) => {
   const client = await pool.connect();
   try {
     const roleId = Number(req.params.id);
@@ -8217,7 +8217,12 @@ app.use(
   createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission: dashboardRbac.requirePermission })
 );
 
-app.use(createRandomPatrolRouter({ pool, requireAuth }));
+app.use(createRandomPatrolRouter({
+  pool,
+  requireAuth,
+  requirePermission: dashboardRbac.requirePermission,
+  requireAllPermissions: dashboardRbac.requireAllPermissions,
+}));
 
 app.use(
   createShiftReportsRouter({

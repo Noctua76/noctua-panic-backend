@@ -128,7 +128,7 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
 }
 
 async function getAuthorizedSite(pool, auth, siteId) {
-  const isSystemOwner = auth.role === "system_owner";
+  const isSystemOwner = auth.is_system_owner === true || auth.role === "system_owner";
   const result = await pool.query(
     `
     SELECT s.id, s.company_id, s.name, COALESCE(c.timezone, 'Europe/Athens') AS timezone,
@@ -142,15 +142,8 @@ async function getAuthorizedSite(pool, auth, siteId) {
   return result.rows[0] || null;
 }
 
-function createRandomPatrolRouter({ pool, requireAuth }) {
+function createRandomPatrolRouter({ pool, requireAuth, requirePermission, requireAllPermissions }) {
   const router = express.Router();
-
-  function requirePatrolAdministrator(req, res, next) {
-    if (!["system_owner", "supervisor"].includes(req.auth.role)) {
-      return res.status(403).json({ status: "error", message: "Administrator access required" });
-    }
-    return next();
-  }
 
   async function loadSchedule(req, siteId, localDate) {
     const site = await getAuthorizedSite(pool, req.auth, siteId);
@@ -227,7 +220,7 @@ function createRandomPatrolRouter({ pool, requireAuth }) {
     };
   }
 
-  router.get("/settings/sites/:siteId/random-patrol-config", requireAuth, requirePatrolAdministrator, async (req, res) => {
+  router.get("/settings/sites/:siteId/random-patrol-config", requireAuth, requirePermission("patrols.view"), async (req, res) => {
     try {
       const siteId = Number(req.params.siteId);
       const site = await getAuthorizedSite(pool, req.auth, siteId);
@@ -253,7 +246,7 @@ function createRandomPatrolRouter({ pool, requireAuth }) {
     }
   });
 
-  router.put("/settings/sites/:siteId/random-patrol-config", requireAuth, requirePatrolAdministrator, async (req, res) => {
+  router.put("/settings/sites/:siteId/random-patrol-config", requireAuth, requirePermission("patrols.manage"), async (req, res) => {
     const client = await pool.connect();
     let transactionStarted = false;
     try {
@@ -380,7 +373,7 @@ function createRandomPatrolRouter({ pool, requireAuth }) {
     }
   });
 
-  router.get("/settings/sites/:siteId/random-patrol-config/history", requireAuth, requirePatrolAdministrator, async (req, res) => {
+  router.get("/settings/sites/:siteId/random-patrol-config/history", requireAuth, requirePermission("patrols.view"), async (req, res) => {
     try {
       const siteId = Number(req.params.siteId);
       const site = await getAuthorizedSite(pool, req.auth, siteId);
@@ -402,7 +395,7 @@ function createRandomPatrolRouter({ pool, requireAuth }) {
     }
   });
 
-  router.get("/patrols/random-schedules", requireAuth, requirePatrolAdministrator, async (req, res) => {
+  router.get("/patrols/random-schedules", requireAuth, requirePermission("patrols.view"), async (req, res) => {
     try {
       const siteId = Number(req.query.site_id);
       const date = String(req.query.date || "");
@@ -418,7 +411,7 @@ function createRandomPatrolRouter({ pool, requireAuth }) {
     }
   });
 
-  router.get("/patrols/random-schedules/report/pdf", requireAuth, requirePatrolAdministrator, async (req, res) => {
+  router.get("/patrols/random-schedules/report/pdf", requireAuth, requireAllPermissions(["patrols.view", "exports.view"]), async (req, res) => {
     let browser;
     try {
       const siteId = Number(req.query.site_id);
