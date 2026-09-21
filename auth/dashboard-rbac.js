@@ -46,10 +46,12 @@ function routePermission(method, path) {
   if (path.startsWith("/incidents")) return mutation ? "incidents.manage" : (path.includes("/report") ? "exports.view" : "incidents.view");
   if (path === "/send-sms" || path === "/test-sms" || path.startsWith("/alerts/") || path.startsWith("/settings/alert")) return mutation ? "alerts.manage" : "alerts.view";
   if (path.startsWith("/settings/test-alert")) return "alerts.view";
+  if (method === "GET" && path === "/guards/shifts/history") return ["guards.view", "audit_logs.view"];
   if (path.startsWith("/settings/guards") || path.startsWith("/guards")) {
     if (/\/reset-password$/.test(path)) return "guards.reset_password";
     return mutation ? "guards.manage" : "guards.view";
   }
+  if (method === "GET" && /^\/patrol-points\/\d+\/qr$/.test(path)) return "patrols.manage";
   if (path.startsWith("/settings/sites") && (path.includes("patrol-") || path.includes("patrol_"))) return mutation ? "patrols.manage" : "patrols.view";
   if (path.startsWith("/settings/patrol") || path.startsWith("/patrols") || path.startsWith("/patrol-points")) return mutation ? "patrols.manage" : (path.includes("/pdf") ? "exports.view" : "patrols.view");
   if (path.startsWith("/settings/sites") || path === "/sites") return mutation ? "sites.manage" : "sites.view";

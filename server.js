@@ -2230,7 +2230,8 @@ c.name AS company_name,
     if (result.rows.length === 0) {
       return res.status(401).json({
         status: "error",
-        message: "Invalid or inactive session",
+        code: "AUTH_SESSION_INVALID",
+        message: "The Dashboard session is no longer active.",
       });
     }
 
@@ -2835,6 +2836,21 @@ app.post(
       }
 
       const site = siteResult.rows[0];
+      const supervisorRoleResult = await client.query(
+        `SELECT id, code
+         FROM dashboard_roles
+         WHERE code = 'supervisor'
+           AND is_active = TRUE
+         LIMIT 1`
+      );
+
+      if (supervisorRoleResult.rows.length === 0) {
+        const error = new Error("Active Supervisor role is unavailable");
+        error.code = "SUPERVISOR_ROLE_UNAVAILABLE";
+        throw error;
+      }
+
+      const supervisorRole = supervisorRoleResult.rows[0];
       const groupId = crypto.randomUUID();
       const usernameSuffix = groupId.slice(0, 8);
 
@@ -2913,6 +2929,35 @@ app.post(
           durationHours,
           groupId,
           label,
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO user_dashboard_roles (user_id, role_id, assigned_by)
+         VALUES ($1, $2, $3)`,
+        [userResult.rows[0].id, supervisorRole.id, req.auth.user_id]
+      );
+
+      await client.query(
+        `INSERT INTO dashboard_rbac_audit_events (
+           event_type, actor_user_id, target_user_id, role_id,
+           company_id, before_state, after_state
+         )
+         VALUES (
+           'USER_ROLE_ASSIGNED', $1, $2, $3, $4, NULL,
+           jsonb_build_object(
+             'role_code', $5::text,
+             'source', 'temporary_preview_creation',
+             'access_mode', $6::text
+           )
+         )`,
+        [
+          req.auth.user_id,
+          userResult.rows[0].id,
+          supervisorRole.id,
+          site.company_id,
+          supervisorRole.code,
+          ACCESS_MODE_READ_ONLY,
         ]
       );
 
@@ -7025,6 +7070,14 @@ app.post(
       if (err.code === "23505") {
         return res.status(409).json({ status: "error", message: "Username already exists" });
       }
+
+      if (err.code === "SUPERVISOR_ROLE_UNAVAILABLE") {
+        return res.status(503).json({
+          status: "error",
+          code: err.code,
+          message: "Temporary access cannot be created because the Supervisor role is unavailable",
+        });
+      }
       return res.status(500).json({
         status: "error",
         message: err.message,
@@ -9991,7 +10044,7 @@ app.get(
           site_id,
           point_name,
           point_description,
-          qr_token,
+          (qr_token IS NOT NULL) AS qr_generated,
           expected_interval_minutes,
           active,
           created_at
@@ -12614,7 +12667,7 @@ if (siteResult.rows.length === 0) {
       SELECT
   id,
   point_name,
-  qr_token,
+  (qr_token IS NOT NULL) AS qr_generated,
   active,
   created_at
 FROM patrol_points
