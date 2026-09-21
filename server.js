@@ -44,6 +44,8 @@ const {
 } = require("./auth/guard-password-lifecycle");
 const { createDashboardRbac } = require("./auth/dashboard-rbac");
 const { resetDashboardUserPassword } = require("./auth/dashboard-user-password-reset");
+const { enforceDashboardPasswordChange } = require("./auth/dashboard-password-gate");
+const { changeDashboardPassword } = require("./auth/dashboard-password-change");
 
 // ================================
 // TIMEZONE HELPERS
@@ -2199,6 +2201,7 @@ async function requireAuth(req, res, next) {
         u.email,
         u.role,
         u.authorization_version,
+        u.must_change_password,
         u.status AS user_status,
 u.company_id,
 u.access_mode,
@@ -2342,6 +2345,7 @@ c.name AS company_name,
       email: auth.email,
       role: auth.role,
 authorization_version: auth.authorization_version,
+must_change_password: auth.must_change_password,
 access_mode: auth.access_mode,
 temporary_access_started_at:
   auth.temporary_access_started_at,
@@ -2357,6 +2361,10 @@ company_id: auth.company_id,
           ? "platform"
           : "company",
     };
+
+    if (enforceDashboardPasswordChange(req, res)) {
+      return;
+    }
 
     Object.assign(
       req.auth,
@@ -3270,122 +3278,26 @@ app.post("/auth/change-password", requireAuth, async (req, res) => {
     const authenticatedUserId = Number(req.auth.user_id);
     const { current_password, new_password } = req.body;
 
-    if (!Number.isInteger(authenticatedUserId) || authenticatedUserId <= 0) {
-      return res.status(401).json({
-        status: "error",
-        message: "Invalid authenticated session",
-      });
-    }
-
-    if (
-      typeof current_password !== "string" ||
-      typeof new_password !== "string" ||
-      !current_password ||
-      !new_password
-    ) {
-      return res.status(400).json({
-        status: "error",
-        message: "current_password and new_password are required",
-      });
-    }
-
-    if (new_password.length < 8) {
-      return res.status(400).json({
-        status: "error",
-        message: "New password must be at least 8 characters long",
-      });
-    }
-
-    if (current_password === new_password) {
-      return res.status(400).json({
-        status: "error",
-        message: "New password must be different from the current password",
-      });
-    }
-
-    const userResult = await pool.query(
-      `
-      SELECT
-        id,
-        full_name,
-        username,
-        email,
-        phone,
-        role,
-        status,
-        password_hash,
-        must_change_password
-      FROM users
-      WHERE id = $1
-        AND status = 'active'
-      `,
-      [authenticatedUserId]
-    );
-
-    if (userResult.rows.length === 0) {
-      return res.status(401).json({
-        status: "error",
-        message: "Authenticated user not found or inactive",
-      });
-    }
-
-    const user = userResult.rows[0];
-
-    const validPassword = await bcrypt.compare(
-      current_password,
-      user.password_hash
-    );
-
-    if (!validPassword) {
-      return res.status(401).json({
-        status: "error",
-        message: "Current password is incorrect",
-      });
-    }
-
-    const newPasswordHash = await bcrypt.hash(new_password, 10);
-
-    const updateResult = await pool.query(
-      `
-      UPDATE users
-      SET
-        password_hash = $1,
-        must_change_password = false,
-        updated_at = NOW()
-      WHERE id = $2
-        AND status = 'active'
-      RETURNING
-        id,
-        full_name,
-        username,
-        email,
-        phone,
-        role,
-        status,
-        must_change_password,
-        updated_at
-      `,
-      [newPasswordHash, authenticatedUserId]
-    );
-
-    if (updateResult.rows.length === 0) {
-      return res.status(401).json({
-        status: "error",
-        message: "Password change could not be completed",
-      });
-    }
+    const user = await changeDashboardPassword({
+      pool,
+      bcrypt,
+      userId: authenticatedUserId,
+      currentPassword: current_password,
+      newPassword: new_password,
+      invalidateUser: dashboardRbac.invalidateUser,
+    });
 
     return res.json({
       status: "ok",
       message: "Password changed successfully",
-      user: updateResult.rows[0],
+      user,
     });
   } catch (err) {
     console.error("Change password error:", err);
 
-    return res.status(500).json({
+    return res.status(err.statusCode || 500).json({
       status: "error",
-      message: "Unable to change password",
+      message: err.statusCode ? err.message : "Unable to change password",
     });
   }
 });
