@@ -17,6 +17,18 @@ test("critical Dashboard routes map to canonical permissions", () => {
   assert.equal(routePermission("GET", "/settings/alert-configuration"), "alerts.view");
   assert.equal(routePermission("POST", "/settings/alert-recipients"), "alerts.manage");
   assert.equal(routePermission("POST", "/alerts/test"), "alerts.manage");
+  assert.equal(routePermission("GET", "/auth/context"), null);
+});
+
+test("auth context is available to every valid Dashboard session", () => {
+  const rbac = createDashboardRbac({ pool: { query: async () => ({ rows: [] }) } });
+  let nextCalled = false;
+  rbac.enforceRequestPermission(
+    { method: "GET", originalUrl: "/auth/context", auth: { permissions: ["shift_reports.view"] } },
+    { status() { return this; }, json() { return this; } },
+    () => { nextCalled = true; }
+  );
+  assert.equal(nextCalled, true);
 });
 
 test("direct alert mutation returns 403 without alerts.manage", () => {

@@ -22,7 +22,7 @@ function normalizeCode(value) {
 function routePermission(method, path) {
   const mutation = !SAFE_METHODS.has(method);
 
-  if (path === "/admin/heartbeat" || path === "/admin/logout" || path === "/auth/change-password") return null;
+  if (path === "/admin/heartbeat" || path === "/admin/logout" || path === "/auth/change-password" || path === "/auth/context") return null;
   if (path.startsWith("/admin/temporary-access")) return "temporary_access.manage";
   if (path === "/admin/roles") return mutation ? "roles.manage" : ["users.view", "roles.view"];
   if (path.startsWith("/admin/roles")) return mutation ? "roles.manage" : "roles.view";
@@ -54,7 +54,7 @@ function routePermission(method, path) {
   if (path.startsWith("/settings/patrol") || path.startsWith("/patrols") || path.startsWith("/patrol-points")) return mutation ? "patrols.manage" : (path.includes("/pdf") ? "exports.view" : "patrols.view");
   if (path.startsWith("/settings/sites") || path === "/sites") return mutation ? "sites.manage" : "sites.view";
   if (path === "/settings/config") return "dashboard.view";
-  if (path === "/admin/active" || path === "/auth/context") return "dashboard.view";
+  if (path === "/admin/active") return "dashboard.view";
   return mutation ? "__unclassified_mutation__" : "dashboard.view";
 }
 
