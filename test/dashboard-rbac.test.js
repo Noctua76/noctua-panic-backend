@@ -14,6 +14,24 @@ test("critical Dashboard routes map to canonical permissions", () => {
   assert.equal(routePermission("GET", "/system/status/global"), "system_status.global");
   assert.deepEqual(routePermission("GET", "/admin/roles"), ["users.view", "roles.view"]);
   assert.equal(routePermission("POST", "/admin/roles"), "roles.manage");
+  assert.equal(routePermission("GET", "/settings/alert-configuration"), "alerts.view");
+  assert.equal(routePermission("POST", "/settings/alert-recipients"), "alerts.manage");
+  assert.equal(routePermission("POST", "/alerts/test"), "alerts.manage");
+});
+
+test("direct alert mutation returns 403 without alerts.manage", () => {
+  const rbac = createDashboardRbac({ pool: { query: async () => ({ rows: [] }) } });
+  const response = { statusCode: 200, body: null,
+    status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+  let nextCalled = false;
+  rbac.enforceRequestPermission(
+    { method: "POST", originalUrl: "/settings/alert-recipients", auth: { permissions: ["alerts.view"] } },
+    response,
+    () => { nextCalled = true; }
+  );
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.body.code, "PERMISSION_DENIED");
+  assert.equal(nextCalled, false);
 });
 
 test("roles list accepts either users.view or roles.view", () => {

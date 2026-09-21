@@ -43,6 +43,7 @@ const {
   validateGuardPassword,
 } = require("./auth/guard-password-lifecycle");
 const { createDashboardRbac } = require("./auth/dashboard-rbac");
+const { resetDashboardUserPassword } = require("./auth/dashboard-user-password-reset");
 
 // ================================
 // TIMEZONE HELPERS
@@ -3226,17 +3227,6 @@ app.put("/admin/users/:id/reset-password", requireAuth, async (req, res) => {
       });
     }
 
-    const targetResult = await pool.query(
-      `SELECT u.id, COALESCE(r.code, u.role) AS role_code
-       FROM users u LEFT JOIN user_dashboard_roles ur ON ur.user_id=u.id
-       LEFT JOIN dashboard_roles r ON r.id=ur.role_id
-       WHERE u.id=$1 AND u.company_id=$2`, [userId, companyId]
-    );
-    if (!targetResult.rows.length) return res.status(404).json({ status: "error", message: "User not found" });
-    if (!req.auth.is_system_owner && targetResult.rows[0].role_code === "system_owner") {
-      return res.status(403).json({ status: "error", message: "Company Administrator cannot reset a System Owner password" });
-    }
-
     const temporaryPassword = crypto
       .randomBytes(9)
       .toString("base64")
@@ -3248,50 +3238,27 @@ app.put("/admin/users/:id/reset-password", requireAuth, async (req, res) => {
       10
     );
 
-    const result = await pool.query(
-      `
-      UPDATE users
-      SET
-        password_hash = $1,
-        must_change_password = true,
-        updated_at = NOW()
-      WHERE id = $2
-        AND company_id = $3
-      RETURNING
-        id,
-        full_name,
-        username,
-        email,
-        phone,
-        role,
-        status,
-        must_change_password,
-        company_id
-      `,
-      [
-        passwordHash,
-        userId,
-        companyId
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "User not found"
-      });
-    }
+    const result = await resetDashboardUserPassword({
+      pool,
+      userId,
+      companyId,
+      actorUserId: req.auth.user_id,
+      actorIsSystemOwner: req.auth.is_system_owner,
+      passwordHash,
+      invalidateUser: dashboardRbac.invalidateUser,
+    });
 
     return res.json({
       status: "ok",
       message: "Password reset successfully",
       temporary_password: temporaryPassword,
-      user: result.rows[0]
+      revoked_session_count: result.revokedSessionCount,
+      user: result.user
     });
   } catch (err) {
     console.error("User reset password error:", err);
 
-    return res.status(500).json({
+    return res.status(err.statusCode || 500).json({
       status: "error",
       message: err.message
     });

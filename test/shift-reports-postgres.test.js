@@ -19,9 +19,12 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       CREATE TABLE guards (id SERIAL PRIMARY KEY, site_id INTEGER NOT NULL REFERENCES sites(id), full_name TEXT NOT NULL);
       CREATE TABLE guard_sessions (id SERIAL PRIMARY KEY, guard_id INTEGER NOT NULL REFERENCES guards(id), site_id INTEGER NOT NULL REFERENCES sites(id));
       CREATE TABLE users (id SERIAL PRIMARY KEY, company_id INTEGER REFERENCES companies(id), full_name TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'viewer', status TEXT NOT NULL DEFAULT 'active');
+        username TEXT, email TEXT, phone TEXT, password_hash TEXT,
+        must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+        role TEXT NOT NULL DEFAULT 'viewer', status TEXT NOT NULL DEFAULT 'active', updated_at TIMESTAMPTZ DEFAULT NOW());
       CREATE TABLE admin_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), is_active BOOLEAN DEFAULT TRUE,
-        logout_time TIMESTAMPTZ, session_end_reason TEXT);
+        session_token TEXT, login_time TIMESTAMPTZ DEFAULT NOW(), logout_time TIMESTAMPTZ,
+        session_duration_seconds INTEGER, session_end_reason TEXT);
     `);
     const migration = fs.readFileSync(
       path.join(__dirname, "../database/2026-09-20-shift-reports.sql"),
@@ -38,6 +41,11 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       "utf8"
     );
     await client.query(rbacMigration);
+    const passwordResetSessionMigration = fs.readFileSync(
+      path.join(__dirname, "../database/2026-09-24-dashboard-password-reset-sessions.sql"),
+      "utf8"
+    );
+    await client.query(passwordResetSessionMigration);
     await client.query(`
       INSERT INTO companies (id, name, timezone) VALUES (1, 'Noctua', 'Europe/Athens');
       INSERT INTO sites (id, company_id, name) VALUES (1, 1, 'Ekali');
@@ -117,6 +125,48 @@ test("PostgreSQL enforces immutable Shift Report content and lifecycle", {
       client.query("DELETE FROM dashboard_rbac_audit_events"),
       /Dashboard RBAC audit events are immutable/
     );
+
+    await client.query(`
+      INSERT INTO users (id, company_id, full_name, username, password_hash)
+      VALUES (2, 1, 'Target Admin', 'target_admin', 'old-hash');
+      INSERT INTO admin_sessions (user_id, session_token, login_time, is_active)
+      VALUES (2, 'old-token-1', NOW() - INTERVAL '10 minutes', TRUE),
+             (2, 'old-token-2', NOW() - INTERVAL '5 minutes', TRUE);
+    `);
+    const { resetDashboardUserPassword } = require("../auth/dashboard-user-password-reset");
+    const resetResult = await resetDashboardUserPassword({
+      pool: { connect: async () => ({ query: client.query.bind(client), release() {} }) },
+      userId: 2,
+      companyId: 1,
+      actorUserId: 1,
+      actorIsSystemOwner: true,
+      passwordHash: 'new-hash',
+    });
+    assert.equal(resetResult.revokedSessionCount, 2);
+    const revoked = await client.query(
+      `SELECT is_active, session_end_reason, logout_time IS NOT NULL AS has_logout,
+              session_duration_seconds >= 0 AS valid_duration
+       FROM admin_sessions WHERE user_id = 2 ORDER BY id`
+    );
+    assert.deepEqual(revoked.rows, [
+      { is_active: false, session_end_reason: "password_reset", has_logout: true, valid_duration: true },
+      { is_active: false, session_end_reason: "password_reset", has_logout: true, valid_duration: true },
+    ]);
+    const oldToken = await client.query(
+      `SELECT id FROM admin_sessions WHERE session_token = $1 AND is_active = TRUE`,
+      ['old-token-1']
+    );
+    assert.equal(oldToken.rowCount, 0);
+    const resetAudit = await client.query(
+      `SELECT actor_user_id, target_user_id, after_state, created_at IS NOT NULL AS has_timestamp
+       FROM dashboard_rbac_audit_events WHERE event_type = 'USER_PASSWORD_RESET'`
+    );
+    assert.deepEqual(resetAudit.rows[0], {
+      actor_user_id: 1,
+      target_user_id: 2,
+      after_state: { revoked_session_count: 2 },
+      has_timestamp: true,
+    });
   } finally {
     await client.end();
   }
