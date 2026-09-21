@@ -267,7 +267,7 @@ to_char(
       UPDATE operational_events
       SET
         email_status = 'processing',
-        updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+        updated_at = NOW()
       WHERE id = $1
         AND email_status = 'pending'
       RETURNING id
@@ -291,7 +291,7 @@ const emailResult = await sendShiftDelayEmail(event);
         SET
           email_status = 'sent',
           email_recipient = $1,
-          email_sent_at = (NOW() AT TIME ZONE 'Europe/Athens'),
+          email_sent_at = NOW(),
           email_error = NULL,
           updated_at = NOW()
         WHERE id = $2
@@ -3063,6 +3063,15 @@ app.post(
         });
       }
 
+      if (err.code === "SUPERVISOR_ROLE_UNAVAILABLE") {
+        return res.status(503).json({
+          status: "error",
+          code: "SUPERVISOR_ROLE_UNAVAILABLE",
+          message:
+            "Temporary access cannot be created because the Supervisor role is unavailable",
+        });
+      }
+
       return res.status(500).json({
         status: "error",
         message:
@@ -3702,9 +3711,9 @@ async function detectShiftDelayEvents() {
       'high',
       'Shift Delay - No Guard Login',
       'No guard login detected within 15 minutes of the scheduled shift start.',
-      (NOW() AT TIME ZONE 'Europe/Athens'),
-      (NOW() AT TIME ZONE 'Europe/Athens'),
-      (NOW() AT TIME ZONE 'Europe/Athens'),
+      NOW(),
+      NOW(),
+      NOW(),
       'pending'
     FROM scheduled_shifts ss
     WHERE ss.scheduled_start + INTERVAL '15 minutes'
@@ -7071,13 +7080,6 @@ app.post(
         return res.status(409).json({ status: "error", message: "Username already exists" });
       }
 
-      if (err.code === "SUPERVISOR_ROLE_UNAVAILABLE") {
-        return res.status(503).json({
-          status: "error",
-          code: err.code,
-          message: "Temporary access cannot be created because the Supervisor role is unavailable",
-        });
-      }
       return res.status(500).json({
         status: "error",
         message: err.message,

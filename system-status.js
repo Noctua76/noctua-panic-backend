@@ -30,13 +30,88 @@ function errorMessage(error) {
   return String(error?.message || error || "Unknown error").slice(0, 1000);
 }
 
+function operationalHealth({ lastSuccess, lastFailure, lastFailureReason = null }) {
+  const successAt = lastSuccess ? new Date(lastSuccess) : null;
+  const failureAt = lastFailure ? new Date(lastFailure) : null;
+  let status = "unknown";
+
+  if (failureAt && (!successAt || failureAt >= successAt)) status = "degraded";
+  else if (successAt) status = "operational";
+
+  return {
+    status,
+    last_success_at: iso(lastSuccess),
+    last_failure_at: iso(lastFailure),
+    last_failure_reason: lastFailureReason || null,
+    current_error: ["degraded", "offline"].includes(status)
+      ? lastFailureReason || null
+      : null,
+  };
+}
+
+function latestInstant(...values) {
+  return values.filter(Boolean).reduce((latest, value) => {
+    if (!latest || new Date(value) > new Date(latest)) return value;
+    return latest;
+  }, null);
+}
+
+function incidentHealth({ lastIncident, lastResolved, lastFailure, lastFailureReason = null }) {
+  const lastActivity = latestInstant(lastIncident, lastResolved);
+  const health = operationalHealth({
+    lastSuccess: lastActivity,
+    lastFailure,
+    lastFailureReason,
+  });
+
+  return {
+    ...health,
+    last_operational_activity_at: iso(lastActivity),
+    status_message:
+      !lastActivity && !lastFailure ? "No incident activity recorded" : null,
+  };
+}
+
+function tenantPushHealth({
+  activeSubscriptions,
+  lastSuccess,
+  lastFailure,
+  lastFailureReason = null,
+}) {
+  const health = operationalHealth({ lastSuccess, lastFailure, lastFailureReason });
+
+  if (Number(activeSubscriptions || 0) === 0) {
+    return {
+      ...health,
+      status: "unknown",
+      current_error: null,
+      status_message: "No active push subscriptions",
+    };
+  }
+
+  return health;
+}
+
 function service(name, label, status, extra = {}) {
+  const normalizedStatus = ALLOWED_STATUSES.has(status) ? status : "unknown";
+  const {
+    last_error: legacyFailureReason,
+    last_failure_reason: suppliedFailureReason,
+    current_error: suppliedCurrentError,
+    ...details
+  } = extra;
+  const lastFailureReason = suppliedFailureReason || legacyFailureReason || null;
+
   return {
     name,
     label,
-    status: ALLOWED_STATUSES.has(status) ? status : "unknown",
+    status: normalizedStatus,
     severity: SERVICE_SEVERITY[name] || "medium",
-    ...extra,
+    ...details,
+    last_failure_reason: lastFailureReason,
+    current_error: ["degraded", "offline"].includes(normalizedStatus)
+      ? suppliedCurrentError || legacyFailureReason || lastFailureReason
+      : null,
   };
 }
 
@@ -94,11 +169,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
           WHEN EXCLUDED.status IN ('degraded', 'offline') THEN EXCLUDED.last_checked_at
           ELSE system_health_state.last_failure_at
         END,
-        last_error = CASE
-          WHEN EXCLUDED.status = 'operational' THEN NULL
-          WHEN EXCLUDED.last_error IS NOT NULL THEN EXCLUDED.last_error
-          ELSE system_health_state.last_error
-        END,
+        last_error = COALESCE(EXCLUDED.last_error, system_health_state.last_error),
         response_time_ms = EXCLUDED.response_time_ms,
         metadata = EXCLUDED.metadata,
         updated_at = NOW()
@@ -121,7 +192,10 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
       last_checked_at: iso(row.last_checked_at),
       last_success_at: iso(row.last_success_at),
       last_failure_at: iso(row.last_failure_at),
-      last_error: row.last_error || null,
+      last_failure_reason: row.last_error || null,
+      current_error: ["degraded", "offline"].includes(row.status)
+        ? row.last_error || null
+        : null,
       response_time_ms: row.response_time_ms,
       metadata: row.metadata || {},
     };
@@ -165,7 +239,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         last_checked_at: checkedAt,
         last_failure_at: checkedAt,
         response_time_ms: Date.now() - started,
-        last_error: errorMessage(error),
+        current_error: errorMessage(error),
         ...metadata,
       };
     }
@@ -174,7 +248,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
       scope: "platform",
       name,
       status: value.status,
-      error: value.last_error || null,
+      error: value.current_error || null,
       responseTimeMs: value.response_time_ms,
       metadata: value,
     });
@@ -227,18 +301,11 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
         `
     );
     const row = result.rows[0] || {};
-    const lastSuccess = row.last_success ? new Date(row.last_success) : null;
-    const lastFailure = row.last_failure ? new Date(row.last_failure) : null;
-    let status = "unknown";
-    if (lastFailure && (!lastSuccess || lastFailure >= lastSuccess)) status = "degraded";
-    else if (lastSuccess) status = "operational";
-
-    return {
-      status,
-      last_success_at: iso(row.last_success),
-      last_failure_at: iso(row.last_failure),
-      last_error: row.last_error || null,
-    };
+    return operationalHealth({
+      lastSuccess: row.last_success,
+      lastFailure: row.last_failure,
+      lastFailureReason: row.last_error,
+    });
   }
 
   async function checkPlatform() {
@@ -307,7 +374,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
       sms_gateway: "Vonage SMS",
       voice_calls: "Vonage Voice",
       email_delivery: "Postmark Email",
-      push_notifications: "Web Push",
+      push_notifications: "Platform Web Push",
     }[item.name], item.status, { ...stateFields(rows[item.name]), ...item }));
   }
 
@@ -449,11 +516,6 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
       stateRows("platform", 0),
     ]);
 
-    const operationStatus = (row) => {
-      if (!row.last_success && !row.last_failure) return "unknown";
-      if (row.last_failure && (!row.last_success || new Date(row.last_failure) >= new Date(row.last_success))) return "degraded";
-      return "operational";
-    };
     const smsRow = sms.rows[0];
     const voiceRow = voice.rows[0];
     const emailRow = email.rows[0];
@@ -464,31 +526,59 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
     const scheduler = platformState.patrol_scheduler;
     const schedulerFresh = scheduler?.last_success_at && Date.now() - new Date(scheduler.last_success_at).getTime() < 180000;
     const pushRecorded = tenantState.push_notifications;
+    const smsHealth = operationalHealth({
+      lastSuccess: smsRow.last_success,
+      lastFailure: smsRow.last_failure,
+      lastFailureReason: smsRow.last_error,
+    });
+    const voiceHealth = operationalHealth({
+      lastSuccess: voiceRow.last_success,
+      lastFailure: voiceRow.last_failure,
+      lastFailureReason: voiceRow.last_error,
+    });
+    const emailHealth = operationalHealth({
+      lastSuccess: emailRow.last_success,
+      lastFailure: emailRow.last_failure,
+      lastFailureReason: emailRow.last_error,
+    });
+    const pushHealth = tenantPushHealth({
+      activeSubscriptions: pushRow.active_subscriptions,
+      lastSuccess: latestInstant(pushRow.last_success, pushRecorded?.last_success_at),
+      lastFailure: pushRecorded?.last_failure_at,
+      lastFailureReason: pushRecorded?.last_error,
+    });
+    const incidentsHealth = incidentHealth({
+      lastIncident: incidentRow.last_incident,
+      lastResolved: incidentRow.last_resolved,
+      lastFailure: incidentRow.last_failure,
+      lastFailureReason: incidentRow.last_error,
+    });
 
     return [
-      service("sms_gateway", "SMS Delivery", operationStatus(smsRow), {
+      service("sms_gateway", "SMS Delivery", smsHealth.status, {
         configured: Boolean(env.VONAGE_API_KEY && env.VONAGE_API_SECRET),
-        last_success_at: iso(smsRow.last_success), last_failure_at: iso(smsRow.last_failure), last_error: smsRow.last_error || null,
+        ...smsHealth,
       }),
-      service("voice_calls", "Voice Calls", operationStatus(voiceRow), {
+      service("voice_calls", "Voice Calls", voiceHealth.status, {
         configured: Boolean(env.VONAGE_APPLICATION_ID && env.VONAGE_PRIVATE_KEY && env.VONAGE_FROM_NUMBER),
-        last_success_at: iso(voiceRow.last_success), last_failure_at: iso(voiceRow.last_failure), last_error: voiceRow.last_error || null,
+        ...voiceHealth,
       }),
-      service("email_delivery", "Email Delivery", operationStatus(emailRow), {
-        last_success_at: iso(emailRow.last_success), last_failure_at: iso(emailRow.last_failure), last_error: emailRow.last_error || null,
+      service("email_delivery", "Email Delivery", emailHealth.status, {
+        ...emailHealth,
       }),
-      service("push_notifications", "Push Notifications", pushRecorded?.status || (pushRow.active_subscriptions > 0 ? "operational" : "unknown"), {
-        ...stateFields(pushRecorded), active_subscriptions: pushRow.active_subscriptions, subscribed_guards: pushRow.subscribed_guards,
-        last_subscription_seen: iso(pushRow.last_subscription_seen), last_success_at: iso(pushRow.last_success) || iso(pushRecorded?.last_success_at),
+      service("push_notifications", "Tenant Push Notifications", pushHealth.status, {
+        ...pushHealth, active_subscriptions: pushRow.active_subscriptions, subscribed_guards: pushRow.subscribed_guards,
+        last_subscription_seen: iso(pushRow.last_subscription_seen),
       }),
       service("patrol_scheduler", "Patrol Scheduler", schedulerFresh ? "operational" : scheduler ? "degraded" : "unknown", {
         ...stateFields(scheduler), active_schedules: patrolRow.active_schedules, last_scan_at: iso(patrolRow.last_scan),
         last_completion_at: iso(patrolRow.last_completion), last_missed_patrol_at: iso(patrolMissedRow.last_missed_at),
         missed_last_30_days: patrolMissedRow.missed_last_30_days, scheduler_fresh: Boolean(schedulerFresh),
       }),
-      service("incident_flow", "Incident Flow", operationStatus(incidentRow), {
+      service("incident_flow", "Incident Flow", incidentsHealth.status, {
+        ...incidentsHealth,
         active_incidents: incidentRow.active_incidents, last_incident_at: iso(incidentRow.last_incident),
-        last_resolved_at: iso(incidentRow.last_resolved), last_failure_at: iso(incidentRow.last_failure), last_error: incidentRow.last_error || null,
+        last_resolved_at: iso(incidentRow.last_resolved),
       }),
     ];
   }
@@ -588,7 +678,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
             severity: "medium",
             last_checked_at: new Date().toISOString(),
             last_failure_at: new Date().toISOString(),
-            last_error: errorMessage(error),
+            current_error: errorMessage(error),
           }
         );
 
@@ -639,4 +729,10 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
   };
 }
 
-module.exports = { createSystemStatusService, summarize };
+module.exports = {
+  createSystemStatusService,
+  incidentHealth,
+  operationalHealth,
+  summarize,
+  tenantPushHealth,
+};
