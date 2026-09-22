@@ -23,6 +23,7 @@ function routePermission(method, path) {
   const mutation = !SAFE_METHODS.has(method);
 
   if (path === "/admin/heartbeat" || path === "/admin/logout" || path === "/auth/change-password" || path === "/auth/context") return null;
+  if (path.startsWith("/admin/companies")) return null;
   if (path.startsWith("/admin/temporary-access")) return "temporary_access.manage";
   if (path === "/admin/roles") return mutation ? "roles.manage" : ["users.view", "roles.view"];
   if (path.startsWith("/admin/roles")) return mutation ? "roles.manage" : "roles.view";

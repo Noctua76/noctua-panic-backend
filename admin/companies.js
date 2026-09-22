@@ -1,0 +1,262 @@
+const express = require("express");
+
+const COMPANY_STATUSES = new Set(["active", "pilot", "inactive"]);
+const REQUIRED_COMPANY_COLUMNS = ["id", "name", "status", "timezone"];
+
+class CompanyOnboardingError extends Error {
+  constructor(code, message, status = 400) {
+    super(message);
+    this.name = "CompanyOnboardingError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function normalizeOptionalText(value) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized || null;
+}
+
+function isValidIanaTimezone(value) {
+  if (typeof value !== "string" || !value.trim() || value.length > 100) return false;
+  if (/^(?:GMT|UTC)[+-]/i.test(value.trim())) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value.trim() }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateCompanyOnboardingInput(body = {}) {
+  const company = body.company || {};
+  const administrator = body.administrator || {};
+  const name = normalizeOptionalText(company.name);
+  const timezone = normalizeOptionalText(company.timezone) || "Europe/Athens";
+  const status = normalizeOptionalText(company.status) || "active";
+  const fullName = normalizeOptionalText(administrator.full_name);
+  const username = normalizeOptionalText(administrator.username);
+
+  if (!name) throw new CompanyOnboardingError("COMPANY_NAME_REQUIRED", "Company name is required");
+  if (name.length > 180) throw new CompanyOnboardingError("COMPANY_NAME_INVALID", "Company name is too long");
+  if (!isValidIanaTimezone(timezone)) {
+    throw new CompanyOnboardingError("COMPANY_TIMEZONE_INVALID", "A valid IANA timezone is required");
+  }
+  if (!COMPANY_STATUSES.has(status)) {
+    throw new CompanyOnboardingError("COMPANY_STATUS_INVALID", "Invalid company status");
+  }
+  if (!fullName) throw new CompanyOnboardingError("ADMIN_NAME_REQUIRED", "Administrator full name is required");
+  if (!username) throw new CompanyOnboardingError("ADMIN_USERNAME_REQUIRED", "Administrator username is required");
+  if (fullName.length > 180 || username.length > 120) {
+    throw new CompanyOnboardingError("ADMIN_IDENTITY_INVALID", "Administrator name or username is too long");
+  }
+
+  return {
+    company: { name, timezone, status },
+    administrator: {
+      full_name: fullName,
+      username,
+      email: normalizeOptionalText(administrator.email),
+      phone: normalizeOptionalText(administrator.phone),
+    },
+  };
+}
+
+async function inspectCompaniesSchema(queryable) {
+  const result = await queryable.query(
+    `SELECT column_name, data_type, udt_name
+       FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'companies'`
+  );
+  const columns = new Map(result.rows.map((row) => [row.column_name, row]));
+  const missing = REQUIRED_COMPANY_COLUMNS.filter((column) => !columns.has(column));
+  if (missing.length) {
+    throw new CompanyOnboardingError(
+      "COMPANIES_SCHEMA_UNAVAILABLE",
+      `Companies schema is missing required columns: ${missing.join(", ")}`,
+      503
+    );
+  }
+  return { columns, hasCreatedAt: columns.has("created_at") };
+}
+
+async function listCompanies(pool) {
+  const schema = await inspectCompaniesSchema(pool);
+  const createdAtExpression = schema.hasCreatedAt ? "c.created_at" : "NULL::timestamptz";
+  const result = await pool.query(
+    `SELECT c.id, c.name, c.status, c.timezone,
+            ${createdAtExpression} AS created_at,
+            (SELECT COUNT(*)::int FROM sites s WHERE s.company_id = c.id) AS sites_count,
+            (SELECT COUNT(*)::int
+               FROM guards g
+               JOIN sites gs ON gs.id = g.site_id
+              WHERE gs.company_id = c.id
+                AND COALESCE(g.access_mode, 'standard') = 'standard') AS guards_count,
+            (SELECT COUNT(*)::int
+               FROM users u
+              WHERE u.company_id = c.id
+                AND COALESCE(u.access_mode, 'standard') = 'standard') AS dashboard_users_count
+       FROM companies c
+      ORDER BY c.name ASC, c.id ASC`
+  );
+  return result.rows;
+}
+
+async function createCompanyWithAdministrator({
+  pool,
+  actorUserId,
+  body,
+  hashPassword,
+  generateTemporaryPassword,
+}) {
+  const input = validateCompanyOnboardingInput(body);
+  const client = await pool.connect();
+  let transactionStarted = false;
+
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const schema = await inspectCompaniesSchema(client);
+    const returningCreatedAt = schema.hasCreatedAt ? ", created_at" : "";
+
+    const companyResult = await client.query(
+      `INSERT INTO companies (name, status, timezone)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, status, timezone${returningCreatedAt}`,
+      [input.company.name, input.company.status, input.company.timezone]
+    );
+    const company = {
+      ...companyResult.rows[0],
+      created_at: companyResult.rows[0].created_at || null,
+    };
+
+    const roleResult = await client.query(
+      `SELECT id, code, name
+         FROM dashboard_roles
+        WHERE code = 'company_administrator'
+          AND scope = 'company'
+          AND is_active = TRUE
+        LIMIT 1
+        FOR SHARE`
+    );
+    const role = roleResult.rows[0];
+    if (!role) {
+      throw new CompanyOnboardingError(
+        "COMPANY_ADMIN_ROLE_UNAVAILABLE",
+        "Company onboarding is unavailable because the Company Administrator role is unavailable",
+        503
+      );
+    }
+
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await hashPassword(temporaryPassword, 10);
+    const userResult = await client.query(
+      `INSERT INTO users (
+         full_name, username, email, phone, role, status, company_id,
+         password_hash, must_change_password, access_mode, created_at
+       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, TRUE, 'standard', NOW())
+       RETURNING id, full_name, username, email, phone, role, status,
+                 company_id, must_change_password, access_mode, created_at`,
+      [
+        input.administrator.full_name,
+        input.administrator.username,
+        input.administrator.email,
+        input.administrator.phone,
+        role.code,
+        company.id,
+        passwordHash,
+      ]
+    );
+    const administrator = userResult.rows[0];
+
+    await client.query(
+      `INSERT INTO user_dashboard_roles (user_id, role_id, assigned_by)
+       VALUES ($1, $2, $3)`,
+      [administrator.id, role.id, actorUserId]
+    );
+    await client.query(
+      `INSERT INTO dashboard_rbac_audit_events
+         (event_type, actor_user_id, target_user_id, role_id, company_id, before_state, after_state)
+       VALUES ('USER_ROLE_ASSIGNED', $1, $2, $3, $4, NULL, $5::jsonb)`,
+      [
+        actorUserId,
+        administrator.id,
+        role.id,
+        company.id,
+        JSON.stringify({
+          source: "company_onboarding",
+          company_name: company.name,
+          role_code: role.code,
+          must_change_password: true,
+          access_mode: "standard",
+        }),
+      ]
+    );
+
+    await client.query("COMMIT");
+    return {
+      company,
+      administrator: { ...administrator, role_id: role.id, role_code: role.code, role_name: role.name },
+      credentials: { username: administrator.username, temporary_password: temporaryPassword },
+    };
+  } catch (error) {
+    if (transactionStarted) await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function createCompaniesRouter({ pool, hashPassword, generateTemporaryPassword }) {
+  const router = express.Router();
+
+  router.get("/", async (_req, res) => {
+    try {
+      return res.json({ status: "ok", companies: await listCompanies(pool) });
+    } catch (error) {
+      console.error("List companies error:", error);
+      return res.status(error.status || 500).json({
+        status: "error",
+        code: error.code || "COMPANIES_LIST_FAILED",
+        message: error.message,
+      });
+    }
+  });
+
+  router.post("/", async (req, res) => {
+    try {
+      const result = await createCompanyWithAdministrator({
+        pool,
+        actorUserId: req.auth.user_id,
+        body: req.body,
+        hashPassword,
+        generateTemporaryPassword,
+      });
+      return res.status(201).json({ status: "ok", ...result });
+    } catch (error) {
+      console.error("Create company error:", error);
+      if (error.code === "23505") {
+        return res.status(409).json({ status: "error", code: "COMPANY_OR_USERNAME_EXISTS", message: "Company name or username already exists" });
+      }
+      return res.status(error.status || 500).json({
+        status: "error",
+        code: error.code || "COMPANY_ONBOARDING_FAILED",
+        message: error.message,
+      });
+    }
+  });
+
+  return router;
+}
+
+module.exports = {
+  COMPANY_STATUSES,
+  CompanyOnboardingError,
+  createCompaniesRouter,
+  createCompanyWithAdministrator,
+  inspectCompaniesSchema,
+  isValidIanaTimezone,
+  listCompanies,
+  validateCompanyOnboardingInput,
+};
