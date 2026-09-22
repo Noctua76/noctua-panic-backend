@@ -131,6 +131,15 @@ async function createCompanyWithAdministrator({
       created_at: companyResult.rows[0].created_at || null,
     };
 
+    if (company.status === "inactive") {
+      await client.query(
+        `INSERT INTO company_inactive_intervals
+           (company_id, started_at, started_by)
+         VALUES ($1, NOW(), $2)`,
+        [company.id, actorUserId]
+      );
+    }
+
     const roleResult = await client.query(
       `SELECT id, code, name
          FROM dashboard_roles
@@ -208,7 +217,13 @@ async function createCompanyWithAdministrator({
   }
 }
 
-async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) {
+async function changeCompanyStatus({
+  pool,
+  companyId,
+  newStatus,
+  actorUserId,
+  syncScheduledShiftsForSession,
+}) {
   const parsedCompanyId = Number(companyId);
   if (!Number.isInteger(parsedCompanyId) || parsedCompanyId <= 0) {
     throw new CompanyOnboardingError("COMPANY_ID_INVALID", "Invalid company id");
@@ -243,6 +258,9 @@ async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) 
       };
     }
 
+    const transitionResult = await client.query("SELECT NOW() AS transition_at");
+    const transitionAt = transitionResult.rows[0].transition_at;
+
     const updatedResult = await client.query(
       `UPDATE companies
           SET status = $1
@@ -253,6 +271,14 @@ async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) 
     const shutdown = { dashboard_sessions: 0, guard_sessions: 0, push_subscriptions: 0 };
 
     if (newStatus === "inactive") {
+      await client.query(
+        `INSERT INTO company_inactive_intervals
+           (company_id, started_at, started_by)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (company_id) WHERE ended_at IS NULL DO NOTHING`,
+        [parsedCompanyId, transitionAt, actorUserId]
+      );
+
       const dashboardSessions = await client.query(
         `UPDATE admin_sessions ads
             SET is_active = FALSE,
@@ -287,6 +313,17 @@ async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) 
       );
       shutdown.guard_sessions = guardSessions.rowCount;
 
+      if (typeof syncScheduledShiftsForSession !== "function") {
+        throw new CompanyOnboardingError(
+          "SHIFT_COVERAGE_SYNC_UNAVAILABLE",
+          "Company inactivity cannot safely close guard sessions",
+          503
+        );
+      }
+      for (const session of guardSessions.rows) {
+        await syncScheduledShiftsForSession(session.id, client);
+      }
+
       const pushSubscriptions = await client.query(
         `UPDATE push_subscriptions ps
             SET active = FALSE, last_seen = NOW()
@@ -298,13 +335,22 @@ async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) 
         [parsedCompanyId]
       );
       shutdown.push_subscriptions = pushSubscriptions.rowCount;
+    } else if (company.status === "inactive") {
+      await client.query(
+        `UPDATE company_inactive_intervals
+            SET ended_at = $2,
+                ended_by = $3
+          WHERE company_id = $1
+            AND ended_at IS NULL`,
+        [parsedCompanyId, transitionAt, actorUserId]
+      );
     }
 
     await client.query(
       `INSERT INTO company_status_audit_events
          (company_id, previous_status, new_status, changed_by, changed_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [parsedCompanyId, company.status, newStatus, actorUserId]
+       VALUES ($1, $2, $3, $4, $5)`,
+      [parsedCompanyId, company.status, newStatus, actorUserId, transitionAt]
     );
     await client.query("COMMIT");
 
@@ -323,7 +369,12 @@ async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) 
   }
 }
 
-function createCompaniesRouter({ pool, hashPassword, generateTemporaryPassword }) {
+function createCompaniesRouter({
+  pool,
+  hashPassword,
+  generateTemporaryPassword,
+  syncScheduledShiftsForSession,
+}) {
   const router = express.Router();
 
   router.get("/", async (_req, res) => {
@@ -369,6 +420,7 @@ function createCompaniesRouter({ pool, hashPassword, generateTemporaryPassword }
         companyId: req.params.id,
         newStatus: req.body?.status,
         actorUserId: req.auth.user_id,
+        syncScheduledShiftsForSession,
       });
       return res.json({ status: "ok", ...result });
     } catch (error) {

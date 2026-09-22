@@ -88,8 +88,8 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
       COALESCE(c.timezone, 'Europe/Athens') AS timezone,
       (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date AS local_date,
       CASE
-        WHEN resumed.changed_at IS NOT NULL
-         AND (resumed.changed_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+        WHEN resumed.ended_at IS NOT NULL
+         AND (resumed.ended_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
              = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
         THEN (
           EXTRACT(HOUR FROM (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')))::int * 60
@@ -101,12 +101,11 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
     FROM random_patrol_configurations rpc
     INNER JOIN companies c ON c.id = rpc.company_id
     LEFT JOIN LATERAL (
-      SELECT csa.changed_at
-      FROM company_status_audit_events csa
-      WHERE csa.company_id = c.id
-        AND csa.previous_status = 'inactive'
-        AND csa.new_status IN ('active', 'pilot')
-      ORDER BY csa.changed_at DESC
+      SELECT inactive.ended_at
+      FROM company_inactive_intervals inactive
+      WHERE inactive.company_id = c.id
+        AND inactive.ended_at IS NOT NULL
+      ORDER BY inactive.ended_at DESC
       LIMIT 1
     ) resumed ON TRUE
     INNER JOIN sites s
@@ -233,6 +232,11 @@ function createRandomPatrolRouter({ pool, requireAuth, requirePermission, requir
       WHERE rpd.company_id = $1
         AND rpd.site_id = $2
         AND rpd.local_date = $3::date
+        AND is_company_operational_at(
+          rpo.company_id,
+          rpo.scheduled_at,
+          rpd.timezone
+        )
       ORDER BY pp.point_name ASC, rpo.scheduled_at ASC
       `,
       [site.company_id, siteId, localDate]

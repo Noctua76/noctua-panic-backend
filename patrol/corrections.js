@@ -159,6 +159,11 @@ async function loadOccurrence(pool, occurrenceKey) {
       JOIN patrol_points pp ON pp.id = ps.patrol_point_id
       WHERE ps.id = $2
         AND ps.schedule_type = 'recurring'
+        AND is_company_operational_at(
+          s.company_id,
+          (TO_TIMESTAMP($3::double precision) AT TIME ZONE 'UTC'),
+          COALESCE(c.timezone, 'Europe/Athens')
+        )
         AND (TO_TIMESTAMP($3::double precision) AT TIME ZONE 'UTC')
           + INTERVAL '2 hours' <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
         AND NOT EXISTS (
@@ -206,6 +211,11 @@ async function loadOccurrence(pool, occurrenceKey) {
       JOIN patrol_points pp ON pp.id = ps.patrol_point_id
       WHERE ps.id = $2
         AND ps.schedule_type = 'manual'
+        AND is_company_operational_at(
+          s.company_id,
+          ps.scheduled_date + ps.scheduled_time,
+          COALESCE(c.timezone, 'Europe/Athens')
+        )
         AND ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
           <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
         AND NOT EXISTS (
@@ -247,6 +257,11 @@ async function loadOccurrence(pool, occurrenceKey) {
       JOIN sites s ON s.id = rpo.site_id AND s.company_id = rpo.company_id
       JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
       WHERE rpo.id = $2
+        AND is_company_operational_at(
+          rpo.company_id,
+          rpo.scheduled_at,
+          rpd.timezone
+        )
         AND rpo.scheduled_at + INTERVAL '2 hours' <= NOW() AT TIME ZONE rpd.timezone
         AND NOT EXISTS (
           SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
@@ -317,6 +332,11 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
           LEFT JOIN patrol_points pp ON pp.id = pl.point_id
           LEFT JOIN guards g ON g.id = pl.guard_id
           WHERE pl.site_id = $1
+            AND is_company_operational_at(
+              s.company_id,
+              pl.scheduled_at,
+              COALESCE(c.timezone, 'Europe/Athens')
+            )
             AND (pl.patrol_time AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
               BETWEEN $2::date AND $3::date
         ),
@@ -356,6 +376,11 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
             AND ps.interval_hours > 0
             AND slots.scheduled_at >= $2::date::timestamp
             AND slots.scheduled_at < ($3::date + 1)::timestamp
+            AND is_company_operational_at(
+              s.company_id,
+              slots.scheduled_at,
+              COALESCE(c.timezone, 'Europe/Athens')
+            )
             AND slots.scheduled_at + INTERVAL '2 hours'
               <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
             AND NOT EXISTS (
@@ -386,6 +411,11 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
           JOIN patrol_points pp ON pp.id = ps.patrol_point_id
           WHERE ps.site_id = $1
             AND ps.schedule_type = 'manual'
+            AND is_company_operational_at(
+              s.company_id,
+              ps.scheduled_date + ps.scheduled_time,
+              COALESCE(c.timezone, 'Europe/Athens')
+            )
             AND ps.scheduled_date BETWEEN $2::date AND $3::date
             AND ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
               <= NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
@@ -412,6 +442,11 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
           JOIN sites s ON s.id = rpo.site_id AND s.company_id = rpo.company_id
           JOIN patrol_points pp ON pp.id = rpo.patrol_point_id
           WHERE rpo.site_id = $1
+            AND is_company_operational_at(
+              rpo.company_id,
+              rpo.scheduled_at,
+              rpd.timezone
+            )
             AND rpd.local_date BETWEEN $2::date AND $3::date
             AND rpo.scheduled_at + INTERVAL '2 hours' <= NOW() AT TIME ZONE rpd.timezone
             AND NOT EXISTS (

@@ -14,6 +14,7 @@ const MIGRATIONS = [
   "2026-09-24-dashboard-password-reset-sessions.sql",
   "2026-09-25-temporary-preview-rbac.sql",
   "2026-09-26-company-status-lifecycle.sql",
+  "2026-09-27-company-inactive-intervals.sql",
 ];
 
 async function runMigrations(pool) {

@@ -260,12 +260,11 @@ to_char(
       AND c.status IN ('active', 'pilot')
 
     LEFT JOIN LATERAL (
-      SELECT csa.changed_at
-      FROM company_status_audit_events csa
-      WHERE csa.company_id = c.id
-        AND csa.previous_status = 'inactive'
-        AND csa.new_status IN ('active', 'pilot')
-      ORDER BY csa.changed_at DESC
+      SELECT inactive.ended_at AS changed_at
+      FROM company_inactive_intervals inactive
+      WHERE inactive.company_id = c.id
+        AND inactive.ended_at IS NOT NULL
+      ORDER BY inactive.ended_at DESC
       LIMIT 1
     ) resumed ON TRUE
 
@@ -3589,12 +3588,11 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
     FROM sites s
     JOIN companies c ON c.id = s.company_id
     LEFT JOIN LATERAL (
-      SELECT csa.changed_at
-      FROM company_status_audit_events csa
-      WHERE csa.company_id = c.id
-        AND csa.previous_status = 'inactive'
-        AND csa.new_status IN ('active', 'pilot')
-      ORDER BY csa.changed_at DESC
+      SELECT inactive.ended_at AS changed_at
+      FROM company_inactive_intervals inactive
+      WHERE inactive.company_id = c.id
+        AND inactive.ended_at IS NOT NULL
+      ORDER BY inactive.ended_at DESC
       LIMIT 1
     ) resumed ON TRUE
     WHERE s.id = $1
@@ -3798,12 +3796,11 @@ async function detectShiftDelayEvents() {
       ON delay_company.id = delay_site.company_id
       AND delay_company.status IN ('active', 'pilot')
     LEFT JOIN LATERAL (
-      SELECT csa.changed_at
-      FROM company_status_audit_events csa
-      WHERE csa.company_id = delay_company.id
-        AND csa.previous_status = 'inactive'
-        AND csa.new_status IN ('active', 'pilot')
-      ORDER BY csa.changed_at DESC
+      SELECT inactive.ended_at AS changed_at
+      FROM company_inactive_intervals inactive
+      WHERE inactive.company_id = delay_company.id
+        AND inactive.ended_at IS NOT NULL
+      ORDER BY inactive.ended_at DESC
       LIMIT 1
     ) resumed ON TRUE
     WHERE ss.scheduled_start + INTERVAL '15 minutes'
@@ -8360,6 +8357,7 @@ app.use(
     pool,
     hashPassword: bcrypt.hash,
     generateTemporaryPassword,
+    syncScheduledShiftsForSession,
   })
 );
 
@@ -10273,15 +10271,28 @@ app.get(
           $6::timestamp AS scheduled_shift_end
       ),
 
+      latest_reactivation AS (
+        SELECT MAX(ended_at AT TIME ZONE $4::text) AS resumed_at
+        FROM company_inactive_intervals
+        WHERE company_id = $7::int
+          AND ended_at IS NOT NULL
+      ),
+
       operational_window AS (
         SELECT
-          CASE
-            WHEN scheduled_shift_start IS NOT NULL
-              AND scheduled_shift_end IS NOT NULL
-              AND scheduled_shift_end > scheduled_shift_start
-              THEN scheduled_shift_start
-            ELSE (NOW() AT TIME ZONE $4::text)::date::timestamp
-          END AS window_start,
+          GREATEST(
+            CASE
+              WHEN scheduled_shift_start IS NOT NULL
+                AND scheduled_shift_end IS NOT NULL
+                AND scheduled_shift_end > scheduled_shift_start
+                THEN scheduled_shift_start
+              ELSE (NOW() AT TIME ZONE $4::text)::date::timestamp
+            END,
+            COALESCE(
+              (SELECT resumed_at FROM latest_reactivation),
+              '-infinity'::timestamp
+            )
+          ) AS window_start,
           CASE
             WHEN scheduled_shift_start IS NOT NULL
               AND scheduled_shift_end IS NOT NULL
@@ -10334,6 +10345,7 @@ app.get(
           AND ps.interval_hours IS NOT NULL
           AND gs.expected_slot >= (SELECT window_start FROM operational_window)
           AND gs.expected_slot < (SELECT window_end FROM operational_window)
+          AND is_company_operational_at($7::int, gs.expected_slot, $4::text)
       ),
 
       manual_slots AS (
@@ -10359,6 +10371,11 @@ app.get(
             >= (SELECT window_start FROM operational_window)
           AND (ps.scheduled_date::timestamp + ps.scheduled_time)
             < (SELECT window_end FROM operational_window)
+          AND is_company_operational_at(
+            $7::int,
+            ps.scheduled_date::timestamp + ps.scheduled_time,
+            $4::text
+          )
       ),
 
       random_slots AS (
@@ -10380,6 +10397,7 @@ app.get(
           AND rpd.company_id = $7::int
           AND rpo.scheduled_at >= (SELECT window_start FROM operational_window)
           AND rpo.scheduled_at < (SELECT window_end FROM operational_window)
+          AND is_company_operational_at($7::int, rpo.scheduled_at, $4::text)
           AND (NOW() AT TIME ZONE $4::text) >=
             rpo.scheduled_at - INTERVAL '${PATROL_TIMING.revealMinutesBefore} minutes'
       ),
@@ -10531,12 +10549,24 @@ app.get(
     ON pp.id = pl.point_id
   WHERE pl.guard_id = $1
     AND pl.site_id = $2
+    AND is_company_operational_at($5::int, pl.scheduled_at, $6::text)
     AND (
       (
         $3::timestamp IS NOT NULL
         AND $4::timestamp IS NOT NULL
         AND $4::timestamp > $3::timestamp
-        AND pl.scheduled_at >= $3::timestamp
+        AND pl.scheduled_at >= GREATEST(
+          $3::timestamp,
+          COALESCE(
+            (
+              SELECT MAX(ended_at AT TIME ZONE $6::text)
+              FROM company_inactive_intervals
+              WHERE company_id = $5::int
+                AND ended_at IS NOT NULL
+            ),
+            '-infinity'::timestamp
+          )
+        )
         AND pl.scheduled_at < $4::timestamp
       )
       OR
@@ -10557,6 +10587,8 @@ app.get(
     session.site_id,
     session.scheduled_shift_start,
     session.scheduled_shift_end,
+    session.company_id,
+    companyTimezone,
   ]
 );
 
@@ -11051,6 +11083,11 @@ ORDER BY
           AND ps.interval_hours IS NOT NULL
           AND gs.expected_slot >= w.day_start
           AND gs.expected_slot < w.day_end
+          AND is_company_operational_at(
+            c.id,
+            gs.expected_slot,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
       ),
 
       manual_slots AS (
@@ -11077,6 +11114,11 @@ ORDER BY
           AND c.status IN ('active', 'pilot')
           AND ps.active = true
           AND ps.scheduled_date = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+          AND is_company_operational_at(
+            c.id,
+            ps.scheduled_date::timestamp + ps.scheduled_time,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
       ),
 
       random_slots AS (
@@ -11095,6 +11137,7 @@ ORDER BY
         INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
         INNER JOIN companies c ON c.id = rpo.company_id AND c.status IN ('active', 'pilot')
         WHERE rpd.local_date = (NOW() AT TIME ZONE rpd.timezone)::date
+          AND is_company_operational_at(rpo.company_id, rpo.scheduled_at, rpd.timezone)
       ),
 
       patrol_items AS (
@@ -11401,17 +11444,21 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           END AS current_status,
           GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (local_now - scheduled_at)) / 60))::int AS delay_minutes
         FROM occurrence_window
-        WHERE NOT has_scheduled_shift
+        WHERE (
+          NOT has_scheduled_shift
           OR (
             scheduled_at >= scheduled_shift_start
             AND scheduled_at < scheduled_shift_end
           )
+        )
+          AND is_company_operational_at($5::int, scheduled_at, $2::text)
         `,
         [
           patrol.scheduled_at,
           companyTimezone,
           scheduledShiftStart,
           scheduledShiftEnd,
+          companyId,
         ]
       )
       : await pool.query(
@@ -11532,11 +11579,14 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           )
         )::int AS delay_minutes
       FROM occurrence_windows
-      WHERE NOT has_scheduled_shift
+      WHERE (
+        NOT has_scheduled_shift
         OR (
           scheduled_at >= scheduled_shift_start
           AND scheduled_at < scheduled_shift_end
         )
+      )
+        AND is_company_operational_at($6::int, scheduled_at, $2::text)
       ORDER BY
         CASE
           WHEN local_now >= scan_available_from
@@ -11553,6 +11603,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
           siteId,
           scheduledShiftStart,
           scheduledShiftEnd,
+          companyId,
         ]
       );
 
@@ -12567,6 +12618,11 @@ CROSS JOIN LATERAL generate_series(
     AND pp.active = true
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
+    AND is_company_operational_at(
+      c.id,
+      gs.expected_slot,
+      COALESCE(c.timezone, 'Europe/Athens')
+    )
     AND gs.expected_slot >= w.day_start
 AND gs.expected_slot < w.day_end
 ),
@@ -12587,6 +12643,11 @@ AND gs.expected_slot < w.day_end
         INNER JOIN companies c ON c.id = schedule_site.company_id
 
         WHERE ps.schedule_type = 'manual'
+          AND is_company_operational_at(
+            c.id,
+            ps.scheduled_date + ps.scheduled_time,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
   AND ps.active = true
   AND ps.scheduled_date =
       (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
@@ -12604,6 +12665,11 @@ AND gs.expected_slot < w.day_end
         INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
         INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
         WHERE rpd.local_date = (NOW() AT TIME ZONE rpd.timezone)::date
+          AND is_company_operational_at(
+            rpo.company_id,
+            rpo.scheduled_at,
+            rpd.timezone
+          )
           AND NOT EXISTS (
             SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
           )
@@ -13248,6 +13314,11 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
     AND ps.active = true
     AND ps.start_time IS NOT NULL
     AND ps.interval_hours IS NOT NULL
+    AND is_company_operational_at(
+      c.id,
+      gs.expected_slot,
+      COALESCE(c.timezone, 'Europe/Athens')
+    )
 
     AND CASE
       WHEN shift_owner.scheduled_shift_end IS NOT NULL
@@ -13319,6 +13390,11 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
           LIMIT 1
         ) shift_owner ON true
         WHERE ps.schedule_type = 'manual'
+          AND is_company_operational_at(
+            c.id,
+            ps.scheduled_date + ps.scheduled_time,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
           AND CASE
             WHEN shift_owner.scheduled_shift_end IS NOT NULL
               THEN LEAST(
@@ -13390,6 +13466,11 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
             )
           ELSE rpo.scheduled_at + INTERVAL '2 hours'
         END <= (NOW() AT TIME ZONE rpd.timezone)
+          AND is_company_operational_at(
+            rpo.company_id,
+            rpo.scheduled_at,
+            rpd.timezone
+          )
           AND NOT EXISTS (
             SELECT 1 FROM patrol_logs pl WHERE pl.random_occurrence_id = rpo.id
           )
@@ -13950,6 +14031,11 @@ app.get(
 
       let whereClause = `
         WHERE ps.schedule_type = 'manual'
+          AND is_company_operational_at(
+            s.company_id,
+            ps.scheduled_date::timestamp + ps.scheduled_time,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
           AND (
             $1::boolean = true
             OR s.company_id = $2
@@ -14159,7 +14245,14 @@ app.get(
         FROM patrol_logs pl
         INNER JOIN sites s
           ON s.id = pl.site_id
+        INNER JOIN companies c
+          ON c.id = s.company_id
         WHERE pl.patrol_time >= NOW() - INTERVAL '24 hours'
+          AND is_company_operational_at(
+            s.company_id,
+            pl.scheduled_at,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
           AND (
             $1::boolean = true
             OR s.company_id = $2
@@ -14198,6 +14291,9 @@ app.get(
         INNER JOIN sites s
           ON s.id = pl.site_id
 
+        INNER JOIN companies c
+          ON c.id = s.company_id
+
         LEFT JOIN patrol_points pp
           ON pp.id = pl.point_id
           AND pp.site_id = pl.site_id
@@ -14210,6 +14306,11 @@ app.get(
           $1::boolean = true
           OR s.company_id = $2
         )
+          AND is_company_operational_at(
+            s.company_id,
+            pl.scheduled_at,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
 
         ORDER BY pl.patrol_time DESC
         LIMIT 50
@@ -14306,6 +14407,9 @@ app.get(
         INNER JOIN sites s
           ON s.id = pl.site_id
 
+        INNER JOIN companies c
+          ON c.id = s.company_id
+
         LEFT JOIN patrol_points pp
           ON pp.id = pl.point_id
           AND pp.site_id = pl.site_id
@@ -14318,6 +14422,12 @@ app.get(
           $1::boolean = true
           OR s.company_id = $2
         )
+
+          AND is_company_operational_at(
+            s.company_id,
+            pl.scheduled_at,
+            COALESCE(c.timezone, 'Europe/Athens')
+          )
 
           AND ($3::int IS NULL OR pl.site_id = $3::int)
           AND ($4::int IS NULL OR pl.point_id = $4::int)
