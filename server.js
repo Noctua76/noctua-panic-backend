@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 97596)
-Total output lines: 14735
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -3778,7 +3775,7228 @@ function startShiftDelayMonitor() {
       await detectShiftDelayEvents();
       await processPendingShiftDelayEmails();
     } catch (err) {
-      console.error…47596 tokens truncated…active_sessions.scheduled_shift_start
+      console.error("[SHIFT TRANSITION MONITOR ERROR]", err.message);
+
+      if (err.stack) {
+        console.error(err.stack);
+      }
+    }
+  };
+
+  setTimeout(runMonitor, 0);
+  setInterval(runMonitor, 60000);
+}
+
+async function recordGuardPasswordAudit(queryable, {
+  companyId, siteId, guardId, actorUserId = null, eventType, metadata = {},
+}) {
+  await queryable.query(
+    `INSERT INTO guard_password_audit_events (
+       company_id, site_id, guard_id, actor_user_id, event_type, metadata
+     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+    [companyId, siteId, guardId, actorUserId, eventType, JSON.stringify(metadata)]
+  );
+}
+
+async function resolveAssignableDashboardRole(queryable, requestedRole, fallbackCode = "viewer") {
+  const numericRoleId = Number(requestedRole);
+  const result = Number.isInteger(numericRoleId) && numericRoleId > 0
+    ? await queryable.query(`SELECT * FROM dashboard_roles WHERE id = $1 AND is_active = TRUE`, [numericRoleId])
+    : await queryable.query(`SELECT * FROM dashboard_roles WHERE code = $1 AND is_active = TRUE`, [requestedRole || fallbackCode]);
+  return result.rows[0] || null;
+}
+
+async function recordRbacAudit(queryable, event) {
+  await queryable.query(
+    `INSERT INTO dashboard_rbac_audit_events
+       (event_type, actor_user_id, target_user_id, role_id, company_id, before_state, after_state)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)`,
+    [event.type, event.actorUserId || null, event.targetUserId || null, event.roleId || null,
+      event.companyId || null, JSON.stringify(event.before || null), JSON.stringify(event.after || null)]
+  );
+}
+
+app.get("/admin/roles", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.id, r.code, r.name, r.description, r.scope, r.is_system_role,
+              r.is_active, r.authorization_version, COUNT(DISTINCT ur.user_id)::int AS user_count,
+              COALESCE(array_agg(p.code ORDER BY p.code) FILTER (WHERE p.code IS NOT NULL), '{}') AS permissions
+       FROM dashboard_roles r
+       LEFT JOIN user_dashboard_roles ur ON ur.role_id = r.id
+       LEFT JOIN dashboard_role_permissions rp ON rp.role_id = r.id
+       LEFT JOIN dashboard_permissions p ON p.id = rp.permission_id
+       WHERE r.is_active = TRUE OR $1::boolean = TRUE
+       GROUP BY r.id ORDER BY r.is_system_role DESC, r.name ASC`,
+      [req.auth.is_system_owner]
+    );
+    const roles = result.rows.filter((role) => req.auth.is_system_owner || role.code !== "system_owner");
+    return res.json({ status: "ok", roles });
+  } catch (err) {
+    console.error("Fetch dashboard roles error:", err);
+    return res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+app.get("/admin/roles/permissions", requireAuth, async (_req, res) => {
+  const result = await pool.query(`SELECT id, code, name, description, category FROM dashboard_permissions ORDER BY category, code`);
+  return res.json({ status: "ok", permissions: result.rows });
+});
+
+app.post("/admin/roles", requireAuth, dashboardRbac.requireSystemOwner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const name = String(req.body.name || "").trim();
+    if (!name) return res.status(400).json({ status: "error", message: "Role name is required" });
+    const code = dashboardRbac.createCustomRoleCode(name);
+    const permissionCodes = [...new Set(Array.isArray(req.body.permissions) ? req.body.permissions : [])];
+    await client.query("BEGIN");
+    const result = await client.query(
+      `INSERT INTO dashboard_roles(code,name,description,scope,is_system_role)
+       VALUES($1,$2,$3,'company',FALSE) RETURNING *`,
+      [code, name, String(req.body.description || "").trim()]
+    );
+    const role = result.rows[0];
+    if (permissionCodes.length) {
+      await client.query(
+        `INSERT INTO dashboard_role_permissions(role_id, permission_id)
+         SELECT $1, id FROM dashboard_permissions WHERE code = ANY($2::text[])`,
+        [role.id, permissionCodes]
+      );
+    }
+    await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id, roleId: role.id, companyId: req.auth.company_id, after: { ...role, permissions: permissionCodes } });
+    await client.query("COMMIT");
+    dashboardRbac.invalidateAll();
+    return res.status(201).json({ status: "ok", role: { ...role, permissions: permissionCodes, user_count: 0 } });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Create dashboard role error:", err);
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
+});
+
+app.post("/admin/roles/:id/clone", requireAuth, dashboardRbac.requireSystemOwner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const roleId = Number(req.params.id);
+    await client.query("BEGIN");
+    const source = await client.query(
+      `SELECT r.*, COALESCE(array_agg(p.code) FILTER (WHERE p.code IS NOT NULL), '{}') AS permissions
+       FROM dashboard_roles r LEFT JOIN dashboard_role_permissions rp ON rp.role_id=r.id
+       LEFT JOIN dashboard_permissions p ON p.id=rp.permission_id WHERE r.id=$1 GROUP BY r.id`, [roleId]
+    );
+    if (!source.rows.length) { await client.query("ROLLBACK"); return res.status(404).json({ status: "error", message: "Role not found" }); }
+    const original = source.rows[0];
+    const name = String(req.body.name || `${original.name} Copy`).trim();
+    const code = dashboardRbac.createCustomRoleCode(name);
+    const inserted = await client.query(
+      `INSERT INTO dashboard_roles(code,name,description,scope,is_system_role)
+       VALUES($1,$2,$3,'company',FALSE) RETURNING *`, [code, name, original.description]
+    );
+    const role = inserted.rows[0];
+    await client.query(
+      `INSERT INTO dashboard_role_permissions(role_id,permission_id)
+       SELECT $1,permission_id FROM dashboard_role_permissions WHERE role_id=$2`, [role.id, roleId]
+    );
+    await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id,
+      roleId: role.id, companyId: req.auth.company_id, after: { ...role, cloned_from: roleId, permissions: original.permissions } });
+    await client.query("COMMIT");
+    return res.status(201).json({ status: "ok", role: { ...role, permissions: original.permissions, user_count: 0 } });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
+});
+
+app.put("/admin/roles/:id", requireAuth, dashboardRbac.requireSystemOwner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const roleId = Number(req.params.id);
+    if (!Number.isInteger(roleId) || roleId <= 0) return res.status(400).json({ status: "error", message: "Invalid role id" });
+    await client.query("BEGIN");
+    const locked = await client.query(`SELECT * FROM dashboard_roles WHERE id=$1 FOR UPDATE`, [roleId]);
+    const before = locked.rows[0];
+    if (!before) { await client.query("ROLLBACK"); return res.status(404).json({ status: "error", message: "Role not found" }); }
+    if (before.code === "system_owner") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", message: "System Owner is protected" });
+    }
+    const name = String(req.body.name ?? before.name).trim();
+    const description = String(req.body.description ?? before.description).trim();
+    const isActive = before.is_system_role
+      ? true
+      : (typeof req.body.is_active === "boolean" ? req.body.is_active : before.is_active);
+    const permissionCodes = [...new Set(Array.isArray(req.body.permissions) ? req.body.permissions : [])];
+    const updated = await client.query(
+      `UPDATE dashboard_roles SET name=$1, description=$2, is_active=$3,
+         authorization_version=authorization_version+1, updated_at=NOW()
+       WHERE id=$4 RETURNING *`, [name, description, isActive, roleId]
+    );
+    await client.query(`DELETE FROM dashboard_role_permissions WHERE role_id=$1`, [roleId]);
+    if (permissionCodes.length) {
+      await client.query(
+        `INSERT INTO dashboard_role_permissions(role_id, permission_id)
+         SELECT $1,id FROM dashboard_permissions WHERE code=ANY($2::text[])`, [roleId, permissionCodes]
+      );
+    }
+    const affected = await client.query(`SELECT user_id FROM user_dashboard_roles WHERE role_id=$1`, [roleId]);
+    await dashboardRbac.revokeAuthorizationSessions(client, affected.rows.map((row) => row.user_id));
+    await recordRbacAudit(client, { type: isActive ? "ROLE_PERMISSION_CHANGED" : "ROLE_DEACTIVATED", actorUserId: req.auth.user_id, roleId, companyId: req.auth.company_id, before, after: { ...updated.rows[0], permissions: permissionCodes } });
+    await client.query("COMMIT");
+    dashboardRbac.invalidateAll();
+    return res.json({ status: "ok", role: { ...updated.rows[0], permissions: permissionCodes } });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Update dashboard role error:", err);
+    return res.status(500).json({ status: "error", message: err.message });
+  } finally { client.release(); }
+});
+
+async function syncScheduledShiftsForSession(sessionId, queryable = pool) {
+  await queryable.query(
+    `
+    INSERT INTO scheduled_shift_sessions (
+      scheduled_shift_id,
+      guard_session_id,
+      guard_id,
+      overlap_start,
+      overlap_end,
+      coverage_minutes,
+      created_at
+    )
+    SELECT
+      ss.id,
+      gs.id,
+      gs.guard_id,
+      GREATEST(gs.login_time, ss.scheduled_start),
+      CASE
+  WHEN gs.logout_time IS NULL THEN NULL
+  ELSE LEAST(gs.logout_time, ss.scheduled_end)
+END,
+       GREATEST(
+  FLOOR(
+    CASE
+      WHEN gs.logout_time IS NULL THEN 0
+      ELSE
+        EXTRACT(EPOCH FROM (
+          LEAST(gs.logout_time, ss.scheduled_end)
+          - GREATEST(gs.login_time, ss.scheduled_start)
+        )) / 60
+    END
+  ),
+  0
+),
+      (NOW() AT TIME ZONE 'Europe/Athens')
+    FROM guard_sessions gs
+JOIN guards operational_guard
+  ON operational_guard.id = gs.guard_id
+JOIN scheduled_shifts ss
+  ON ss.site_id = gs.site_id
+ AND (
+   (
+     gs.scheduled_shift_start IS NOT NULL
+     AND gs.scheduled_shift_end IS NOT NULL
+     AND ss.scheduled_start = gs.scheduled_shift_start
+     AND ss.scheduled_end = gs.scheduled_shift_end
+   )
+   OR (
+     gs.scheduled_shift_start IS NULL
+     AND gs.login_time >= ss.scheduled_start - INTERVAL '15 minutes'
+     AND gs.login_time < ss.scheduled_end
+   )
+ )
+WHERE gs.id = $1
+  AND operational_guard.access_mode = 'standard'
+    ON CONFLICT (scheduled_shift_id, guard_session_id)
+    DO UPDATE SET
+      overlap_start = EXCLUDED.overlap_start,
+      overlap_end = EXCLUDED.overlap_end,
+      coverage_minutes = EXCLUDED.coverage_minutes
+    `,
+    [sessionId]
+  );
+
+  await queryable.query(
+    `
+    UPDATE scheduled_shifts ss
+    SET
+      guard_id = last_session.guard_id,
+      guard_session_id = last_session.guard_session_id,
+      actual_login_time = first_session.overlap_start,
+      actual_logout_time = CASE
+  WHEN active_sessions.active_count > 0 THEN NULL
+  ELSE last_session.overlap_end
+END,
+
+      coverage_minutes = COALESCE(total_coverage.coverage_minutes, 0),
+
+      uncovered_minutes = GREATEST(
+        FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60)
+        - COALESCE(total_coverage.coverage_minutes, 0),
+        0
+      ),
+
+      coverage_percent = ROUND(
+        (
+          COALESCE(total_coverage.coverage_minutes, 0)
+          /
+          NULLIF(FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60), 0)
+        ) * 100,
+        2
+      ),
+
+      login_delay_minutes = CASE
+        WHEN first_session.overlap_start IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (first_session.overlap_start - ss.scheduled_start)) / 60),
+          0
+        )
+      END,
+
+      logout_delay_minutes = CASE
+        WHEN last_session.overlap_end IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (last_session.overlap_end - ss.scheduled_end)) / 60),
+          0
+        )
+      END,
+
+      early_logout_minutes = CASE
+        WHEN last_session.overlap_end IS NULL THEN NULL
+        ELSE GREATEST(
+          FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - last_session.overlap_end)) / 60),
+          0
+        )
+      END,
+
+      coverage_status = CASE
+        WHEN COALESCE(total_coverage.coverage_minutes, 0) = 0 THEN 'no_login'
+        WHEN active_sessions.active_count > 0 THEN 'active'
+        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '15 minutes'
+AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '15 minutes'
+         AND COALESCE(total_coverage.coverage_minutes, 0) >=
+             FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) - 20
+          THEN 'completed'
+        ELSE 'partial_coverage'
+      END,
+
+      status = CASE
+        WHEN COALESCE(total_coverage.coverage_minutes, 0) = 0 THEN 'no_login'
+        WHEN active_sessions.active_count > 0 THEN 'active'
+        WHEN first_session.overlap_start <= ss.scheduled_start + INTERVAL '15 minutes'
+AND last_session.overlap_end >= ss.scheduled_end - INTERVAL '15 minutes'
+         AND COALESCE(total_coverage.coverage_minutes, 0) >=
+             FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60) - 20
+          THEN 'completed'
+        ELSE 'partial_coverage'
+      END,
+
+      updated_at = (NOW() AT TIME ZONE 'Europe/Athens')
+
+    FROM (
+      SELECT scheduled_shift_id, SUM(coverage_minutes) AS coverage_minutes
+      FROM scheduled_shift_sessions
+      GROUP BY scheduled_shift_id
+    ) total_coverage
+
+    LEFT JOIN LATERAL (
+      SELECT overlap_start
+      FROM scheduled_shift_sessions
+      WHERE scheduled_shift_id = total_coverage.scheduled_shift_id
+      ORDER BY overlap_start ASC
+      LIMIT 1
+    ) first_session ON TRUE
+
+    LEFT JOIN LATERAL (
+  SELECT
+    sss.guard_id,
+    sss.guard_session_id,
+    CASE
+      WHEN gs.logout_time IS NULL THEN NULL
+      ELSE sss.overlap_end
+    END AS overlap_end
+  FROM scheduled_shift_sessions sss
+  JOIN guard_sessions gs
+    ON gs.id = sss.guard_session_id
+  WHERE sss.scheduled_shift_id = total_coverage.scheduled_shift_id
+  ORDER BY sss.overlap_start DESC
+) last_session ON TRUE
+
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) AS active_count
+      FROM scheduled_shift_sessions sss
+      JOIN guard_sessions gs ON gs.id = sss.guard_session_id
+      WHERE sss.scheduled_shift_id = total_coverage.scheduled_shift_id
+        AND gs.logout_time IS NULL
+    ) active_sessions ON TRUE
+
+    WHERE ss.id = total_coverage.scheduled_shift_id
+    `
+  );
+}
+
+async function expireGuardSessionsPastShiftGrace() {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const closedResult = await client.query(`
+      WITH expired_sessions AS (
+        SELECT gs.id
+        FROM guard_sessions gs
+        JOIN guards g
+          ON g.id = gs.guard_id
+        WHERE gs.logout_time IS NULL
+          AND g.access_mode = 'standard'
+          AND gs.scheduled_shift_end IS NOT NULL
+          AND gs.scheduled_shift_end + INTERVAL '15 minutes'
+              <= (NOW() AT TIME ZONE 'Europe/Athens')
+        FOR UPDATE OF gs SKIP LOCKED
+      )
+      UPDATE guard_sessions gs
+      SET
+        logout_time = (NOW() AT TIME ZONE 'Europe/Athens'),
+        last_heartbeat = (NOW() AT TIME ZONE 'Europe/Athens'),
+        status = 'shift_boundary_timeout'
+      FROM expired_sessions expired
+      WHERE gs.id = expired.id
+        AND gs.logout_time IS NULL
+      RETURNING gs.id, gs.guard_id
+    `);
+
+    if (closedResult.rows.length > 0) {
+      const sessionIds = closedResult.rows.map((row) => row.id);
+
+      await client.query(
+        `
+        UPDATE push_subscriptions
+        SET active = FALSE, last_seen = NOW()
+        WHERE session_id = ANY($1::int[])
+          AND active = TRUE
+        `,
+        [sessionIds]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    for (const row of closedResult.rows) {
+      await syncScheduledShiftsForSession(row.id);
+    }
+
+    if (closedResult.rows.length > 0) {
+      console.log(
+        "[SHIFT SESSION EXPIRY] Closed",
+        closedResult.rows.length,
+        "session(s) after the shift handover window"
+      );
+    }
+
+    return closedResult.rows;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ----------------------------------------------------------
+// GUARD LOGIN
+// ----------------------------------------------------------
+app.post("/guard/login", async (req, res) => {
+  try {
+    const { username, password, device_info } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        status: "error",
+        message: "username and password are required"
+      });
+    }
+
+    const existingThrottle = await authProtection.getThrottle(
+      req,
+      "guard",
+      username
+    );
+
+    if (existingThrottle) {
+      return sendAuthenticationThrottle(res, {
+        retryAfterSeconds: existingThrottle.retry_after_seconds,
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM guards
+      WHERE username = $1
+      `,
+      [username]
+    );
+
+    if (result.rows.length === 0) {
+      await bcrypt.compare(password, INVALID_ACCOUNT_PASSWORD_HASH);
+      return rejectInvalidCredentials(
+        req,
+        res,
+        "guard",
+        username,
+        null
+      );
+    }
+
+
+    let guard = result.rows[0];
+    const sessionToken = crypto.randomBytes(32).toString("hex");
+
+    let validPassword = false;
+
+    if (guard.password_hash && guard.password_hash.startsWith("$2")) {
+      validPassword = await bcrypt.compare(password, guard.password_hash);
+    } else {
+      validPassword = password === guard.password_hash;
+    }
+
+    if (!validPassword) {
+      return rejectInvalidCredentials(
+        req,
+        res,
+        "guard",
+        username,
+        guard.id
+      );
+    }
+
+    await authProtection.recordSuccess(
+      req,
+      "guard",
+      username,
+      guard.id
+    );
+
+    if (guard.active !== true) {
+      return res.status(403).json({
+        status: "error",
+        message: "Guard account is inactive",
+      });
+    }
+
+    if (guard.access_mode === "standard" && guard.must_change_password === true) {
+      const temporaryPasswordExpired = guard.temporary_password_expires_at &&
+        new Date(guard.temporary_password_expires_at).getTime() <= Date.now();
+
+      if (temporaryPasswordExpired) {
+        return res.status(403).json({
+          status: "error",
+          code: "TEMP_PASSWORD_EXPIRED",
+          message: "The temporary password has expired. Ask an administrator to reset it.",
+        });
+      }
+
+      const setup = createPasswordSetupToken(guard.id);
+      const setupResult = await pool.query(
+        `UPDATE guards g
+         SET password_setup_token_hash = $1,
+             password_setup_token_expires_at = NOW() + ($2 * INTERVAL '1 minute')
+         FROM sites s
+         WHERE g.id = $3 AND s.id = g.site_id
+           AND g.active = TRUE AND g.must_change_password = TRUE
+         RETURNING s.company_id, g.site_id`,
+        [setup.hash, PASSWORD_SETUP_TOKEN_TTL_MINUTES, guard.id]
+      );
+
+      if (setupResult.rows.length === 0) {
+        return res.status(403).json({ status: "error", message: "Password setup is unavailable." });
+      }
+
+      return res.json({
+        status: "password_change_required",
+        code: "GUARD_PASSWORD_CHANGE_REQUIRED",
+        message: "Create a permanent password before signing in.",
+        password_setup_token: setup.token,
+        password_setup_token_expires_in_minutes: PASSWORD_SETUP_TOKEN_TTL_MINUTES,
+        guard: { id: guard.id, username: guard.username, full_name: guard.full_name },
+      });
+    }
+
+    guard = await activateTemporaryGuardAccess(guard);
+
+if (
+  guard.temporary_access_expiry_reason ||
+  isTemporaryAccessExpired(guard.access_expires_at)
+) {
+  await pool.query(
+    `
+    UPDATE guard_sessions
+    SET
+      logout_time = NOW(),
+      status = 'temporary_access_expired',
+      last_heartbeat = NOW()
+    WHERE guard_id = $1
+      AND logout_time IS NULL
+    `,
+    [guard.id]
+  );
+
+  return res.status(403).json({
+    status: "error",
+    code: "TEMPORARY_ACCESS_EXPIRED",
+    expiry_reason:
+      guard.temporary_access_expiry_reason ||
+      "access_period_completed",
+    message: getTemporaryExpiryMessage(
+      guard.temporary_access_expiry_reason
+    ),
+  });
+}
+
+const closedSessions = await pool.query(
+  `
+  UPDATE guard_sessions
+  SET
+    logout_time = NOW(),
+    status = 'auto_closed',
+    last_heartbeat = NOW()
+  WHERE guard_id = $1
+    AND logout_time IS NULL
+  RETURNING id
+  `,
+  [guard.id]
+);
+
+await pool.query(
+  `
+  UPDATE push_subscriptions
+  SET active = FALSE, last_seen = NOW()
+  WHERE guard_id = $1 AND active = TRUE
+  `,
+  [guard.id]
+);
+
+for (const row of closedSessions.rows) {
+  await syncScheduledShiftsForSession(row.id);
+}
+
+    const siteResult = await pool.query(
+  `
+  SELECT shift_rules
+  FROM sites
+  WHERE id = $1
+  `,
+  [guard.site_id]
+);
+
+const scheduledShift =
+  siteResult.rows.length > 0
+    ? getScheduledShiftFromRules(siteResult.rows[0].shift_rules)
+    : null;
+
+    console.log("SCHEDULED SHIFT:", scheduledShift);
+
+    const sessionResult = await pool.query(
+      `
+      INSERT INTO guard_sessions (
+    guard_id,
+    site_id,
+    login_time,
+    last_heartbeat,
+    status,
+    session_token,
+    device_info,
+    ip_address,
+    created_at,
+    scheduled_shift_start,
+    scheduled_shift_end,
+    scheduled_shift_label
+  )
+  VALUES (
+  $1,
+  $2,
+  (NOW() AT TIME ZONE 'Europe/Athens'),
+  (NOW() AT TIME ZONE 'Europe/Athens'),
+  'online',
+  $3,
+  $4,
+  $5,
+  (NOW() AT TIME ZONE 'Europe/Athens'),
+  $6::timestamp,
+  $7::timestamp,
+  $8
+)
+  RETURNING *
+  `,
+  [
+  guard.id,
+  guard.site_id,
+  sessionToken,
+  device_info || null,
+  req.ip || null,
+  scheduledShift?.start || null,
+  scheduledShift?.end || null,
+  scheduledShift?.label || null
+]
+);
+
+console.log("NEW SESSION:", sessionResult.rows[0]);
+
+if (
+  guard.access_mode !== ACCESS_MODE_READ_ONLY
+) {
+  const scheduledShiftDate =
+    scheduledShift?.start?.slice(0, 10) ||
+    (() => {
+      const athensToday = getAthensDateParts(new Date());
+      return `${athensToday.year}-${pad2(athensToday.month)}-${pad2(athensToday.day)}`;
+    })();
+
+  await generateScheduledShiftsForSite(
+    guard.site_id,
+    scheduledShiftDate
+  );
+
+  await syncScheduledShiftsForSession(
+    sessionResult.rows[0].id
+  );
+}
+
+    res.json({
+      status: "ok",
+      message: "Guard login successful",
+      guard_session_token: sessionToken,
+      guard: {
+        id: guard.id,
+        full_name: guard.full_name,
+        username: guard.username,
+        phone: guard.phone,
+        role: guard.role,
+site_id: guard.site_id,
+access_mode: guard.access_mode,
+temporary_access_started_at:
+  guard.temporary_access_started_at,
+access_expires_at: guard.access_expires_at
+,
+temporary_access_activation_deadline:
+  guard.temporary_access_activation_deadline,
+temporary_access_expiry_reason:
+  guard.temporary_access_expiry_reason
+      },
+      session: sessionResult.rows[0]
+    });
+
+  } catch (err) {
+    console.error("Guard login error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+app.post("/guard/change-password", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { password_setup_token, new_password, confirm_password } = req.body || {};
+    const parsedToken = parsePasswordSetupToken(password_setup_token);
+
+    if (!parsedToken) {
+      return res.status(400).json({ status: "error", code: "INVALID_PASSWORD_SETUP_TOKEN", message: "Invalid password setup token." });
+    }
+    if (new_password !== confirm_password) {
+      return res.status(400).json({ status: "error", code: "PASSWORD_CONFIRMATION_MISMATCH", message: "Passwords do not match." });
+    }
+    const policy = validateGuardPassword(new_password);
+    if (!policy.valid) {
+      return res.status(400).json({ status: "error", code: "PASSWORD_POLICY_FAILED", message: policy.message, requirements: policy.errors });
+    }
+
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT g.*, s.company_id
+       FROM guards g
+       INNER JOIN sites s ON s.id = g.site_id
+       WHERE g.id = $1
+       FOR UPDATE OF g`,
+      [parsedToken.guardId]
+    );
+    const guard = result.rows[0];
+    const credentialState = evaluatePasswordChangeCredential(
+      guard,
+      parsedToken.secret
+    );
+
+    if (credentialState.code === "TEMP_PASSWORD_EXPIRED") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        status: "error",
+        code: "TEMP_PASSWORD_EXPIRED",
+        message: "The temporary password has expired. Ask an administrator to reset it.",
+      });
+    }
+
+    if (!credentialState.valid) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", code: "PASSWORD_SETUP_TOKEN_EXPIRED", message: "This password setup link is invalid or expired. Sign in again or contact an administrator." });
+    }
+    if (await bcrypt.compare(new_password, guard.password_hash)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ status: "error", code: "PASSWORD_REUSE_NOT_ALLOWED", message: "The permanent password must differ from the temporary password." });
+    }
+
+    const passwordHash = await bcrypt.hash(new_password, 10);
+    const updated = await client.query(
+      `UPDATE guards
+       SET password_hash = $1, must_change_password = FALSE,
+           password_changed_at = NOW(), temporary_password_created_at = NULL,
+           temporary_password_expires_at = NULL, password_setup_token_hash = NULL,
+           password_setup_token_expires_at = NULL
+       WHERE id = $2 AND must_change_password = TRUE
+         AND password_setup_token_hash = $3
+         AND temporary_password_expires_at > NOW()
+         AND password_setup_token_expires_at > NOW()
+       RETURNING id`,
+      [passwordHash, guard.id, guard.password_setup_token_hash]
+    );
+    if (updated.rows.length === 0) throw new Error("Password setup token was already used.");
+
+    await recordGuardPasswordAudit(client, {
+      companyId: guard.company_id, siteId: guard.site_id, guardId: guard.id,
+      eventType: "GUARD_PASSWORD_CHANGED", metadata: { source_ip: req.ip || null },
+    });
+    await client.query("COMMIT");
+    return res.json({ status: "ok", message: "Password created. Sign in with your new password." });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Guard change password error:", err);
+    return res.status(500).json({ status: "error", message: "Unable to change password." });
+  } finally {
+    client.release();
+  }
+});
+
+app.post(
+  "/admin/scheduled-shifts/generate",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { site_id, date } = req.body;
+
+      const parsedSiteId = Number(site_id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
+
+      if (
+        !Number.isInteger(parsedSiteId) ||
+        parsedSiteId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site_id",
+        });
+      }
+
+      if (
+        typeof date !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid date format",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          parsedSiteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const created =
+        await generateScheduledShiftsForSite(
+          parsedSiteId,
+          date
+        );
+
+      return res.json({
+        status: "ok",
+        created_count: created.length,
+        scheduled_shifts: created,
+      });
+    } catch (err) {
+      console.error(
+        "Generate scheduled shifts error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+// ----------------------------------------------------------
+// GUARD LOGOUT
+// ----------------------------------------------------------
+app.post("/guard/logout", requireGuardAuth, async (req, res) => {
+  try {
+    const { guard_id, session_id } = req.guard;
+
+    const logoutResult = await pool.query(
+  `
+  UPDATE guard_sessions
+  SET
+    logout_time = (NOW() AT TIME ZONE 'Europe/Athens'),
+    status = 'logged_out',
+    last_heartbeat = (NOW() AT TIME ZONE 'Europe/Athens')
+  WHERE id = $1
+    AND guard_id = $2
+    AND logout_time IS NULL
+  RETURNING id
+  `,
+  [session_id, guard_id]
+);
+
+for (const row of logoutResult.rows) {
+  await pool.query(
+    `
+    UPDATE push_subscriptions
+    SET active = FALSE, last_seen = NOW()
+    WHERE guard_id = $1
+      AND session_id = $2
+      AND active = TRUE
+    `,
+    [guard_id, row.id]
+  );
+
+  await syncScheduledShiftsForSession(row.id);
+}
+
+    res.json({ status: "ok" });
+
+  } catch (err) {
+    console.error("Guard logout error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// GUARD SESSION HEARTBEAT
+// ----------------------------------------------------------
+app.post("/guard/heartbeat", requireGuardAuth, async (req, res) => {
+  try {
+    const { guard_id, session_id } = req.guard;
+
+    const result = await pool.query(
+      `
+      UPDATE guard_sessions
+      SET
+        last_heartbeat = NOW(),
+        status = 'online'
+      WHERE id = $1
+        AND guard_id = $2
+        AND logout_time IS NULL
+      RETURNING *
+      `,
+      [session_id, guard_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Active session not found"
+      });
+    }
+
+    res.json({
+      status: "ok",
+      session: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error("Guard heartbeat error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// ACTIVE GUARDS
+// ----------------------------------------------------------
+app.get(
+  "/guards/active",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
+        SELECT
+          s.id AS site_id,
+          s.name AS site_name,
+          s.location AS site_location,
+
+          g.id AS guard_id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.mobile_phone,
+
+          to_char(
+  gs.login_time,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS login_time,
+
+to_char(
+  gs.login_time,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS check_in_time,
+
+to_char(
+  gs.last_heartbeat,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS last_heartbeat,
+
+to_char(
+  gs.last_heartbeat,
+  'YYYY-MM-DD"T"HH24:MI:SS.MS'
+) AS last_seen,
+          gs.status,
+
+          (
+            gs.id IS NOT NULL
+            AND gs.logout_time IS NULL
+          ) AS is_currently_online,
+
+          (
+            gs.id IS NOT NULL
+            AND gs.logout_time IS NULL
+            AND gs.last_heartbeat > NOW() - INTERVAL '90 seconds'
+          ) AS has_recent_heartbeat
+
+        FROM sites s
+
+LEFT JOIN guard_sessions gs
+  ON gs.site_id = s.id
+  AND gs.logout_time IS NULL
+  AND (
+    gs.scheduled_shift_end IS NULL
+    OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+       > (NOW() AT TIME ZONE 'Europe/Athens')
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM guards operational_guard
+    WHERE operational_guard.id = gs.guard_id
+      AND operational_guard.access_mode = 'standard'
+  )
+
+LEFT JOIN guards g
+  ON g.id = gs.guard_id
+
+        WHERE
+          $1::boolean = true
+          OR s.company_id = $2
+
+        ORDER BY s.id ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        guards: result.rows,
+      });
+    } catch (err) {
+      console.error("Active guards error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.get("/dashboard/metrics", requireAuth, async (req, res) => {
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+
+    const guardsResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+FROM guard_sessions gs
+INNER JOIN guards g ON g.id = gs.guard_id
+INNER JOIN sites s ON s.id = gs.site_id
+WHERE gs.logout_time IS NULL
+  AND g.access_mode = 'standard'
+  AND (
+    gs.scheduled_shift_end IS NULL
+    OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+       > (NOW() AT TIME ZONE 'Europe/Athens')
+  )
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    );
+
+    const incidentsResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM incidents i
+      INNER JOIN sites s
+        ON s.id = i.site_id
+      WHERE i.status IN ('active', 'in_progress')
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    ).catch(() => ({
+      rows: [{ count: 0 }],
+    }));
+
+    const alertsTodayResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM incidents i
+      INNER JOIN sites s
+        ON s.id = i.site_id
+      WHERE DATE(i.created_at) = CURRENT_DATE
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    ).catch(() => ({
+      rows: [{ count: 0 }],
+    }));
+
+    const responseTimeResult = await pool.query(
+      `
+      SELECT
+        i.trigger_time,
+        i.resolved_time,
+        EXTRACT(
+          EPOCH FROM (
+            i.resolved_time - i.trigger_time
+          )
+        )::int AS duration_seconds
+      FROM incidents i
+      INNER JOIN sites s
+        ON s.id = i.site_id
+      WHERE i.status = 'resolved'
+        AND i.trigger_time IS NOT NULL
+        AND i.resolved_time IS NOT NULL
+        AND (
+          $1::boolean = true
+          OR s.company_id = $2
+        )
+      ORDER BY i.resolved_time DESC
+      LIMIT 1
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    ).catch(() => ({
+      rows: [{ duration_seconds: null }],
+    }));
+
+    let responseTime = "0s";
+
+    const durationSeconds =
+      responseTimeResult.rows[0]?.duration_seconds;
+
+    if (
+      durationSeconds !== null &&
+      durationSeconds !== undefined
+    ) {
+      const hours = Math.floor(durationSeconds / 3600);
+      const minutes = Math.floor(
+        (durationSeconds % 3600) / 60
+      );
+      const seconds = durationSeconds % 60;
+
+      responseTime =
+        hours > 0
+          ? `${hours}h ${minutes}m ${seconds}s`
+          : minutes > 0
+          ? `${minutes}m ${seconds}s`
+          : `${seconds}s`;
+    }
+
+    return res.json({
+      activeIncidents:
+        incidentsResult.rows[0]?.count || 0,
+
+      alertsToday:
+        alertsTodayResult.rows[0]?.count || 0,
+
+      responseTime,
+
+      guardsOnDuty:
+        guardsResult.rows[0]?.count || 0,
+    });
+  } catch (err) {
+    console.error(
+      "Dashboard metrics error:",
+      err
+    );
+
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load metrics",
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// DASHBOARD INCIDENT TIMELINE
+// Uses real alert_events for the latest active / recent incident
+// ----------------------------------------------------------
+app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+    await ensureAlertEventsTable();
+
+    const incidentResult = await pool.query(
+  `
+  SELECT
+    i.id,
+    i.incident_ref,
+    i.status,
+    i.priority,
+    i.trigger_time,
+    i.resolved_time,
+    s.name AS site_name,
+    s.location AS site_location,
+    COALESCE(
+      g.full_name,
+      g.username,
+      'Unknown guard'
+    ) AS guard_name
+  FROM incidents i
+  INNER JOIN sites s
+    ON s.id = i.site_id
+  LEFT JOIN guards g
+    ON g.id = i.guard_ref
+  WHERE (
+      i.status IN ('active', 'in_progress')
+      OR (
+        i.status = 'resolved'
+        AND i.resolved_time > NOW() - INTERVAL '1 hour'
+      )
+    )
+    AND (
+      $1::boolean = true
+      OR s.company_id = $2
+    )
+  ORDER BY
+    CASE
+      WHEN i.status IN ('active', 'in_progress') THEN 1
+      WHEN i.status = 'resolved' THEN 2
+      ELSE 3
+    END,
+    i.trigger_time DESC
+  LIMIT 1
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
+
+    if (incidentResult.rows.length === 0) {
+      return res.json({
+        status: "normal",
+        incidentRef: null,
+        location: "Normal",
+        alertTime: null,
+        guardName: null,
+        alertStatus: "normal",
+        callStatus: "normal",
+        smsStatus: "normal",
+        incidentStatus: "normal",
+        resolvedTime: null,
+        duration: null,
+        events: []
+      });
+    }
+
+    const incident = incidentResult.rows[0];
+
+    const eventsResult = await pool.query(
+      `
+      SELECT
+        id,
+        event_type,
+        source,
+        status,
+        sms_sent,
+        sms_failed,
+        voice_attempted,
+        voice_status,
+        recipient_phone,
+        provider,
+        provider_message_id,
+        provider_call_uuid,
+        event_payload,
+        created_at
+      FROM alert_events
+      WHERE incident_id = $1
+      ORDER BY created_at ASC, id ASC
+      `,
+      [incident.id]
+    );
+
+    const rawEvents = eventsResult.rows;
+
+    const events = [];
+
+rawEvents.forEach((event) => {
+  if (event.event_type === "WEBAPP_ALERT") {
+    events.push({
+      id: `${event.id}-alert`,
+      type: "alert",
+      label: "Alert Triggered",
+      detail: "Panic alert received from web app",
+      eventType: event.event_type,
+      status: event.status,
+      time: event.created_at,
+      provider: event.provider,
+      recipientPhone: event.recipient_phone,
+      providerCallUuid: event.provider_call_uuid
+    });
+
+    if (Number(event.sms_sent) > 0) {
+      events.push({
+        id: `${event.id}-sms-sent`,
+        type: "sms",
+        label: "SMS Sent",
+        detail: `${event.sms_sent} SMS notification(s) sent`,
+        eventType: "SMS_SENT",
+        status: "completed",
+        time: event.created_at,
+        provider: event.provider,
+        recipientPhone: event.recipient_phone,
+        providerCallUuid: event.provider_call_uuid
+      });
+    }
+
+    if (Number(event.sms_failed) > 0) {
+      events.push({
+        id: `${event.id}-sms-failed`,
+        type: "sms",
+        label: "SMS Failed",
+        detail: `${event.sms_failed} SMS notification(s) failed`,
+        eventType: "SMS_FAILED",
+        status: "failed",
+        time: event.created_at,
+        provider: event.provider,
+        recipientPhone: event.recipient_phone,
+        providerCallUuid: event.provider_call_uuid
+      });
+    }
+
+    return;
+  }
+
+  if (event.event_type === "VOICE_CALL_SUBMITTED") {
+    events.push({
+      id: event.id,
+      type: "call",
+      label: "Call Submitted",
+      detail: event.recipient_phone
+        ? `Call submitted to ${event.recipient_phone}`
+        : "Voice call submitted to Vonage",
+      eventType: event.event_type,
+      status: event.status,
+      time: event.created_at,
+      provider: event.provider,
+      recipientPhone: event.recipient_phone,
+      providerCallUuid: event.provider_call_uuid
+    });
+
+    return;
+  }
+
+  if (event.event_type === "VOICE_WEBHOOK") {
+    let label = `Call ${event.status || "Event"}`;
+    let detail = event.voice_status || event.status || "Voice webhook received";
+
+    if (event.status === "ringing") {
+      label = "Call Ringing";
+      detail = "Phone is ringing";
+    } else if (event.status === "started") {
+      label = "Call Started";
+      detail = "Voice call started";
+    } else if (event.status === "answered") {
+      label = "Call Answered";
+      detail = "Voice call answered";
+    } else if (event.status === "completed") {
+      label = "Call Completed";
+
+      const duration =
+        event.event_payload?.duration ||
+        event.event_payload?.duration_ms ||
+        null;
+
+      detail = duration
+        ? `Voice call completed · Duration: ${duration} sec`
+        : "Voice call completed";
+    }
+
+    events.push({
+      id: event.id,
+      type: "call",
+      label,
+      detail,
+      eventType: event.event_type,
+      status: event.status,
+      time: event.created_at,
+      provider: event.provider,
+      recipientPhone: event.recipient_phone,
+      providerCallUuid: event.provider_call_uuid
+    });
+  }
+});
+
+events.sort((a, b) => {
+  const order = {
+    "Alert Triggered": 1,
+    "SMS Sent": 2,
+    "SMS Failed": 3,
+    "Call Submitted": 4,
+    "Call Started": 5,
+    "Call Ringing": 6,
+    "Call Answered": 7,
+    "Call Completed": 8
+  };
+
+  return (
+    (order[a.label] || 99) - (order[b.label] || 99) ||
+    new Date(a.time) - new Date(b.time)
+  );
+});
+
+    const hasCallCompleted = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "completed"
+    );
+
+    const hasCallAnswered = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "answered"
+    );
+
+    const hasCallStarted = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "started"
+    );
+
+    const hasCallRinging = rawEvents.some(
+      (event) =>
+        event.event_type === "VOICE_WEBHOOK" &&
+        event.status === "ringing"
+    );
+
+    const hasCallSubmitted = rawEvents.some(
+      (event) => event.event_type === "VOICE_CALL_SUBMITTED"
+    );
+
+    const webAlertEvent = rawEvents.find(
+      (event) => event.event_type === "WEBAPP_ALERT"
+    );
+
+    const smsSent =
+      webAlertEvent && Number(webAlertEvent.sms_sent) > 0;
+
+    let callStatus = "normal";
+
+    if (hasCallCompleted) {
+      callStatus = "completed";
+    } else if (hasCallAnswered) {
+      callStatus = "answered";
+    } else if (hasCallStarted) {
+      callStatus = "started";
+    } else if (hasCallRinging) {
+      callStatus = "ringing";
+    } else if (hasCallSubmitted) {
+      callStatus = "submitted";
+    }
+
+    let duration = null;
+
+    if (incident.trigger_time && incident.resolved_time) {
+      const start = new Date(incident.trigger_time);
+      const end = new Date(incident.resolved_time);
+      const seconds = Math.floor((end - start) / 1000);
+      const minutes = Math.floor(seconds / 60);
+      const remainingSeconds = seconds % 60;
+
+      duration = `${minutes}m ${remainingSeconds}s`;
+    }
+
+    const isResolved = incident.status === "resolved";
+
+    return res.json({
+      status: isResolved ? "resolved_recent" : "active",
+
+      incidentId: incident.id,
+      incidentRef: incident.incident_ref,
+      location: incident.site_name || incident.site_location || "Unknown site",
+      alertTime: incident.trigger_time,
+      guardName: incident.guard_name || "Unknown guard",
+
+      alertStatus: webAlertEvent ? "triggered" : "normal",
+      callStatus,
+      smsStatus: smsSent ? "completed" : "normal",
+      incidentStatus: isResolved ? "resolved" : incident.status,
+
+      resolvedTime: incident.resolved_time,
+      duration,
+
+      events
+    });
+  } catch (err) {
+    console.error("Dashboard incident timeline error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// GUARD SHIFT HISTORY
+// Event Logs source of truth: scheduled_shifts
+// ----------------------------------------------------------
+app.get(
+  "/guards/shifts/history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
+      SELECT
+        ss.id,
+        s.company_id,
+
+        ss.guard_id,
+        COALESCE(g.full_name, g.username, 'No Login') AS full_name,
+
+        ss.site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+
+        to_char(ss.scheduled_start, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_start,
+to_char(ss.scheduled_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS shift_end,
+
+FLOOR(
+  EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60
+)::int AS shift_minutes,
+
+        ss.shift_label AS shift_label,
+
+        ss.actual_login_time AS check_in_time,
+        ss.actual_logout_time AS check_out_time,
+        ss.updated_at AS last_seen,
+
+        ss.coverage_minutes,
+        ss.uncovered_minutes,
+        ss.coverage_percent,
+        COALESCE(
+  (
+    SELECT SUM(
+      CASE
+        WHEN gs.logout_time IS NULL THEN
+          GREATEST(
+            FLOOR(
+              EXTRACT(EPOCH FROM (
+                LEAST((NOW() AT TIME ZONE 'Europe/Athens'), ss.scheduled_end)
+                - sss.overlap_start
+              )) / 60
+            ),
+            0
+          )
+        ELSE COALESCE(sss.coverage_minutes, 0)
+      END
+    )
+    FROM scheduled_shift_sessions sss
+    JOIN guard_sessions gs
+      ON gs.id = sss.guard_session_id
+    WHERE sss.scheduled_shift_id = ss.id
+  ),
+  0
+)::int AS live_coverage_minutes,
+
+ROUND(
+  (
+    COALESCE(
+      (
+        SELECT SUM(
+          CASE
+            WHEN gs.logout_time IS NULL THEN
+              GREATEST(
+                FLOOR(
+                  EXTRACT(EPOCH FROM (
+                    LEAST((NOW() AT TIME ZONE 'Europe/Athens'), ss.scheduled_end)
+                    - sss.overlap_start
+                  )) / 60
+                ),
+                0
+              )
+            ELSE COALESCE(sss.coverage_minutes, 0)
+          END
+        )
+        FROM scheduled_shift_sessions sss
+        JOIN guard_sessions gs
+          ON gs.id = sss.guard_session_id
+        WHERE sss.scheduled_shift_id = ss.id
+      ),
+      0
+    )
+    /
+    NULLIF(
+      FLOOR(EXTRACT(EPOCH FROM (ss.scheduled_end - ss.scheduled_start)) / 60),
+      0
+    )
+  ) * 100,
+  2
+) AS live_coverage_percent,
+        ss.login_delay_minutes,
+        ss.logout_delay_minutes,
+        ss.early_logout_minutes,
+        ss.guard_session_id,
+        ss.created_at,
+
+        EXISTS (
+          SELECT 1
+          FROM scheduled_shift_sessions sss
+          JOIN guard_sessions gs
+            ON gs.id = sss.guard_session_id
+          WHERE sss.scheduled_shift_id = ss.id
+            AND gs.logout_time IS NULL
+        ) AS online,
+
+        EXISTS (
+          SELECT 1
+          FROM scheduled_shift_sessions sss
+          JOIN guard_sessions gs
+            ON gs.id = sss.guard_session_id
+          WHERE sss.scheduled_shift_id = ss.id
+            AND gs.logout_time IS NULL
+            AND gs.last_heartbeat > (NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '90 seconds'
+        ) AS is_currently_online,
+
+        CASE
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_start
+            THEN 'scheduled'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= ss.scheduled_start
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND EXISTS (
+              SELECT 1
+              FROM scheduled_shift_sessions sss
+              JOIN guard_sessions gs
+                ON gs.id = sss.guard_session_id
+              WHERE sss.scheduled_shift_id = ss.id
+                AND gs.logout_time IS NULL
+            )
+            THEN 'on_duty'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= ss.scheduled_start
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND COALESCE(ss.coverage_minutes, 0) > 0
+            THEN 'in_progress'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') >= ss.scheduled_start
+            AND (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            THEN 'no_guard'
+
+          ELSE 'finished'
+        END AS operational_status,
+
+        CASE
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            THEN 'pending'
+
+          WHEN COALESCE(ss.coverage_minutes, 0) = 0
+            THEN 'missed'
+
+          WHEN ss.coverage_status = 'completed'
+            THEN 'completed'
+
+          ELSE 'partial_coverage'
+        END AS evaluation_status,
+
+        CASE
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_start
+            THEN 'scheduled'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND EXISTS (
+              SELECT 1
+              FROM scheduled_shift_sessions sss
+              JOIN guard_sessions gs
+                ON gs.id = sss.guard_session_id
+              WHERE sss.scheduled_shift_id = ss.id
+                AND gs.logout_time IS NULL
+            )
+            THEN 'on_duty'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            AND COALESCE(ss.coverage_minutes, 0) > 0
+            THEN 'in_progress'
+
+          WHEN (NOW() AT TIME ZONE 'Europe/Athens') < ss.scheduled_end
+            THEN 'no_guard'
+
+          WHEN COALESCE(ss.coverage_minutes, 0) = 0
+            THEN 'missed'
+
+          WHEN ss.coverage_status = 'completed'
+            THEN 'completed'
+
+          ELSE 'partial_coverage'
+        END AS display_status,
+
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'guard_session_id', sss.guard_session_id,
+                'guard_id', sss.guard_id,
+                'guard_name', COALESCE(sg.full_name, sg.username, 'Unknown Guard'),
+                'login_time', to_char(gs.login_time, 'YYYY-MM-DD"T"HH24:MI:SS.MS'),
+'logout_time', CASE
+  WHEN gs.logout_time IS NULL THEN NULL
+  ELSE to_char(gs.logout_time, 'YYYY-MM-DD"T"HH24:MI:SS.MS')
+END,
+'overlap_start', to_char(sss.overlap_start, 'YYYY-MM-DD"T"HH24:MI:SS.MS'),
+'overlap_end', CASE
+  WHEN sss.overlap_end IS NULL THEN NULL
+  ELSE to_char(sss.overlap_end, 'YYYY-MM-DD"T"HH24:MI:SS.MS')
+END,
+                'coverage_minutes',
+CASE
+  WHEN gs.logout_time IS NULL THEN
+    GREATEST(
+      FLOOR(
+        EXTRACT(EPOCH FROM (
+          LEAST((NOW() AT TIME ZONE 'Europe/Athens'), ss.scheduled_end)
+          - sss.overlap_start
+        )) / 60
+      ),
+      0
+    )
+  ELSE sss.coverage_minutes
+END
+              )
+              ORDER BY sss.overlap_start ASC
+            )
+            FROM scheduled_shift_sessions sss
+            JOIN guard_sessions gs
+              ON gs.id = sss.guard_session_id
+            LEFT JOIN guards sg
+              ON sg.id = sss.guard_id
+            WHERE sss.scheduled_shift_id = ss.id
+          ),
+          '[]'::json
+        ) AS sessions
+
+      FROM scheduled_shifts ss
+
+      LEFT JOIN guards g
+        ON g.id = ss.guard_id
+
+      LEFT JOIN sites s
+        ON s.id = ss.site_id
+
+        WHERE
+  (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+  AND ss.scheduled_end > to_char((NOW() AT TIME ZONE 'Europe/Athens')::date, 'YYYY-MM-DD')::timestamp
+  AND ss.scheduled_start < (
+    to_char((NOW() AT TIME ZONE 'Europe/Athens')::date + INTERVAL '1 day', 'YYYY-MM-DD')::timestamp
+    + INTERVAL '7 hours'
+  )
+
+ORDER BY ss.scheduled_start ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+    res.json({
+      status: "ok",
+      shifts: result.rows
+    });
+
+  } catch (err) {
+    console.error("Guard shift history error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// ALL GUARDS
+// ----------------------------------------------------------
+app.get(
+  "/guards",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
+        SELECT
+          g.id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.mobile_phone,
+          g.landline_phone,
+          g.tax_id,
+          g.home_address,
+          g.education_level,
+          g.foreign_languages,
+          g.security_experience_range,
+          g.guard_notes,
+          g.assignment_status,
+          g.employment_status,
+          g.role,
+          g.site_id,
+          g.active,
+          s.name AS site_name,
+          s.location AS site_location
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE
+  g.access_mode = 'standard'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+        ORDER BY g.full_name ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        guards: result.rows,
+      });
+    } catch (err) {
+      console.error("All guards error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+// ----------------------------------------------------------
+// UPDATE GUARD PROFILE
+// ----------------------------------------------------------
+app.put(
+  "/guards/:id/profile",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const { id } = req.params;
+
+      const {
+        full_name,
+        username,
+        mobile_phone,
+        landline_phone,
+        tax_id,
+        home_address,
+        education_level,
+        foreign_languages,
+        security_experience_range,
+        guard_notes,
+        site_id,
+        assignment_status,
+      } = req.body;
+
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      await client.query("BEGIN");
+
+      const guardResult = await client.query(
+        `
+        SELECT
+          g.id,
+          g.site_id
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE g.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        FOR UPDATE
+        `,
+        [
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (guardResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      if (site_id !== undefined && site_id !== null) {
+        const siteResult = await client.query(
+          `
+          SELECT id
+          FROM sites
+          WHERE id = $1
+            AND (
+              $2::boolean = true
+              OR company_id = $3
+            )
+          `,
+          [
+            site_id,
+            isSystemOwner,
+            req.auth.company_id,
+          ]
+        );
+
+        if (siteResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            status: "error",
+            message: "Site not found",
+          });
+        }
+      }
+
+      const result = await client.query(
+        `
+        UPDATE guards
+        SET
+          full_name = $1,
+          username = $2,
+          mobile_phone = $3,
+          landline_phone = $4,
+          tax_id = $5,
+          home_address = $6,
+          education_level = $7,
+          foreign_languages = $8,
+          security_experience_range = $9,
+          guard_notes = $10,
+          site_id = $11,
+          assignment_status = $12
+        WHERE id = $13
+        RETURNING *
+        `,
+        [
+          full_name,
+          username,
+          mobile_phone,
+          landline_phone,
+          tax_id,
+          home_address,
+          education_level,
+          foreign_languages,
+          security_experience_range,
+          guard_notes,
+          site_id,
+          assignment_status,
+          id,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      console.error("Guard profile update error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// ----------------------------------------------------------
+// ALL SITES
+// ----------------------------------------------------------
+app.get("/sites", requireAuth, async (req, res) => {
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+
+const result = await pool.query(
+  `
+  SELECT
+    s.id,
+    s.company_id,
+    s.name,
+    s.location,
+    s.status,
+    s.created_at,
+    s.site_phone,
+s.full_address,
+s.coverage_type,
+
+    CASE
+      WHEN s.status <> 'active' THEN 'Guarding suspended'
+      ELSE COALESCE(active_guard.full_name, 'No active guard')
+    END AS active_guard,
+
+    (
+      SELECT COUNT(*)
+      FROM guards g2
+      WHERE g2.site_id = s.id
+        AND g2.active = true
+        AND g2.access_mode = 'standard'
+    )::int AS guards_assigned,
+
+    CASE
+      WHEN s.status <> 'active' THEN 0
+      ELSE (
+        SELECT COUNT(*)
+        FROM guard_sessions gs3
+        WHERE gs3.site_id = s.id
+          AND gs3.logout_time IS NULL
+          AND (
+            gs3.scheduled_shift_end IS NULL
+            OR gs3.scheduled_shift_end + INTERVAL '15 minutes'
+               > (NOW() AT TIME ZONE 'Europe/Athens')
+          )
+          AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs3.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
+      )::int
+    END AS on_duty,
+
+    CASE
+      WHEN s.status <> 'active' THEN 'Suspended'
+      ELSE 'Active'
+    END AS coverage_status
+
+    ,
+CASE
+  WHEN s.status <> 'active' THEN 'Inactive'
+  WHEN (
+    SELECT COUNT(*)
+    FROM guard_sessions gs3
+    WHERE gs3.site_id = s.id
+      AND gs3.logout_time IS NULL
+      AND (
+        gs3.scheduled_shift_end IS NULL
+        OR gs3.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
+      AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs3.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
+  ) > 0 THEN 'Covered'
+  ELSE 'No Guard'
+END AS status_label,
+
+CASE
+  WHEN s.status <> 'active' THEN 'inactive'
+  WHEN (
+    SELECT COUNT(*)
+    FROM guard_sessions gs3
+    WHERE gs3.site_id = s.id
+      AND gs3.logout_time IS NULL
+      AND (
+        gs3.scheduled_shift_end IS NULL
+        OR gs3.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
+      AND EXISTS (
+  SELECT 1
+  FROM guards operational_guard
+  WHERE operational_guard.id = gs3.guard_id
+    AND operational_guard.access_mode = 'standard'
+)
+  ) > 0 THEN 'normal'
+  ELSE 'no-guard'
+END AS status_class
+
+  FROM sites s
+  
+  LEFT JOIN LATERAL (
+    SELECT
+      g.full_name
+    FROM guard_sessions gs
+    LEFT JOIN guards g
+      ON g.id = gs.guard_id
+    WHERE gs.site_id = s.id
+      AND gs.logout_time IS NULL
+      AND (
+        gs.scheduled_shift_end IS NULL
+        OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
+      AND g.access_mode = 'standard'
+    ORDER BY gs.login_time DESC
+    LIMIT 1
+  ) active_guard ON true
+
+  WHERE s.status <> 'archived'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+
+ORDER BY s.id ASC
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
+
+    res.json({
+      status: "ok",
+      sites: result.rows
+    });
+
+  } catch (err) {
+    console.error("Sites error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// ALERT RECIPIENTS TABLE
+// ----------------------------------------------------------
+
+async function ensureAlertRecipientsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_recipients (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER,
+      full_name VARCHAR(255),
+      phone VARCHAR(50) NOT NULL,
+      sms_enabled BOOLEAN DEFAULT true,
+      voice_enabled BOOLEAN DEFAULT true,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
+// ----------------------------------------------------------
+// ALERT HELPERS
+// ----------------------------------------------------------
+
+async function getEffectiveAlertRecipients(companyId) {
+  const resolution = await alertDispatcher.getAlertRecipientsForCompany(companyId);
+  return resolution.recipients;
+}
+
+async function ensureAlertEventsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_events (
+      id SERIAL PRIMARY KEY,
+      event_type VARCHAR(50) NOT NULL,
+      mode VARCHAR(30),
+      source VARCHAR(100),
+      status VARCHAR(50),
+      company_id INTEGER,
+      recipients_count INTEGER DEFAULT 0,
+      sms_sent INTEGER DEFAULT 0,
+      sms_failed INTEGER DEFAULT 0,
+      voice_attempted INTEGER DEFAULT 0,
+      voice_status VARCHAR(50),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
+async function ensureIncidentGuardResponsesTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS incident_guard_responses (
+      id SERIAL PRIMARY KEY,
+      incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
+      guard_id INTEGER,
+      site_id INTEGER,
+      session_id INTEGER,
+      question_key VARCHAR(100),
+      question_text TEXT,
+      answer TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
+// ----------------------------------------------------------
+// ALERT RECIPIENTS API
+// ----------------------------------------------------------
+
+app.get("/settings/alert-recipients", requireAuth, async (req, res) => {
+  try {
+    const recipients = await getEffectiveAlertRecipients(
+      req.auth.company_id
+    );
+
+    return res.json({
+      status: "ok",
+      recipients,
+    });
+  } catch (err) {
+    console.error("Alert recipients GET error:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: err.message || String(err),
+    });
+  }
+});
+
+
+app.post("/settings/alert-recipients", requireAuth, async (req, res) => {
+  try {
+    await ensureAlertRecipientsTable();
+
+    const {
+      full_name,
+      phone,
+      sms_enabled = true,
+      voice_enabled = true,
+    } = req.body;
+
+    const result = await pool.query(
+      `
+      INSERT INTO alert_recipients (
+        company_id,
+        full_name,
+        phone,
+        sms_enabled,
+        voice_enabled
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+      `,
+      [
+        req.auth.company_id,
+        full_name,
+        phone,
+        sms_enabled,
+        voice_enabled,
+      ]
+    );
+
+    return res.json({
+      status: "ok",
+      recipient: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Alert recipient POST error:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+app.put(
+  "/settings/alert-recipients/:id/toggle",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const result = await pool.query(
+        `
+        UPDATE alert_recipients
+        SET active = NOT active
+        WHERE id = $1
+          AND company_id = $2
+        RETURNING *
+        `,
+        [
+          id,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Alert recipient not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        recipient: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Alert recipient toggle error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.delete(
+  "/settings/alert-recipients/:id",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const result = await pool.query(
+        `
+        DELETE FROM alert_recipients
+        WHERE id = $1
+          AND company_id = $2
+        RETURNING id
+        `,
+        [
+          id,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Alert recipient not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+      });
+    } catch (err) {
+      console.error("Alert recipient DELETE error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+// ----------------------------------------------------------
+// SETTINGS - SITES MANAGEMENT
+// ----------------------------------------------------------
+
+app.get("/settings/sites", requireAuth, async (req, res) => {
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+
+    const result = await pool.query(
+      `
+      SELECT
+  sites.id,
+  sites.company_id,
+  sites.name,
+  sites.location,
+  sites.status,
+  to_char(
+  sites.active_changed_at,
+  'YYYY-MM-DD HH24:MI:SS'
+) AS active_changed_at,
+  sites.active_changed_by,
+  u.full_name AS active_changed_by_name,
+  u.role AS active_changed_by_role,
+  sites.required_shifts,
+  sites.full_address,
+  sites.coverage_type,
+  sites.shift_rules,
+  sites.site_phone,
+  sites.shift_schedule,
+  sites.residence_contact_name,
+  sites.residence_contact_phone,
+  sites.supervisor_contact_name,
+  sites.supervisor_contact_phone,
+  sites.operational_notes,
+  sites.sop_text,
+  sites.sop_file_url,
+  sites.sop_title,
+  sites.sop_version,
+  sites.sop_updated_at,
+  sites.general_notes,
+  sites.access_instructions,
+  sites.patrol_instructions,
+  sites.emergency_instructions,
+  sites.special_warnings,
+  sites.created_at
+      FROM sites
+      LEFT JOIN users u
+      ON u.id = sites.active_changed_by
+      WHERE (
+  $1::boolean = true
+  OR sites.company_id = $2
+)
+      ORDER BY id ASC
+      `,
+      [
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    );
+
+    return res.json({
+      status: "ok",
+      sites: result.rows,
+    });
+  } catch (err) {
+    console.error("Settings sites GET error:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+app.post("/settings/sites", requireAuth, async (req, res) => {
+  try {
+    const {
+      name,
+      location,
+      required_shifts = 1,
+    } = req.body;
+
+    const siteName =
+      typeof name === "string" ? name.trim() : "";
+
+    const siteLocation =
+      typeof location === "string" ? location.trim() : "";
+
+    const requiredShifts = Number(required_shifts);
+
+    if (!siteName) {
+      return res.status(400).json({
+        status: "error",
+        message: "Site name is required",
+      });
+    }
+
+    if (
+      !Number.isInteger(requiredShifts) ||
+      requiredShifts <= 0
+    ) {
+      return res.status(400).json({
+        status: "error",
+        message: "required_shifts must be a positive integer",
+      });
+    }
+
+    const targetCompanyId = Number(req.auth.company_id);
+
+    if (
+      !Number.isInteger(targetCompanyId) ||
+      targetCompanyId <= 0
+    ) {
+      return res.status(403).json({
+        status: "error",
+        message: "Authenticated user is not assigned to a company",
+      });
+    }
+
+    const companyResult = await pool.query(
+      `
+      SELECT id
+      FROM companies
+      WHERE id = $1
+      `,
+      [targetCompanyId]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Company not found",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO sites (
+        company_id,
+        name,
+        location,
+        status,
+        required_shifts,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      RETURNING *
+      `,
+      [
+        targetCompanyId,
+        siteName,
+        siteLocation,
+        "active",
+        requiredShifts,
+      ]
+    );
+
+    return res.json({
+      status: "ok",
+      site: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Settings site POST error:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+app.put("/settings/sites/:id", requireAuth, async (req, res) => {
+  try {
+    const siteId = Number(req.params.id);
+
+    const {
+      name,
+      location,
+      required_shifts,
+      status,
+      full_address,
+      site_phone,
+      shift_schedule,
+      residence_contact_name,
+      residence_contact_phone,
+      supervisor_contact_name,
+      supervisor_contact_phone,
+      operational_notes,
+      sop_text,
+      sop_file_url,
+      sop_title,
+      sop_version,
+      coverage_type,
+      shift_rules,
+      general_notes,
+      access_instructions,
+      patrol_instructions,
+      emergency_instructions,
+      special_warnings,
+    } = req.body;
+
+    if (!Number.isInteger(siteId) || siteId <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid site id",
+      });
+    }
+
+    const isSystemOwner = req.auth.role === "system_owner";
+
+    const result = await pool.query(
+      `
+      UPDATE sites
+      SET
+        name = COALESCE($1, name),
+        location = COALESCE($2, location),
+        required_shifts = COALESCE($3, required_shifts),
+        status = COALESCE($4, status),
+        full_address = COALESCE($5, full_address),
+        site_phone = COALESCE($6, site_phone),
+        shift_schedule = COALESCE($7, shift_schedule),
+        residence_contact_name = COALESCE($8, residence_contact_name),
+        residence_contact_phone = COALESCE($9, residence_contact_phone),
+        supervisor_contact_name = COALESCE($10, supervisor_contact_name),
+        supervisor_contact_phone = COALESCE($11, supervisor_contact_phone),
+        operational_notes = COALESCE($12, operational_notes),
+        sop_text = COALESCE($13, sop_text),
+        sop_file_url = COALESCE($14, sop_file_url),
+        sop_title = COALESCE($15, sop_title),
+        sop_version = COALESCE($16, sop_version),
+        sop_updated_at = CASE
+          WHEN $13 IS NOT NULL
+            OR $14 IS NOT NULL
+            OR $15 IS NOT NULL
+            OR $16 IS NOT NULL
+          THEN NOW()
+          ELSE sop_updated_at
+        END,
+        coverage_type = COALESCE($17, coverage_type),
+        shift_rules = COALESCE($18, shift_rules),
+        general_notes = COALESCE($19, general_notes),
+        access_instructions = COALESCE($20, access_instructions),
+        patrol_instructions = COALESCE($21, patrol_instructions),
+        emergency_instructions = COALESCE($22, emergency_instructions),
+        special_warnings = COALESCE($23, special_warnings)
+      WHERE id = $24
+        AND (
+          $25::boolean = true
+          OR company_id = $26
+        )
+      RETURNING *
+      `,
+      [
+        name || null,
+        location || null,
+        required_shifts || null,
+        status || null,
+        full_address || null,
+        site_phone || null,
+        shift_schedule || null,
+        residence_contact_name || null,
+        residence_contact_phone || null,
+        supervisor_contact_name || null,
+        supervisor_contact_phone || null,
+        operational_notes || null,
+        sop_text || null,
+        sop_file_url || null,
+        sop_title || null,
+        sop_version || null,
+        coverage_type || null,
+        shift_rules || null,
+        general_notes || null,
+        access_instructions || null,
+        patrol_instructions || null,
+        emergency_instructions || null,
+        special_warnings || null,
+        siteId,
+        isSystemOwner,
+        req.auth.company_id,
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Site not found",
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      site: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Settings site PUT error:", err);
+
+    return res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+app.post(
+  "/settings/sites/:id/sop/upload",
+  requireAuth,
+  upload.single("sop_file"),
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT
+          id,
+          company_id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          status: "error",
+          message: "No SOP file uploaded",
+        });
+      }
+
+      if (req.file.mimetype !== "application/pdf") {
+        return res.status(400).json({
+          status: "error",
+          message: "Only PDF files are allowed",
+        });
+      }
+
+      const bucket =
+        process.env.SUPABASE_SOP_BUCKET || "aegis-sop-files";
+
+      const safeOriginalName = req.file.originalname
+        .replace(/\s+/g, "-")
+        .replace(/[^a-zA-Z0-9._-]/g, "");
+
+      const filePath =
+        `companies/company-${siteResult.rows[0].company_id}/` +
+        `sites/site-${siteId}/` +
+        `sop-${Date.now()}-${safeOriginalName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(bucket)
+        .upload(filePath, req.file.buffer, {
+          contentType: "application/pdf",
+          upsert: true,
+        });
+
+      if (uploadError) {
+        console.error(
+          "Supabase SOP upload error:",
+          uploadError
+        );
+
+        return res.status(500).json({
+          status: "error",
+          message: "Failed to upload SOP file",
+        });
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from(bucket)
+        .getPublicUrl(filePath);
+
+      const publicUrl = publicUrlData.publicUrl;
+
+      const result = await pool.query(
+        `
+        UPDATE sites
+        SET
+          sop_file_url = $1,
+          sop_updated_at = NOW()
+        WHERE id = $2
+          AND (
+            $3::boolean = true
+            OR company_id = $4
+          )
+        RETURNING *
+        `,
+        [
+          publicUrl,
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        message: "SOP file uploaded",
+        site: result.rows[0],
+        sop_file_url: publicUrl,
+      });
+    } catch (err) {
+      console.error("SOP upload endpoint error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "SOP upload failed",
+      });
+    }
+  }
+);
+
+app.post(
+  "/settings/sites/:id/documents/:slot/upload",
+  requireAuth,
+  upload.single("site_document"),
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const slot = Number(req.params.slot);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
+
+      if (![1, 2].includes(slot)) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid document slot",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT
+          id,
+          company_id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          status: "error",
+          message: "No document file uploaded",
+        });
+      }
+
+      if (req.file.mimetype !== "application/pdf") {
+        return res.status(400).json({
+          status: "error",
+          message: "Only PDF files are allowed",
+        });
+      }
+
+      const bucket =
+        process.env.SUPABASE_SOP_BUCKET || "aegis-sop-files";
+
+      const fileName =
+        `companies/company-${siteResult.rows[0].company_id}/` +
+        `sites/site-${siteId}/documents/` +
+        `document-${slot}-${Date.now()}.pdf`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(bucket)
+        .upload(fileName, req.file.buffer, {
+          contentType: "application/pdf",
+          upsert: true,
+        });
+
+      if (uploadError) {
+        console.error(
+          "Supabase site document upload error:",
+          uploadError
+        );
+
+        return res.status(500).json({
+          status: "error",
+          message: "Failed to upload site document",
+        });
+      }
+
+      const { data } = supabase.storage
+        .from(bucket)
+        .getPublicUrl(fileName);
+
+      const columnName = `document_${slot}_url`;
+
+      const updateResult = await pool.query(
+        `
+        UPDATE sites
+        SET ${columnName} = $1
+        WHERE id = $2
+          AND (
+            $3::boolean = true
+            OR company_id = $4
+          )
+        RETURNING id
+        `,
+        [
+          data.publicUrl,
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (updateResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        slot,
+        document_url: data.publicUrl,
+      });
+    } catch (err) {
+      console.error("Site document upload error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Site document upload failed",
+      });
+    }
+  }
+);
+
+app.put(
+  "/settings/sites/:id/toggle-active",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE sites
+SET
+  status =
+    CASE
+      WHEN status = 'active' THEN 'inactive'
+      ELSE 'active'
+    END,
+  active_changed_at = NOW(),
+  active_changed_by = $4
+WHERE id = $1
+  AND (
+    $2::boolean = true
+    OR company_id = $3
+  )
+RETURNING *
+        `,
+        [
+  siteId,
+  isSystemOwner,
+  req.auth.company_id,
+  req.auth.user_id,
+]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        site: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Site toggle error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.put(
+  "/settings/sites/:id/archive",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site id",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE sites
+        SET status = 'archived'
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        RETURNING *
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        site: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Settings site archive error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+// ----------------------------------------------------------
+// SETTINGS - GUARDS MANAGEMENT
+// ----------------------------------------------------------
+
+app.get(
+  "/settings/guards",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
+        SELECT
+          g.id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.role,
+          g.site_id,
+          g.active,
+          g.created_at,
+          g.mobile_phone,
+          g.landline_phone,
+          g.tax_id,
+          g.home_address,
+          g.education_level,
+          g.foreign_languages,
+          g.security_experience_range,
+          g.guard_notes,
+          g.assignment_status,
+          g.employment_status,
+          g.must_change_password,
+          g.temporary_password_expires_at,
+          g.password_changed_at,
+          CASE
+            WHEN g.must_change_password = FALSE THEN 'active'
+            WHEN g.temporary_password_expires_at <= NOW() THEN 'temporary_expired'
+            ELSE 'temporary_pending'
+          END AS password_status,
+          s.name AS site_name
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE
+  g.access_mode = 'standard'
+  AND (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+        ORDER BY g.id ASC
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        guards: result.rows,
+      });
+    } catch (err) {
+      console.error("Settings guards GET error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.post(
+  "/settings/guards",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const {
+        full_name,
+        username,
+        phone,
+        password,
+        role = "guard",
+        site_id,
+      } = req.body;
+
+      if (!full_name || !username || !password || !site_id) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "full_name, username, password and site_id are required",
+        });
+      }
+
+      const passwordPolicy = validateGuardPassword(password);
+      if (!passwordPolicy.valid) {
+        return res.status(400).json({
+          status: "error",
+          code: "PASSWORD_POLICY_FAILED",
+          message: passwordPolicy.message,
+          requirements: passwordPolicy.errors,
+        });
+      }
+
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      await client.query("BEGIN");
+
+      const siteResult = await client.query(
+        `
+        SELECT id, company_id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          site_id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10);
+
+      const temporaryPasswordTtlHours = getTempPasswordTtlHours();
+      const result = await client.query(
+        `
+        INSERT INTO guards (
+          full_name,
+          username,
+          phone,
+          role,
+          site_id,
+          active,
+          password_hash,
+          must_change_password,
+          temporary_password_created_at,
+          temporary_password_expires_at,
+          password_changed_at,
+          created_at
+        )
+        VALUES ($1,$2,$3,$4,$5,true,$6,true,NOW(),NOW() + ($7 * INTERVAL '1 hour'),NULL,NOW())
+        RETURNING
+          id,
+          full_name,
+          username,
+          phone,
+          role,
+          site_id,
+          active,
+          must_change_password,
+          temporary_password_expires_at,
+          password_changed_at,
+          created_at
+        `,
+        [
+          full_name,
+          username,
+          phone || "",
+          role,
+          site_id,
+          passwordHash,
+          temporaryPasswordTtlHours,
+        ]
+      );
+
+      await recordGuardPasswordAudit(client, {
+        companyId: siteResult.rows[0].company_id,
+        siteId: Number(site_id),
+        guardId: result.rows[0].id,
+        actorUserId: req.auth.user_id,
+        eventType: "GUARD_TEMP_PASSWORD_ISSUED",
+        metadata: { reason: "guard_created", expires_at: result.rows[0].temporary_password_expires_at },
+      });
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        status: "ok",
+        temporary_password: password,
+        temporary_password_expires_at: result.rows[0].temporary_password_expires_at,
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("Settings guard POST error:", err);
+
+      if (err.code === "23505") {
+        return res.status(409).json({ status: "error", message: "Username already exists" });
+      }
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.put(
+  "/settings/guards/:id",
+  requireAuth,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const { id } = req.params;
+      const {
+        full_name,
+        username,
+        phone,
+        role,
+        site_id,
+        active,
+      } = req.body;
+
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      await client.query("BEGIN");
+
+      const guardResult = await client.query(
+        `
+        SELECT
+          g.id,
+          g.site_id
+        FROM guards g
+        INNER JOIN sites s
+          ON s.id = g.site_id
+        WHERE g.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        FOR UPDATE
+        `,
+        [
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (guardResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      if (site_id !== undefined && site_id !== null) {
+        const siteResult = await client.query(
+          `
+          SELECT id
+          FROM sites
+          WHERE id = $1
+            AND (
+              $2::boolean = true
+              OR company_id = $3
+            )
+          `,
+          [
+            site_id,
+            isSystemOwner,
+            req.auth.company_id,
+          ]
+        );
+
+        if (siteResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            status: "error",
+            message: "Site not found",
+          });
+        }
+      }
+
+      const result = await client.query(
+        `
+        UPDATE guards
+        SET
+          full_name = COALESCE($1, full_name),
+          username = COALESCE($2, username),
+          phone = COALESCE($3, phone),
+          role = COALESCE($4, role),
+          site_id = COALESCE($5, site_id),
+          active = COALESCE($6, active)
+        WHERE id = $7
+        RETURNING
+          id,
+          full_name,
+          username,
+          phone,
+          role,
+          site_id,
+          active,
+          created_at
+        `,
+        [
+          full_name || null,
+          username || null,
+          phone || null,
+          role || null,
+          site_id ?? null,
+          typeof active === "boolean" ? active : null,
+          id,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+
+      console.error("Settings guard PUT error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.put(
+  "/settings/guards/:id/toggle-active",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
+        UPDATE guards g
+        SET active = NOT g.active
+        FROM sites s
+        WHERE g.id = $1
+          AND s.id = g.site_id
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        RETURNING
+          g.id,
+          g.full_name,
+          g.username,
+          g.phone,
+          g.role,
+          g.site_id,
+          g.active,
+          g.created_at
+        `,
+        [
+          id,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Guard not found",
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        guard: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Settings guard toggle error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+async function resetGuardPassword(req, res) {
+  const client = await pool.connect();
+  const closedSessionIds = [];
+  try {
+    const guardId = Number(req.params.id);
+    if (!Number.isInteger(guardId) || guardId <= 0) {
+      return res.status(400).json({ status: "error", message: "Invalid guard id" });
+    }
+
+    const isSystemOwner = req.auth.role === "system_owner";
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    const temporaryPasswordTtlHours = getTempPasswordTtlHours();
+
+    await client.query("BEGIN");
+    const result = await client.query(
+      `UPDATE guards g
+       SET password_hash = $1, must_change_password = TRUE,
+           temporary_password_created_at = NOW(),
+           temporary_password_expires_at = NOW() + ($2 * INTERVAL '1 hour'),
+           password_changed_at = NULL, password_setup_token_hash = NULL,
+           password_setup_token_expires_at = NULL
+       FROM sites s
+       WHERE g.id = $3 AND s.id = g.site_id
+         AND g.access_mode = 'standard'
+         AND ($4::boolean = TRUE OR s.company_id = $5)
+       RETURNING g.id, g.full_name, g.username, g.site_id,
+                 g.temporary_password_expires_at, s.company_id`,
+      [passwordHash, temporaryPasswordTtlHours, guardId, isSystemOwner, req.auth.company_id]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ status: "error", message: "Guard not found" });
+    }
+
+    const closed = await client.query(
+      `UPDATE guard_sessions
+       SET logout_time = (NOW() AT TIME ZONE 'Europe/Athens'),
+           status = 'password_reset',
+           last_heartbeat = (NOW() AT TIME ZONE 'Europe/Athens')
+       WHERE guard_id = $1 AND logout_time IS NULL
+       RETURNING id`,
+      [guardId]
+    );
+    closedSessionIds.push(...closed.rows.map((row) => row.id));
+
+    await client.query(
+      `UPDATE push_subscriptions
+       SET active = FALSE, last_seen = NOW()
+       WHERE guard_id = $1 AND active = TRUE`,
+      [guardId]
+    );
+
+    const guard = result.rows[0];
+    await recordGuardPasswordAudit(client, {
+      companyId: guard.company_id, siteId: guard.site_id, guardId,
+      actorUserId: req.auth.user_id, eventType: "GUARD_PASSWORD_RESET",
+      metadata: { revoked_session_count: closedSessionIds.length, expires_at: guard.temporary_password_expires_at },
+    });
+
+    await commitGuardPasswordReset({
+      client,
+      closedSessionIds,
+      syncScheduledShiftsForSession,
+    });
+
+    return res.json({
+      status: "ok",
+      message: "Temporary guard password issued. Active sessions were revoked.",
+      temporary_password: temporaryPassword,
+      temporary_password_expires_at: guard.temporary_password_expires_at,
+      guard: {
+        id: guard.id, full_name: guard.full_name, username: guard.username,
+        site_id: guard.site_id,
+        password_status: "temporary_pending",
+        must_change_password: true,
+        temporary_password_expires_at: guard.temporary_password_expires_at,
+        password_changed_at: null,
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Settings guard reset password error:", err);
+    return res.status(500).json({ status: "error", message: "Unable to reset guard password." });
+  } finally {
+    client.release();
+  }
+}
+
+app.post("/settings/guards/:id/reset-password", requireAuth, resetGuardPassword);
+app.put("/settings/guards/:id/reset-password", requireAuth, resetGuardPassword);
+
+// ----------------------------------------------------------
+// ALERT CONFIGURATION STATUS
+// ----------------------------------------------------------
+app.post(
+  "/admin/scheduled-shifts/generate",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { site_id, date } = req.body;
+
+      const parsedSiteId = Number(site_id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
+
+      if (
+        !Number.isInteger(parsedSiteId) ||
+        parsedSiteId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site_id",
+        });
+      }
+
+      if (
+        typeof date !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(date)
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid date format",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          parsedSiteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const created =
+        await generateScheduledShiftsForSite(
+          parsedSiteId,
+          date
+        );
+
+      return res.json({
+        status: "ok",
+        created_count: created.length,
+        scheduled_shifts: created,
+      });
+    } catch (err) {
+      console.error(
+        "Generate scheduled shifts error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.get(
+  "/event-logs",
+  requireAuth,
+  async (req, res) => {
+    try {
+      await ensureAlertEventsTable();
+
+      const isSystemOwner =
+        req.auth.role === "system_owner";
+
+      const result = await pool.query(
+        `
+        SELECT ae.*
+        FROM alert_events ae
+        LEFT JOIN sites s ON s.id = ae.site_id
+        WHERE
+          $1::boolean = true
+          OR COALESCE(ae.company_id, s.company_id) = $2
+        ORDER BY ae.created_at DESC
+        LIMIT 50
+        `,
+        [
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      return res.json({
+        status: "ok",
+        logs: result.rows,
+      });
+    } catch (err) {
+      console.error("Event logs error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+// ----------------------------------------------------------
+// ANALYTICS SUMMARY
+// ----------------------------------------------------------
+app.get(
+  "/analytics/summary",
+  requireAuth,
+  async (req, res) => {
+  try {
+    const companyId = req.auth.company_id;
+const isSystemOwner =
+  req.auth.role === "system_owner";
+
+    const siteResult = await pool.query(
+      `
+      SELECT
+  COUNT(*)::int AS total_sites,
+  COALESCE(SUM(required_shifts), 0)::int AS required_shifts
+FROM sites
+WHERE
+  ($1::boolean = true OR company_id = $2)
+      `,
+      [
+    isSystemOwner,
+    companyId,
+  ]
+    );
+
+    
+    const companySummary = siteResult.rows[0];
+
+    const alertsResult = await pool.query(
+  `
+  SELECT COUNT(*)::int AS alerts_count
+  FROM alert_events ae
+  INNER JOIN sites s
+    ON s.id = ae.site_id
+  WHERE
+    ($1::boolean = true OR s.company_id = $2)
+  `,
+  [
+    isSystemOwner,
+    companyId,
+  ]
+);
+
+    const guardsResult = await pool.query(
+  `
+  SELECT COUNT(*)::int AS assigned_guards
+  FROM guards g
+  INNER JOIN sites s
+    ON s.id = g.site_id
+  WHERE
+  g.active = true
+  AND g.access_mode = 'standard'
+  AND ($1::boolean = true OR s.company_id = $2)
+  `,
+  [
+    isSystemOwner,
+    companyId,
+  ]
+);
+
+    const alertsCount = alertsResult.rows[0].alerts_count;
+    const assignedGuards = guardsResult.rows[0].assigned_guards;
+    const requiredShifts =
+  companySummary.required_shifts;
+
+    let riskLevel = "No Data";
+
+    if (alertsCount > 0 && alertsCount <= 5) {
+      riskLevel = "Normal";
+    } else if (alertsCount >= 6 && alertsCount <= 10) {
+      riskLevel = "Medium";
+    } else if (alertsCount >= 11) {
+      riskLevel = "High";
+    }
+
+    let readinessRatio = null;
+    let readinessLevel = "No Data";
+
+    if (assignedGuards > 0 && requiredShifts > 0) {
+      readinessRatio = Number(
+        (assignedGuards / requiredShifts).toFixed(2)
+      );
+
+      if (readinessRatio >= 1.3) {
+        readinessLevel = "High";
+      } else if (readinessRatio >= 1) {
+        readinessLevel = "Medium";
+      } else {
+        readinessLevel = "Low";
+      }
+    }
+
+    res.json({
+      status: "ok",
+      updated_at: new Date().toISOString(),
+
+      company: {
+  total_sites:
+    companySummary.total_sites,
+},
+
+      alerts: {
+        count: alertsCount,
+        risk_level: riskLevel
+      },
+
+      readiness: {
+        assigned_guards: assignedGuards,
+        required_shifts: requiredShifts,
+        ratio: readinessRatio,
+        level: readinessLevel
+      },
+
+      fatigue: {
+        level: "No Data",
+        reason: "Guard shift history is not connected yet"
+      },
+
+      stability: {
+        score: "No Data",
+        reason: "Stability requires fatigue data"
+      }
+    });
+
+  } catch (err) {
+    console.error("Analytics summary error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// DASHBOARD TEST ALERT
+// ----------------------------------------------------------
+const ALERT_SUCCESS_STATUSES = new Set(["delivered", "completed"]);
+const ALERT_FAILURE_STATUSES = new Set([
+  "failed", "rejected", "busy", "unanswered", "cancelled",
+  "timeout", "expired", "undeliverable",
+]);
+
+function summarizeFinalNotifications(notifications = []) {
+  const attempted = notifications.length;
+  const successful = notifications.filter((item) =>
+    ALERT_SUCCESS_STATUSES.has(String(item.status || "").toLowerCase())
+  ).length;
+  const failed = notifications.filter((item) =>
+    ALERT_FAILURE_STATUSES.has(String(item.status || "").toLowerCase())
+  ).length;
+  const pending = Math.max(0, attempted - successful - failed);
+
+  let status = "not_attempted";
+  if (attempted > 0 && pending > 0) status = failed > 0 ? "partial_failure" : "pending";
+  else if (attempted > 0 && failed === attempted) status = "failed";
+  else if (failed > 0) status = "partial_failure";
+  else if (attempted > 0) status = "completed";
+
+  return { attempted, successful, pending, failed, status };
+}
+
+async function hydrateTestAlertRows(rows = []) {
+  const prepared = rows
+    .map((row) => ({
+      row,
+      result: row?.event_payload?.result
+        ? JSON.parse(JSON.stringify(row.event_payload.result))
+        : null,
+    }))
+    .filter((item) => item.result);
+
+  const messageIds = [...new Set(prepared.flatMap(({ result }) =>
+    (result.notifications?.sms || [])
+      .map((item) => item.provider_message_id)
+      .filter(Boolean)
+  ))];
+  const callUuids = [...new Set(prepared.flatMap(({ result }) =>
+    (result.notifications?.voice || [])
+      .map((item) => item.provider_call_uuid)
+      .filter(Boolean)
+  ))];
+
+  const [smsReceipts, voiceReceipts] = await Promise.all([
+    messageIds.length
+      ? pool.query(
+          `
+          SELECT DISTINCT ON (provider_message_id)
+            provider_message_id, status, created_at, event_payload
+          FROM alert_events
+          WHERE event_type = 'SMS_DELIVERY_RECEIPT'
+            AND provider_message_id = ANY($1::varchar[])
+          ORDER BY provider_message_id, created_at DESC, id DESC
+          `,
+          [messageIds]
+        )
+      : Promise.resolve({ rows: [] }),
+    callUuids.length
+      ? pool.query(
+          `
+          SELECT DISTINCT ON (provider_call_uuid)
+            provider_call_uuid, status, created_at, event_payload
+          FROM alert_events
+          WHERE event_type = 'VOICE_WEBHOOK'
+            AND provider_call_uuid = ANY($1::varchar[])
+          ORDER BY provider_call_uuid, created_at DESC, id DESC
+          `,
+          [callUuids]
+        )
+      : Promise.resolve({ rows: [] }),
+  ]);
+
+  const smsById = new Map(
+    smsReceipts.rows.map((row) => [row.provider_message_id, row])
+  );
+  const voiceByUuid = new Map(
+    voiceReceipts.rows.map((row) => [row.provider_call_uuid, row])
+  );
+
+  return prepared.map(({ row, result }) => {
+    const smsNotifications = result.notifications?.sms || [];
+    const voiceNotifications = result.notifications?.voice || [];
+
+    for (const notification of smsNotifications) {
+      const receipt = smsById.get(notification.provider_message_id);
+      if (!receipt) continue;
+      notification.status = receipt.status;
+      notification.final_status_at = receipt.created_at;
+      notification.error_message = ALERT_FAILURE_STATUSES.has(
+        String(receipt.status || "").toLowerCase()
+      ) ? receipt.event_payload?.error || null : null;
+    }
+
+    for (const notification of voiceNotifications) {
+      const receipt = voiceByUuid.get(notification.provider_call_uuid);
+      if (!receipt) continue;
+      notification.status = receipt.status;
+      notification.final_status_at = receipt.created_at;
+      notification.error_message = ALERT_FAILURE_STATUSES.has(
+        String(receipt.status || "").toLowerCase()
+      ) ? receipt.event_payload?.error || null : null;
+    }
+
+    result.sms = { ...result.sms, ...summarizeFinalNotifications(smsNotifications) };
+    result.voice = { ...result.voice, ...summarizeFinalNotifications(voiceNotifications) };
+    result.status = summarizeFinalNotifications([
+      ...smsNotifications,
+      ...voiceNotifications,
+    ]).status;
+    result.tested_at = result.tested_at || row.created_at;
+    result.test_id = row.id;
+    return result;
+  });
+}
+
+async function getLatestTestAlertResult(companyId) {
+  const lastTestResult = await pool.query(
+    `
+    SELECT id, created_at, event_payload
+    FROM alert_events
+    WHERE company_id = $1
+      AND event_type = 'test_alert'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+    `,
+    [companyId]
+  );
+  const [result = null] = await hydrateTestAlertRows(lastTestResult.rows);
+  return result;
+}
+
+const testAlertResultReader = createTestAlertResultReader({
+  pool,
+  hydrateTestAlertRows,
+});
+
+app.post("/alerts/test", requireAuth, async (req, res) => {
+  try {
+    const text =
+      `AEGIS LINK TEST ALERT\n` +
+      `Source: Dashboard Settings\n` +
+      `This is a system notification test.\n` +
+      `Time: ${new Date().toISOString()}`;
+
+    const result = await alertDispatcher.dispatchAlertNotifications({
+      mode: "test",
+      source: "Dashboard Settings",
+      companyId: req.auth.company_id,
+      message: text,
+    });
+
+    return res.json({
+      status: "ok",
+      message: "Test alert dispatch completed",
+      result,
+    });
+  } catch (err) {
+    console.error("Test alert dispatch error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Test alert could not be dispatched",
+    });
+  }
+});
+
+app.get("/settings/test-alerts/:testId", requireAuth, async (req, res) => {
+  try {
+    const rawTestId = String(req.params.testId || "");
+    const testId = /^\d+$/.test(rawTestId) ? Number(rawTestId) : NaN;
+    if (!Number.isSafeInteger(testId) || testId <= 0) {
+      return res.status(404).json({ status: "error", message: "Test alert not found" });
+    }
+
+    const result = await testAlertResultReader.getById(
+      req.auth.company_id,
+      testId
+    );
+    if (!result) {
+      return res.status(404).json({ status: "error", message: "Test alert not found" });
+    }
+
+    return res.json({ status: "ok", result });
+  } catch (err) {
+    console.error("Test alert result error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load test alert result",
+    });
+  }
+});
+
+app.get("/settings/test-alert-history", requireAuth, async (req, res) => {
+  try {
+    const requestedPage = Number.parseInt(req.query.page, 10);
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const page = Number.isFinite(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 50)
+      : 10;
+    const offset = (page - 1) * limit;
+
+    const [historyResult, countResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT id, created_at, event_payload
+        FROM alert_events
+        WHERE company_id = $1
+          AND event_type = 'test_alert'
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $3
+        `,
+        [req.auth.company_id, limit, offset]
+      ),
+      pool.query(
+        `
+        SELECT COUNT(*)::int AS total
+        FROM alert_events
+        WHERE company_id = $1
+          AND event_type = 'test_alert'
+        `,
+        [req.auth.company_id]
+      ),
+    ]);
+
+    const items = await hydrateTestAlertRows(historyResult.rows);
+    const total = countResult.rows[0]?.total || 0;
+
+    return res.json({
+      status: "ok",
+      items,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.max(1, Math.ceil(total / limit)),
+      },
+    });
+  } catch (err) {
+    console.error("Test alert history error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load test alert history",
+    });
+  }
+});
+
+app.get("/settings/alert-configuration", requireAuth, async (req, res) => {
+  try {
+    const resolution = await alertDispatcher.getAlertRecipientsForCompany(
+      req.auth.company_id
+    );
+    const recipients = resolution.recipients;
+    const savedResult = await getLatestTestAlertResult(req.auth.company_id);
+
+    return res.json({
+      status: "ok",
+      recipient_source: resolution.source,
+      fallback_used: resolution.fallback_used,
+      sms: {
+        recipients_count: recipients.length,
+        enabled_count: recipients.filter((item) => item.sms_enabled).length,
+      },
+      voice: {
+        recipients_count: recipients.length,
+        enabled_count: recipients.filter((item) => item.voice_enabled).length,
+      },
+      escalation: { order: "SMS and Voice in parallel" },
+      last_test: savedResult,
+    });
+  } catch (err) {
+    console.error("Alert configuration error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to load alert configuration",
+    });
+  }
+});
+
+// ----------------------------------------------------------
+// DASHBOARD SETTINGS CONFIG
+// ----------------------------------------------------------
+app.get("/settings/config", async (req, res) => {
+  res.json({
+    status: "ok",
+
+    incident_rules: {
+      timeline_reset: process.env.TIMELINE_RESET || "1 hour",
+      default_priority: process.env.DEFAULT_PRIORITY || "High",
+      ai_intake: process.env.AI_INTAKE_ENABLED === "true" ? "Enabled" : "Disabled",
+    },
+
+    guard_sessions: {
+      heartbeat: process.env.GUARD_HEARTBEAT || "30 sec",
+      offline_timeout: process.env.GUARD_OFFLINE_TIMEOUT || "90 sec",
+      auto_close: process.env.GUARD_AUTO_CLOSE === "true" ? "Enabled" : "Disabled",
+    },
+
+    notifications: {
+      desktop_alerts: process.env.DESKTOP_ALERTS_ENABLED === "true" ? "Enabled" : "Disabled",
+      sound_alerts: process.env.SOUND_ALERTS_ENABLED === "true" ? "Enabled" : "Disabled",
+      push_notifications: process.env.PUSH_NOTIFICATIONS_ENABLED === "true" ? "Enabled" : "Disabled",
+    },
+  });
+});
+
+
+// ----------------------------------------------------------
+// SYSTEM STATUS
+// ----------------------------------------------------------
+app.get("/system/status/legacy-internal", requireAuth, async (req, res) => {
+
+  const startedAt = Date.now();
+
+  try {
+
+    let webAppStatus = "offline";
+
+try {
+  const guardWebAppHealthUrl =
+    process.env.GUARD_WEBAPP_HEALTH_URL ||
+    "https://guard.aegislink.noctuacore.ai/health.json";
+  const webCheck = await fetch(
+    guardWebAppHealthUrl,
+    {
+      cache: "no-store"
+    }
+  );
+
+  if (webCheck.ok) {
+    const webData = await webCheck.json();
+
+    if (webData.status === "ok") {
+      webAppStatus = "online";
+    }
+  }
+} catch {
+  webAppStatus = "offline";
+}
+
+    const status = {
+      checked_at: new Date().toISOString(),
+      overall_status: "operational",
+
+      services: {
+
+        web_app: {
+         label: "Web App",
+         status: webAppStatus
+        },
+
+        backend_api: {
+          label: "Backend API",
+          status: "operational",
+          message: "Backend responding"
+        },
+
+        database: {
+          label: "Database",
+          status: "unknown"
+        },
+
+        guard_sessions: {
+          label: "Guard Sessions",
+          status: "unknown"
+        },
+
+        incidents: {
+          label: "Incidents",
+          status: "unknown"
+        },
+
+        sms_gateway: {
+  label: "SMS Gateway",
+  status:
+    process.env.VONAGE_API_KEY &&
+    process.env.VONAGE_API_SECRET &&
+    process.env.VONAGE_SMS_FROM
+      ? "operational"
+      : "offline",
+  configured:
+    Boolean(
+      process.env.VONAGE_API_KEY &&
+      process.env.VONAGE_API_SECRET &&
+      process.env.VONAGE_SMS_FROM
+    )
+},
+
+        voice_calls: {
+  label: "Voice Calls",
+  status:
+    process.env.VONAGE_APPLICATION_ID &&
+    process.env.VONAGE_PRIVATE_KEY &&
+    process.env.VONAGE_FROM_NUMBER
+      ? "operational"
+      : "offline",
+  configured:
+    Boolean(
+      process.env.VONAGE_APPLICATION_ID &&
+      process.env.VONAGE_PRIVATE_KEY &&
+      process.env.VONAGE_FROM_NUMBER
+    )
+},
+
+        ai_intake: {
+  label: "AI Intake",
+  status: process.env.OPENAI_API_KEY
+    ? "operational"
+    : "offline",
+  configured: Boolean(process.env.OPENAI_API_KEY)
+}
+
+      }
+
+    };
+
+    // DATABASE
+
+    const dbCheck =
+      await pool.query(
+        "SELECT NOW() AS server_time"
+      );
+
+    status.services.database = {
+      label: "Database",
+      status: "operational",
+      server_time:
+        dbCheck.rows[0].server_time
+    };
+
+    // ACTIVE GUARDS
+
+    const guards =
+  await pool.query(`
+SELECT COUNT(*)::int AS active_guards
+
+FROM guard_sessions gs
+INNER JOIN guards g
+  ON g.id = gs.guard_id
+
+WHERE gs.logout_time IS NULL
+
+AND g.access_mode = 'standard'
+
+AND (
+  gs.scheduled_shift_end IS NULL
+  OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+     > (NOW() AT TIME ZONE 'Europe/Athens')
+)
+
+AND gs.last_heartbeat >
+NOW() - INTERVAL '90 seconds'
+`);
+
+    status.services.guard_sessions = {
+      label: "Guard Sessions",
+      status: "operational",
+      active_guards:
+        guards.rows[0].active_guards
+    };
+
+    // INCIDENTS
+
+    const incidents =
+      await pool.query(`
+SELECT COUNT(*)::int AS active_incidents
+
+FROM incidents
+
+WHERE status IN (
+'active',
+'in_progress'
+)
+`);
+
+    status.services.incidents = {
+      label: "Incidents",
+      status: "operational",
+      active_incidents:
+        incidents.rows[0]
+        .active_incidents
+    };
+
+    status.response_time_ms =
+      Date.now() - startedAt;
+
+    res.json(status);
+
+  } catch(err){
+
+    console.error(
+      "System status error:",
+      err
+    );
+
+    res.status(500).json({
+      overall_status:"degraded",
+      message:err.message
+    });
+
+  }
+
+});
+
+app.use(
+  "/admin/patrol-corrections",
+  createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission: dashboardRbac.requirePermission })
+);
+
+app.use(createRandomPatrolRouter({
+  pool,
+  requireAuth,
+  requirePermission: dashboardRbac.requirePermission,
+  requireAllPermissions: dashboardRbac.requireAllPermissions,
+}));
+
+app.use(
+  createShiftReportsRouter({
+    pool,
+    requireAuth,
+    requireGuardAuth,
+    storage: createSupabaseGuardReportsStorage(),
+    puppeteer,
+  })
+);
+
+// Public endpoint intentionally exposes platform health only.
+app.get("/system/status", async (_req, res) => {
+  try {
+    return res.json(await systemStatusService.getPublicStatus());
+  } catch (err) {
+    console.error("Public system status error:", err);
+    return res.status(503).json({
+      overall_status: "offline",
+      scope: "platform",
+      checked_at: new Date().toISOString(),
+      message: err.message,
+    });
+  }
+});
+
+app.get("/system/status/tenant", requireAuth, async (req, res) => {
+  try {
+    return res.json(
+      await systemStatusService.getTenantStatus(req.auth.company_id)
+    );
+  } catch (err) {
+    console.error("Tenant system status error:", err);
+    return res.status(500).json({
+      overall_status: "offline",
+      scope: "tenant",
+      checked_at: new Date().toISOString(),
+      message: err.message,
+    });
+  }
+});
+
+app.get("/system/status/global", requireAuth, async (req, res) => {
+  if (!req.auth.is_system_owner) {
+    return res.status(403).json({
+      status: "error",
+      message: "System owner access required",
+    });
+  }
+
+  try {
+    return res.json(await systemStatusService.getGlobalStatus());
+  } catch (err) {
+    console.error("Global system status error:", err);
+    return res.status(500).json({
+      overall_status: "offline",
+      scope: "global",
+      checked_at: new Date().toISOString(),
+      message: err.message,
+    });
+  }
+});
+
+app.use(
+  "/admin/companies",
+  requireAuth,
+  dashboardRbac.requireSystemOwner,
+  createCompaniesRouter({
+    pool,
+    hashPassword: bcrypt.hash,
+    generateTemporaryPassword,
+  })
+);
+
+// ----------------------------------------------------------
+// Helper: Αποστολή SMS μέσω Vonage (κοινή λογική)
+// ----------------------------------------------------------
+async function sendVonageSms(to, text) {
+  return alertDispatcher.provider.sendSms(to, text);
+}
+
+
+// ----------------------------------------------------------
+// Vonage SMS Test Route (χρησιμοποιεί το helper sendVonageSms)
+// ----------------------------------------------------------
+app.post('/test-sms', requireAuth, async (req, res) => {
+  if (!isSystemOwner(req.auth)) {
+    return res.status(403).json({
+      status: "error",
+      message: "Forbidden",
+    });
+  }
+
+  const { to, text } = req.body;
+
+  if (!to || !text) {
+    return res.status(400).json({ error: 'Required fields: to, text' });
+  }
+
+  try {
+    const data = await sendVonageSms(to, text);
+    res.json({ status: 'ok', data });
+  } catch (err) {
+    console.error('Vonage SMS Error:', err);
+    res.status(500).json({ error: 'SMS failed', details: err.message });
+  }
+});
+
+// === ALERT ENDPOINT used by the WebApp ===
+app.post('/alert', requireGuardAuth, async (req, res) => {
+  console.log('ALERT ENDPOINT HIT:', req.body);
+
+  const {
+  triggeredAt,
+  source,
+  latitude,
+  longitude,
+  accuracy,
+  battery,
+  locationAddress
+} = req.body || {};
+
+const {
+  guard_id: guardId,
+  session_id: sessionId,
+  site_id: siteId,
+  company_id: companyId,
+} = req.guard;
+
+  const alertTime = new Date();
+
+console.log("Server now:", alertTime);
+console.log("ISO:", alertTime.toISOString());
+console.log("Locale:", alertTime.toLocaleString("el-GR"));
+
+  const incidentRef = `INC-${Date.now()}`;
+
+  const text =
+    `NOCTUA PANIC ALERT\n` +
+    `Site: ${siteId || 'N/A'}\n` +
+    `Guard: ${guardId || 'N/A'}\n` +
+    `Source: ${source || 'noctua-panic-webapp'}\n` +
+    `Time: ${alertTime}`;
+
+  try {
+    const incidentResult = await pool.query(
+  `
+  INSERT INTO incidents (
+    incident_ref,
+    company_id,
+    site_id,
+    guard_ref,
+    status,
+    priority,
+    trigger_time,
+    resolved_time,
+    auto_reset_time,
+    ai_summary,
+    needs_support,
+    incident_latitude,
+    incident_longitude,
+    incident_accuracy,
+    incident_battery_level,
+    incident_address,
+    incident_location_timestamp,
+    created_at
+  )
+  SELECT
+    $1,
+    s.company_id,
+    $2::int,
+    $3::int,
+    'active',
+    'High',
+    $4::timestamptz,
+    NULL,
+    $4::timestamptz + INTERVAL '2 minutes',
+    $5,
+    true,
+    $6,
+    $7,
+    $8,
+    $9,
+    $10,
+    $11::timestamptz,
+    NOW()
+  FROM sites s
+  WHERE s.id = $2::int
+  RETURNING *
+  `,
+  [
+    incidentRef,
+    siteId,
+    guardId,
+    alertTime,
+    'Panic alert triggered from web app.',
+    latitude || null,
+    longitude || null,
+    accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
+    battery !== null && battery !== undefined ? Math.round(Number(battery)) : null,
+    latitude && longitude
+  ? await reverseGeocode(latitude, longitude)
+  : locationAddress || null,
+    triggeredAt || alertTime
+  ]
+);
+
+    const incident = incidentResult.rows[0];
+    if (!incident) {
+      throw new Error("Authenticated site was not found for incident creation");
+    }
+
+    const dispatchResult = await alertDispatcher.dispatchAlertNotifications({
+      mode: "incident",
+      source: source || "webapp",
+      companyId,
+      message: text,
+      incident_id: incident.id,
+      site_id: siteId,
+      guard_id: guardId,
+    });
+
+    return res.json({
+      status: 'ok',
+      message: 'Alert received, incident created, notification attempts processed',
+      incident: incidentResult.rows[0],
+      dispatch: dispatchResult,
+      recipients: [
+        ...new Set([
+          ...dispatchResult.notifications.sms.map((item) => item.phone),
+          ...dispatchResult.notifications.voice.map((item) => item.phone),
+        ]),
+      ],
+      notifications: dispatchResult.notifications,
+    });
+
+  } catch (err) {
+    console.error('Error processing panic alert from /alert:', err);
+
+    return res.status(500).json({
+      status: 'error',
+      message: 'Alert received but processing failed',
+      error: err.message
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// Vonage delivery webhooks
+// ----------------------------------------------------------
+
+async function smsDeliveryHook(req, res) {
+  try {
+    const payload = { ...(req.query || {}), ...(req.body || {}) };
+    const messageId = payload.messageId || payload["message-id"] || null;
+    const deliveryStatus = String(payload.status || "unknown").toLowerCase();
+
+    if (!messageId) return res.status(200).send("ok");
+
+    const submittedLookup = await pool.query(
+      `
+      SELECT company_id, mode, incident_id, site_id, guard_id, recipient_phone
+      FROM alert_events
+      WHERE provider_message_id = $1
+        AND event_type = 'SMS_NOTIFICATION_RESULT'
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [messageId]
+    );
+    const submitted = submittedLookup.rows[0] || {};
+
+    await ensureAlertEventsTable();
+    await pool.query(
+      `
+      INSERT INTO alert_events (
+        event_type, mode, company_id, source, status,
+        incident_id, site_id, guard_id, recipient_phone,
+        provider, provider_message_id, event_payload
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
+      `,
+      [
+        "SMS_DELIVERY_RECEIPT",
+        submitted.mode || null,
+        submitted.company_id || null,
+        "vonage",
+        deliveryStatus,
+        submitted.incident_id || null,
+        submitted.site_id || null,
+        submitted.guard_id || null,
+        submitted.recipient_phone || payload.msisdn || payload.to || null,
+        "vonage",
+        messageId,
+        JSON.stringify({
+          status: deliveryStatus,
+          error: payload["err-code"] && payload["err-code"] !== "0"
+            ? `Vonage delivery error ${payload["err-code"]}`
+            : null,
+          timestamp: payload["message-timestamp"] || payload.timestamp || null,
+          network_code: payload["network-code"] || null,
+        }),
+      ]
+    );
+
+    return res.status(200).send("ok");
+  } catch (err) {
+    console.error("Vonage SMS delivery webhook error:", err);
+    return res.status(200).send("ok");
+  }
+}
+
+app.get("/webhooks/sms-delivery", smsDeliveryHook);
+app.post("/webhooks/sms-delivery", smsDeliveryHook);
+
+// Vonage Voice Webhooks (match Vonage Application URLs)
+
+function answerNcco(req, res) {
+  console.log("VONAGE ANSWER HIT:", { method: req.method, query: req.query, body: req.body });
+
+  const audioUrl = process.env.ALERT_AUDIO_URL;
+
+  if (!audioUrl) {
+    return res.status(500).json([{ action: "talk", text: "Audio URL is not configured." }]);
+  }
+
+  return res.json([{ action: "stream", streamUrl: [audioUrl] }]);
+}
+
+app.get('/webhooks/answer', answerNcco);
+app.post('/webhooks/answer', answerNcco);
+
+async function eventHook(req, res) {
+  try {
+    const payload = req.body || {};
+    const callStatus = payload.status || "unknown";
+    const callUuid = payload.uuid || payload.conversation_uuid || null;
+
+    const incidentLookup = await pool.query(
+      `
+      SELECT
+        company_id,
+        mode,
+        incident_id,
+        site_id,
+        guard_id,
+        recipient_phone
+      FROM alert_events
+      WHERE provider_call_uuid = $1
+        AND event_type = 'VOICE_CALL_SUBMITTED'
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [callUuid]
+    );
+
+    const incidentInfo = incidentLookup.rows[0] || {};
+
+    console.log("VONAGE VOICE EVENT:", {
+      method: req.method,
+      query: req.query,
+      body: payload
+    });
+
+    await ensureAlertEventsTable();
+
+    await pool.query(
+      `
+      INSERT INTO alert_events (
+        event_type, mode, company_id,
+        source,
+        status,
+        incident_id,
+        site_id,
+        guard_id,
+        recipient_phone,
+        voice_attempted,
+        voice_status,
+        provider,
+        provider_call_uuid,
+        event_payload
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      `,
+      [
+        "VOICE_WEBHOOK",
+        incidentInfo.mode || null,
+        incidentInfo.company_id || null,
+        "vonage",
+        callStatus,
+
+        incidentInfo.incident_id || null,
+        incidentInfo.site_id || null,
+        incidentInfo.guard_id || null,
+        incidentInfo.recipient_phone || null,
+
+        1,
+        callStatus,
+        "vonage",
+        callUuid,
+        JSON.stringify({
+          status: callStatus,
+          error: payload.reason || payload.detail || null,
+          direction: payload.direction || null,
+          timestamp: payload.timestamp || null,
+          duration: payload.duration || null,
+          rate: payload.rate || null,
+        })
+      ]
+    );
+
+    return res.status(200).send("ok");
+  } catch (err) {
+    console.error("Vonage voice webhook error:", err);
+    return res.status(200).send("ok");
+  }
+}
+
+app.get('/webhooks/event', eventHook);
+app.post('/webhooks/event', eventHook);
+
+app.get("/incidents/live", requireAuth, async (req, res) => {
+
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+
+    const result = await pool.query(
+  `
+  SELECT
+    i.id,
+    i.incident_ref,
+    i.status,
+    i.priority,
+    i.trigger_time,
+    i.resolved_time,
+    i.ai_summary,
+    i.needs_support,
+    i.incident_latitude,
+    i.incident_longitude,
+    i.incident_accuracy,
+    i.incident_battery_level,
+    i.incident_address,
+    i.incident_location_timestamp,
+
+    s.name AS site_name,
+
+    COALESCE(
+      g.full_name,
+      g.username
+    ) AS guard_name
+
+  FROM incidents i
+
+  INNER JOIN sites s
+    ON s.id = i.site_id
+
+  LEFT JOIN guards g
+    ON g.id = i.guard_ref
+
+  WHERE (
+    $1::boolean = true
+    OR s.company_id = $2
+  )
+
+  ORDER BY i.trigger_time DESC
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
+
+    res.json(result.rows);
+
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      error: "live incidents failed"
+    });
+  }
+
+});
+
+app.get("/incidents/site-monitoring", requireAuth, async (req, res) => {
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+    await pool.query(
+  `
+  UPDATE incidents i
+  SET
+    status = 'in_progress'
+  FROM sites s
+  WHERE s.id = i.site_id
+    AND i.status = 'active'
+    AND i.auto_reset_time IS NOT NULL
+    AND i.auto_reset_time <= NOW()
+    AND (
+      $1::boolean = true
+      OR s.company_id = $2
+    )
+  `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
+
+    const result = await pool.query(
+  `
+      SELECT
+        s.id AS site_id,
+        s.name AS site_name,
+        s.location AS site_location,
+        s.status AS site_status,
+
+        COALESCE(gs.full_name, gs.username, 'No active guard') AS guard_name,
+
+        i.id AS incident_id,
+        i.incident_ref,
+        i.status AS incident_status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+        i.incident_latitude,
+i.incident_longitude,
+i.incident_accuracy,
+i.incident_battery_level,
+i.incident_address,
+i.incident_location_timestamp,
+        ae.status AS alert_event_status,
+        ae.sms_sent,
+        ae.sms_failed,
+        ae.voice_attempted,
+        ae.voice_status,
+        ae.has_call_submitted,
+ae.has_call_ringing,
+ae.has_call_answered,
+ae.has_call_completed,
+
+        CASE
+  WHEN s.status <> 'active' THEN 'inactive'
+  WHEN i.id IS NULL THEN 'normal'
+  ELSE i.status
+END AS display_status
+
+      FROM sites s
+
+      LEFT JOIN LATERAL (
+  SELECT
+    gs.site_id,
+    g.full_name,
+    g.username,
+    gs.login_time
+  FROM guard_sessions gs
+  LEFT JOIN guards g
+    ON g.id = gs.guard_id
+  WHERE gs.site_id = s.id
+    AND gs.logout_time IS NULL
+    AND g.access_mode = 'standard'
+  ORDER BY gs.login_time DESC
+  LIMIT 1
+) gs ON true
+
+      LEFT JOIN LATERAL (
+  SELECT *
+  FROM incidents i
+  WHERE i.site_id = s.id
+    AND (
+      (
+        i.status = 'active'
+        AND (
+          i.auto_reset_time IS NULL
+          OR i.auto_reset_time > NOW()
+        )
+      )
+      OR i.status = 'in_progress'
+    )
+  ORDER BY i.trigger_time DESC
+  LIMIT 1
+) i ON true
+       LEFT JOIN LATERAL (
+  SELECT
+    ae.*,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_CALL_SUBMITTED'
+    ) AS has_call_submitted,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_WEBHOOK'
+        AND e.status = 'ringing'
+    ) AS has_call_ringing,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_WEBHOOK'
+        AND e.status = 'answered'
+    ) AS has_call_answered,
+
+    EXISTS (
+      SELECT 1
+      FROM alert_events e
+      WHERE e.incident_id = i.id
+        AND e.event_type = 'VOICE_WEBHOOK'
+        AND e.status = 'completed'
+    ) AS has_call_completed
+
+  FROM alert_events ae
+  WHERE ae.event_type = 'WEBAPP_ALERT'
+    AND ae.incident_id = i.id
+  ORDER BY ae.created_at DESC
+  LIMIT 1
+) ae ON true
+WHERE (
+  $1::boolean = true
+  OR s.company_id = $2
+)
+      ORDER BY s.id ASC
+      `,
+  [
+    isSystemOwner,
+    req.auth.company_id,
+  ]
+);
+
+    const cards = result.rows.map((row) => ({
+      siteId: row.site_id,
+      title: row.site_name,
+      site: row.site_name,
+      location: row.site_location,
+
+      guard:
+  row.display_status === "inactive"
+    ? "Guarding suspended"
+    : row.guard_name || "Waiting for guard check-in",
+
+      status: row.display_status || "normal",
+      priority: row.priority || "Normal",
+
+      incidentId: row.incident_ref || null,
+      incidentDbId: row.incident_id || null,
+      triggerTime: row.trigger_time || null,
+      resolvedTime: row.resolved_time || null,
+      incidentLatitude: row.incident_latitude || null,
+incidentLongitude: row.incident_longitude || null,
+incidentAccuracy: row.incident_accuracy || null,
+incidentBatteryLevel: row.incident_battery_level || null,
+incidentAddress: row.incident_address || null,
+incidentLocationTimestamp: row.incident_location_timestamp || null,
+      
+      triggerStatus: row.incident_id
+  ? row.display_status === "resolved"
+    ? "Completed"
+    : "Received"
+  : "Ready",
+
+smsStatus: row.incident_id
+  ? Number(row.sms_sent) > 0
+    ? "Sent"
+    : Number(row.sms_failed) > 0
+    ? "Failed"
+    : "Sending"
+  : "Ready",
+
+callStatus: row.incident_id
+  ? row.has_call_completed
+    ? "Completed"
+    : row.has_call_answered
+    ? "Answered"
+    : row.has_call_ringing
+    ? "Ringing"
+    : row.has_call_submitted
+    ? "Dialing"
+    : "Pending"
+  : "Ready",
+
+aiStatus: row.incident_id
+  ? row.alert_event_status === "completed"
+    ? "Completed"
+    : "Processing"
+  : "Ready",
+
+      aiSummary: row.ai_summary || null,
+      escalation: row.needs_support ? "Supervisor required" : "Standby",
+    }));
+
+    res.json({
+      status: "ok",
+      cards,
+    });
+  } catch (err) {
+    console.error("Site monitoring error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+app.get(
+  "/incidents/:id/guard-responses",
+  requireAuth,
+  async (req, res) => {
+    try {
+      await ensureIncidentGuardResponsesTable();
+
+      const incidentId = Number(req.params.id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
+
+      if (
+        !Number.isInteger(incidentId) ||
+        incidentId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid incident id",
+        });
+      }
+
+      const incidentResult = await pool.query(
+        `
+        SELECT
+          i.id
+        FROM incidents i
+        INNER JOIN sites s
+          ON s.id = i.site_id
+        WHERE i.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        `,
+        [
+          incidentId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (incidentResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Incident not found",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          igr.id,
+          igr.incident_id,
+          igr.guard_id,
+          igr.site_id,
+          igr.session_id,
+          igr.question_key,
+          igr.question_text,
+          igr.answer,
+          igr.created_at
+        FROM incident_guard_responses igr
+        WHERE igr.incident_id = $1
+        ORDER BY igr.created_at ASC
+        `,
+        [incidentId]
+      );
+
+      return res.json({
+        status: "ok",
+        responses: result.rows,
+        guard_notes: result.rows
+          .map(
+            (row) =>
+              `${row.question_text}\n${row.answer}`
+          )
+          .join("\n\n"),
+      });
+    } catch (err) {
+      console.error(
+        "Guard responses error:",
+        err
+      );
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.post(
+  "/incidents/:id/resolve",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const incidentId = Number(req.params.id);
+      const isSystemOwner =
+        req.auth.role === "system_owner";
+
+      if (
+        !Number.isInteger(incidentId) ||
+        incidentId <= 0
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid incident id",
+        });
+      }
+
+      const incidentResult = await pool.query(
+        `
+        SELECT
+          i.id
+        FROM incidents i
+        INNER JOIN sites s
+          ON s.id = i.site_id
+        WHERE i.id = $1
+          AND (
+            $2::boolean = true
+            OR s.company_id = $3
+          )
+        `,
+        [
+          incidentId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (incidentResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Incident not found",
+        });
+      }
+
+      const {
+        supervisor_notified,
+        supervisor_name,
+        supervisor_notes,
+
+        guard_contacted,
+        guard_contacted_name,
+        guard_notes,
+
+        residence_contacted,
+        residence_contacted_name,
+        residence_notes,
+
+        admin_notes,
+        approved_by,
+      } = req.body;
+
+      await pool.query(
+        `
+        INSERT INTO incident_resolution_actions (
+          incident_id,
+          supervisor_notified,
+          supervisor_name,
+          supervisor_notes,
+          guard_contacted,
+          guard_contacted_name,
+          guard_notes,
+          residence_contacted,
+          residence_contacted_name,
+          residence_notes,
+          admin_notes,
+          approved_by,
+          approved_at
+        )
+        VALUES (
+          $1,$2,$3,$4,
+          $5,$6,$7,
+          $8,$9,$10,
+          $11,$12,
+          NOW()
+        )
+        `,
+        [
+          incidentId,
+
+          supervisor_notified,
+          supervisor_name,
+          supervisor_notes,
+
+          guard_contacted,
+          guard_contacted_name,
+          guard_notes,
+
+          residence_contacted,
+          residence_contacted_name,
+          residence_notes,
+
+          admin_notes,
+          approved_by,
+        ]
+      );
+
+      await pool.query(
+        `
+        UPDATE incidents
+        SET
+          status = 'resolved',
+          resolved_time = NOW()
+        WHERE id = $1
+        `,
+        [incidentId]
+      );
+
+      return res.json({
+        status: "ok",
+        message: "Incident resolved",
+      });
+    } catch (err) {
+      console.error(err);
+
+      return res.status(500).json({
+        status: "error",
+        message: err.message,
+      });
+    }
+  }
+);
+
+app.get("/incidents/resolved", requireAuth, async (req, res) => {
+  try {
+    const isSystemOwner = req.auth.role === "system_owner";
+    const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
+    const { date, site_id } = req.query;
+
+    const values = [
+  isSystemOwner,
+  req.auth.company_id,
+];
+    let query = `
+      SELECT
+  i.id,
+  i.incident_ref,
+  i.status,
+  i.priority,
+
+  i.trigger_time,
+  i.resolved_time,
+
+  i.ai_summary,
+  i.needs_support,
+  i.incident_latitude,
+  i.incident_longitude,
+  i.incident_accuracy,
+  i.incident_battery_level,
+  i.incident_address,
+
+  i.incident_location_timestamp,
+
+  s.id AS site_id,
+  s.name AS site_name,
+  s.location AS site_location,
+
+  COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name,
+
+  ira.supervisor_notified,
+  ira.supervisor_name,
+  ira.supervisor_notes,
+  ira.guard_contacted,
+  ira.guard_contacted_name,
+  ira.guard_notes,
+  ira.residence_contacted,
+  ira.residence_contacted_name,
+  ira.residence_notes,
+  ira.admin_notes,
+  ira.approved_by,
+  ira.approved_at
+
+      FROM incidents i
+
+      LEFT JOIN sites s
+        ON s.id = i.site_id
+
+      LEFT JOIN guards g
+        ON g.id = i.guard_ref
+
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM incident_resolution_actions ira
+        WHERE ira.incident_id = i.id
+        ORDER BY ira.approved_at DESC
+        LIMIT 1
+      ) ira ON true
+
+      WHERE i.status = 'resolved'
+      AND (
+  $1::boolean = true
+  OR s.company_id = $2
+)
+    `;
+
+    if (date) {
+      values.push(date);
+      query += `
+        AND DATE(i.resolved_time) = $${values.length}::date
+      `;
+    }
+
+    if (site_id) {
+      values.push(site_id);
+      query += `
+        AND i.site_id = $${values.length}
+      `;
+    }
+
+    query += `
+      ORDER BY i.resolved_time DESC
+      LIMIT 10
+    `;
+
+    const result = await pool.query(query, values);
+
+    const incidents = result.rows.map((incident) => ({
+  ...incident,
+
+  trigger_time_display: formatReportTime(
+    incident.trigger_time,
+    companyTimezone
+  ),
+
+  resolved_time_display: formatReportTime(
+    incident.resolved_time,
+    companyTimezone
+  ),
+
+  incident_location_timestamp_display: formatReportTime(
+    incident.incident_location_timestamp,
+    companyTimezone
+  ),
+
+  approved_at_display: formatReportTime(
+    incident.approved_at,
+    companyTimezone
+  ),
+}));
+
+console.log(incidents[0]);
+
+    res.json({
+  status: "ok",
+  incidents,
+});
+
+  } catch (err) {
+    console.error("Resolved incidents error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
+  }
+});
+
+
+function formatDuration(ms) {
+  if (!ms || ms < 0) return "N/A";
+
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+
+  return `${minutes}m ${seconds}s`;
+}
+
+function formatReportTime(value, timezone = "Europe/Athens") {
+  if (!value) return null;
+
+  // Αν είναι ήδη formatted local timestamp (χωρίς timezone),
+  // μην κάνεις νέα timezone μετατροπή.
+  if (typeof value === "string" && !value.endsWith("Z")) {
+    const [datePart, timePart] = value.split("T");
+    if (datePart && timePart) {
+      const [y, m, d] = datePart.split("-");
+      return `${d}/${m}/${y}, ${timePart}`;
+    }
+  }
+
+  return new Date(value).toLocaleString("el-GR", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+app.get(
+  "/incidents/:id/report",
+  requireAuth,
+  async (req, res) => {
+  try {
+  const incidentId = Number(req.params.id);
+
+const companyTimezone = await getCompanyTimezone(
+  req.auth.company_id
+);
+
+const isSystemOwner = req.auth.role === "system_owner";
+
+if (
+  !Number.isInteger(incidentId) ||
+  incidentId <= 0
+) {
+  return res.status(400).json({
+    status: "error",
+    message: "Invalid incident id",
+  });
+}
+    const incidentResult = await pool.query(
+      `
+      SELECT
+        i.id,
+        i.incident_ref,
+        i.status,
+        i.priority,
+        i.trigger_time,
+        i.resolved_time,
+        i.ai_summary,
+        i.needs_support,
+        i.needs_support,
+i.incident_latitude,
+i.incident_longitude,
+i.incident_accuracy,
+i.incident_battery_level,
+i.incident_address,
+i.incident_location_timestamp,
+        s.name AS site_name,
+        s.location AS site_location,
+        COALESCE(g.full_name, g.username, 'Unknown guard') AS guard_name
+      FROM incidents i
+      LEFT JOIN sites s ON s.id = i.site_id
+      LEFT JOIN guards g ON g.id = i.guard_ref
+      WHERE i.id = $1
+  AND (
+    $2::boolean = true
+    OR s.company_id = $3
+  )
+      `,
+      [
+  incidentId,
+  isSystemOwner,
+  req.auth.company_id,
+]
+    );
+
+    if (incidentResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Incident not found",
+      });
+    }
+
+    const incident = incidentResult.rows[0];
+
+    const guardResponsesResult = await pool.query(
+      `
+      SELECT
+        question_key,
+        question_text,
+        answer,
+        created_at
+      FROM incident_guard_responses
+      WHERE incident_id = $1
+      ORDER BY created_at ASC
+      `,
+      [incidentId]
+    );
+
+    const resolutionResult = await pool.query(
+      `
+      SELECT
+        supervisor_name,
+        supervisor_notes,
+        guard_contacted_name,
+        guard_notes,
+        residence_contacted_name,
+        residence_notes,
+        admin_notes,
+        approved_by,
+        approved_at
+      FROM incident_resolution_actions
+      WHERE incident_id = $1
+      ORDER BY approved_at DESC
+      LIMIT 1
+      `,
+      [incidentId]
+    );
+
+    const alertEventsResult = await pool.query(
+  `
+  SELECT
+    id,
+    event_type,
+    source,
+    status,
+    sms_sent,
+    sms_failed,
+    voice_attempted,
+    voice_status,
+    recipient_phone,
+    provider,
+    provider_call_uuid,
+    event_payload,
+    created_at
+  FROM alert_events
+  WHERE incident_id = $1
+  ORDER BY created_at ASC, id ASC
+  `,
+  [incidentId]
+);
+
+    const guardResponses = guardResponsesResult.rows;
+    const resolution = resolutionResult.rows[0] || null;
+    const alertEvents = alertEventsResult.rows;
+
+    const durationMs =
+      incident.trigger_time && incident.resolved_time
+        ? new Date(incident.resolved_time) - new Date(incident.trigger_time)
+        : null;
+
+    const timeline = [];
+
+alertEvents.forEach((event) => {
+  if (event.event_type === "WEBAPP_ALERT") {
+    timeline.push({
+      event: "Alert Triggered",
+      timestamp: event.created_at,
+      display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
+    });
+
+    if (Number(event.sms_sent) > 0) {
+      timeline.push({
+        event: `SMS Sent (${event.sms_sent})`,
+        timestamp: event.created_at,
+        display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
+      });
+    }
+
+    if (Number(event.sms_failed) > 0) {
+      timeline.push({
+        event: `SMS Failed (${event.sms_failed})`,
+        timestamp: event.created_at,
+        display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
+      });
+    }
+
+    return;
+  }
+
+  if (event.event_type === "VOICE_CALL_SUBMITTED") {
+    timeline.push({
+      event: event.recipient_phone
+        ? `Voice Call Submitted (${event.recipient_phone})`
+        : "Voice Call Submitted",
+      timestamp: event.created_at,
+      display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
+    });
+
+    return;
+  }
+
+  if (event.event_type === "VOICE_WEBHOOK") {
+    let label = `Voice Call ${event.status || "Event"}`;
+
+    if (event.status === "started") {
+      label = "Voice Call Started";
+    }
+
+    if (event.status === "ringing") {
+      label = "Voice Call Ringing";
+    }
+
+    if (event.status === "answered") {
+      label = "Voice Call Answered";
+    }
+
+    if (event.status === "completed") {
+      const duration =
+        event.event_payload?.duration ||
+        event.event_payload?.duration_ms ||
+        null;
+
+      label = duration
+        ? `Voice Call Completed (${duration} sec)`
+        : "Voice Call Completed";
+    }
+
+    timeline.push({
+      event: label,
+      timestamp: event.created_at,
+      display_time: formatReportTime(
+  event.created_at,
+  companyTimezone
+),
+    });
+  }
+});
+
+if (guardResponses.length > 0) {
+  const lastResponse = guardResponses[guardResponses.length - 1];
+
+  timeline.push({
+    event: "Guard Questions Completed",
+    timestamp: lastResponse.created_at,
+    display_time: formatReportTime(
+  lastResponse.created_at,
+  companyTimezone
+),
+  });
+}
+
+if (resolution?.approved_at) {
+  timeline.push({
+    event: "Investigation Completed",
+    timestamp: resolution.approved_at,
+    display_time: formatReportTime(
+  resolution.approved_at,
+  companyTimezone
+),
+  });
+}
+
+if (incident.resolved_time) {
+  timeline.push({
+    event: "Incident Resolved",
+    timestamp: incident.resolved_time,
+    display_time: formatReportTime(
+  incident.resolved_time,
+  companyTimezone
+),
+  });
+}
+
+    timeline.sort((a, b) => {
+  const order = {
+    "Alert Triggered": 1,
+    "SMS Sent": 2,
+    "SMS Failed": 3,
+    "Voice Call Submitted": 4,
+    "Voice Call Started": 5,
+    "Voice Call Ringing": 6,
+    "Voice Call Answered": 7,
+    "Voice Call Completed": 8,
+    "Guard Questions Completed": 9,
+    "Investigation Completed": 10,
+    "Incident Resolved": 11
+  };
+
+  const getOrder = (item) => {
+    if (item.event?.startsWith("SMS Sent")) return order["SMS Sent"];
+    if (item.event?.startsWith("SMS Failed")) return order["SMS Failed"];
+    if (item.event?.startsWith("Voice Call Submitted")) return order["Voice Call Submitted"];
+    if (item.event?.startsWith("Voice Call Completed")) return order["Voice Call Completed"];
+    return order[item.event] || 99;
+  };
+
+  return (
+    getOrder(a) - getOrder(b) ||
+    new Date(a.timestamp) - new Date(b.timestamp)
+  );
+});
+
+    res.json({
+      status: "ok",
+      report_title: "Aegis Link Security Incident Report",
+      report_id: `RPT-${incident.incident_ref || incident.id}`,
+      generated_at: new Date().toISOString(),
+      generated_at_display: formatReportTime(
+  new Date(),
+  companyTimezone
+),
+
+      incident: {
+        id: incident.id,
+        incident_ref: incident.incident_ref,
+        status: incident.status,
+        priority: incident.priority,
+        site: incident.site_name,
+        site_location: incident.site_location,
+        guard: incident.guard_name,
+        trigger_time: incident.trigger_time,
+        trigger_time_display: formatReportTime(
+  incident.trigger_time,
+  companyTimezone
+),
+        resolved_time: incident.resolved_time,
+        resolved_time_display: formatReportTime(
+  incident.resolved_time,
+  companyTimezone
+),
+        duration_seconds: durationMs ? Math.floor(durationMs / 1000) : null,
+        duration_display: formatDuration(durationMs),
+        ai_summary: incident.ai_summary,
+        needs_support: incident.needs_support,
+        incident_latitude: incident.incident_latitude,
+incident_longitude: incident.incident_longitude,
+incident_accuracy: incident.incident_accuracy,
+incident_battery_level: incident.incident_battery_level,
+incident_address: incident.incident_address,
+incident_location_timestamp: incident.incident_location_timestamp,
+incident_location_timestamp_display: formatReportTime(
+  incident.incident_location_timestamp,
+  companyTimezone
+),
+      },
+
+      timeline,
+
+      guard_responses: guardResponses.map((row) => ({
+        question_key: row.question_key,
+        question_text: row.question_text,
+        answer: row.answer,
+        created_at: row.created_at,
+        created_at_display: formatReportTime(
+  row.created_at,
+  companyTimezone
+),
+      })),
+
+      investigation: resolution
+        ? {
+            supervisor_name: resolution.supervisor_name,
+            supervisor_notes: resolution.supervisor_notes,
+            guard_contact_name: resolution.guard_contacted_name,
+            guard_notes: resolution.guard_notes,
+            residence_contact_name: resolution.residence_contacted_name,
+            residence_notes: resolution.residence_notes,
+            admin_notes: resolution.admin_notes,
+            approved_by: resolution.approved_by,
+            approved_at: resolution.approved_at,
+            approved_at_display: formatReportTime(
+  resolution.approved_at,
+  companyTimezone
+),
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("Incident report error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to generate incident report",
+      error: err.message,
+    });
+  }
+});
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return "-";
+
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+app.get(
+  "/incidents/:id/report/pdf",
+  requireAuth,
+  async (req, res) => {
+  let browser;
+
+  try {
+    const incidentId = Number(req.params.id);
+
+if (
+  !Number.isInteger(incidentId) ||
+  incidentId <= 0
+) {
+  return res.status(400).json({
+    status: "error",
+    message: "Invalid incident id",
+  });
+}
+
+const forwardedProtocol =
+  req.get("x-forwarded-proto") || req.protocol;
+
+const reportResponse = await fetch(
+  `${forwardedProtocol}://${req.get("host")}/incidents/${incidentId}/report`,
+  {
+    headers: {
+      Authorization: req.headers.authorization,
+    },
+  }
+);
+
+    const data = await reportResponse.json();
+
+    if (data.status !== "ok") {
+      return res.status(404).json({
+        status: "error",
+        message: "Report data not found",
+      });
+    }
+
+    const timelineHtml = data.timeline
+      .map(
+        (item) => `
+          <tr>
+            <td>${escapeHtml(item.display_time)}</td>
+            <td>${escapeHtml(
+              item.event === "Voice Call online"
+                ? "Voice Call Completed"
+                : item.event
+            )}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const responsesHtml = data.guard_responses
+      .map(
+        (item) => `
+          <div style="margin-bottom:12px">
+            <strong>${escapeHtml(item.question_text)}</strong><br/>
+            ${escapeHtml(item.answer)}
+          </div>
+        `
+      )
+      .join("");
+
+      const incidentLocationHtml =
+  data.incident?.incident_latitude && data.incident?.incident_longitude
+    ? `
+      <h2>Incident Location</h2>
+
+      <div class="summary-grid">
+        <div class="summary-item">
+          <span class="label">Address</span>
+          <span class="value">${escapeHtml(data.incident.incident_address)}</span>
+        </div>
+
+        <div class="summary-item">
+          <span class="label">Coordinates</span>
+          <span class="value">
+            ${escapeHtml(data.incident.incident_latitude)}, ${escapeHtml(data.incident.incident_longitude)}
+          </span>
+        </div>
+
+        <div class="summary-item">
+          <span class="label">Accuracy</span>
+          <span class="value">${escapeHtml(data.incident.incident_accuracy)}m</span>
+        </div>
+
+        <div class="summary-item">
+          <span class="label">Battery</span>
+          <span class="value">${escapeHtml(data.incident.incident_battery_level)}%</span>
+        </div>
+
+        <div class="summary-item">
+          <span class="label">Snapshot Time</span>
+          <span class="value">${escapeHtml(data.incident.incident_location_timestamp_display)}</span>
+        </div>
+
+        <div class="summary-item">
+          <span class="label">Map</span>
+          <span class="value">
+            https://www.google.com/maps?q=${escapeHtml(data.incident.incident_latitude)},${escapeHtml(data.incident.incident_longitude)}
+          </span>
+        </div>
+      </div>
+    `
+    : "";
+
+    const html = `
+      <html>
+        <head>
+          <title>${escapeHtml(data.report_title)}</title>
+          <style>
+            @page { margin: 16mm; }
+
+            body {
+              font-family: Arial, sans-serif;
+              color: #111;
+              margin: 0;
+              padding: 28px 34px;
+              box-sizing: border-box;
+            }
+
+            .report-header {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              border-bottom: 3px solid #111827;
+              padding-bottom: 18px;
+              margin-bottom: 28px;
+            }
+
+            .brand-title h1 {
+              margin: 0;
+              font-size: 28px;
+              letter-spacing: 1px;
+            }
+
+            .brand-title p {
+              margin: 4px 0 0;
+              color: #555;
+              font-size: 14px;
+            }
+
+            .report-meta {
+              text-align: right;
+              font-size: 13px;
+              color: #444;
+            }
+
+            .summary-grid {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: 10px 28px;
+              margin-bottom: 28px;
+            }
+
+            .summary-item {
+              border-bottom: 1px solid #eee;
+              padding-bottom: 8px;
+            }
+
+            .label {
+              display: block;
+              font-size: 11px;
+              text-transform: uppercase;
+              color: #666;
+              letter-spacing: .6px;
+              margin-bottom: 3px;
+            }
+
+            .value {
+              font-size: 15px;
+              font-weight: 600;
+            }
+
+            h2 {
+              margin-top: 30px;
+              border-bottom: 1px solid #ddd;
+              padding-bottom: 8px;
+              font-size: 18px;
+            }
+
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              margin-top: 10px;
+            }
+
+            td {
+              border-bottom: 1px solid #eee;
+              padding: 9px 8px;
+              font-size: 14px;
+              vertical-align: top;
+            }
+
+            .notes {
+              white-space: pre-line;
+              line-height: 1.5;
+            }
+
+            .footer {
+              margin-top: 36px;
+              padding-top: 14px;
+              border-top: 1px solid #ddd;
+              font-size: 12px;
+              color: #555;
+              display: flex;
+              justify-content: space-between;
+            }
+          </style>
+        </head>
+
+        <body>
+          <div class="report-header">
+            <div class="brand-title">
+              <h1>AEGIS LINK</h1>
+              <p>Security Operations Platform</p>
+            </div>
+
+            <div class="report-meta">
+              <strong>Security Incident Report</strong><br/>
+              Report ID: ${escapeHtml(data.report_id)}<br/>
+              Generated: ${escapeHtml(data.generated_at_display)}<br/>
+              Generated By: System
+            </div>
+          </div>
+
+          <div class="summary-grid">
+            <div class="summary-item">
+              <span class="label">Incident Ref</span>
+              <span class="value">${escapeHtml(data.incident.incident_ref)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Duration</span>
+              <span class="value">${escapeHtml(data.incident.duration_display)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Site</span>
+              <span class="value">${escapeHtml(data.incident.site)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Guard</span>
+              <span class="value">${escapeHtml(data.incident.guard)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Status</span>
+              <span class="value">${escapeHtml(data.incident.status)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Priority</span>
+              <span class="value">${escapeHtml(data.incident.priority)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Triggered</span>
+              <span class="value">${escapeHtml(data.incident.trigger_time_display)}</span>
+            </div>
+
+            <div class="summary-item">
+              <span class="label">Resolved</span>
+              <span class="value">${escapeHtml(data.incident.resolved_time_display)}</span>
+            </div>
+          </div>
+
+          ${incidentLocationHtml}
+
+          <h2>Incident Timeline</h2>
+          <table>${timelineHtml}</table>
+
+          <h2>Guard Responses</h2>
+          ${responsesHtml}
+
+          <h2>Investigation Notes</h2>
+
+          <p><strong>Supervisor:</strong> ${escapeHtml(data.investigation?.supervisor_name)}</p>
+
+          <p><strong>Supervisor Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.supervisor_notes)}</span>
+          </p>
+
+          <p><strong>Guard Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.guard_notes)}</span>
+          </p>
+
+          <p><strong>Residence Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.residence_notes)}</span>
+          </p>
+
+          <p><strong>Admin Notes:</strong><br/>
+            <span class="notes">${escapeHtml(data.investigation?.admin_notes)}</span>
+          </p>
+
+          <h2>Resolution Summary</h2>
+
+          <p><strong>Approved By:</strong> ${escapeHtml(data.investigation?.approved_by)}</p>
+          <p><strong>Approved At:</strong> ${escapeHtml(data.investigation?.approved_at_display)}</p>
+
+          <div class="footer">
+            <span>Aegis Link Security Operations Platform</span>
+            <span>Generated Automatically</span>
+          </div>
+        </body>
+      </html>
+    `;
+
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const page = await browser.newPage();
+
+    await page.setContent(html, {
+      waitUntil: "networkidle0",
+    });
+
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+    });
+
+    await browser.close();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${data.report_id}.pdf"`
+    );
+
+    res.send(pdfBuffer);
+  } catch (err) {
+    if (browser) {
+      await browser.close();
+    }
+
+    console.error("Incident PDF report error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to generate PDF report",
+      error: err.message,
+    });
+  }
+});
+
+
+// ----------------------------------------------------------
+// QR PATROL POINTS API
+// ----------------------------------------------------------
+
+app.get(
+  "/settings/sites/:siteId/patrol-points",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const siteId = Number(req.params.siteId);
+      const isSystemOwner = req.auth.role === "system_owner";
+
+      if (!Number.isInteger(siteId) || siteId <= 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "Invalid site ID",
+        });
+      }
+
+      const siteResult = await pool.query(
+        `
+        SELECT id
+        FROM sites
+        WHERE id = $1
+          AND (
+            $2::boolean = true
+            OR company_id = $3
+          )
+        `,
+        [
+          siteId,
+          isSystemOwner,
+          req.auth.company_id,
+        ]
+      );
+
+      if (siteResult.rows.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "Site not found",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          site_id,
+          point_name,
+          point_description,
+          (qr_token IS NOT NULL) AS qr_generated,
+          expected_interval_minutes,
+          active,
+          created_at
+        FROM patrol_points
+        WHERE site_id = $1
+          AND active = true
+        ORDER BY id ASC
+        `,
+        [siteId]
+      );
+
+      return res.json({
+        status: "ok",
+        points: result.rows,
+      });
+    } catch (err) {
+      console.error("Load patrol points error:", err);
+
+      return res.status(500).json({
+        status: "error",
+        message: "Failed to load patrol points",
+      });
+    }
+  }
+);
+
+app.get(
+  "/guard/patrols/board",
+  requireGuardAuth,
+  async (req, res) => {
+    try {
+      const guard_id = req.guard.guard_id;
+      const session_id = req.guard.session_id;
+
+      const sessionResult = await pool.query(
+      `
+      SELECT
+        gs.id AS session_id,
+        gs.guard_id,
+        gs.site_id,
+        s.company_id,
+        gs.login_time,
+        gs.logout_time,
+        gs.scheduled_shift_start,
+        gs.scheduled_shift_end,
+        gs.scheduled_shift_label,
+        g.full_name AS guard_name,
+        s.name AS site_name,
+        s.location AS site_location
+      FROM guard_sessions gs
+      LEFT JOIN guards g
+        ON g.id = gs.guard_id
+      LEFT JOIN sites s
+        ON s.id = gs.site_id
+      WHERE gs.id = $1
+        AND gs.guard_id = $2
+        AND gs.logout_time IS NULL
+      LIMIT 1
+      `,
+      [session_id, guard_id]
+    );
+
+    if (sessionResult.rows.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Active guard session not found",
+      });
+    }
+
+    const session = sessionResult.rows[0];
+    const companyTimezone = await getCompanyTimezone(session.company_id);
+
+    const boardResult = await pool.query(
+      `
+      WITH active_session AS (
+        SELECT
+          $1::int AS guard_id,
+          $2::int AS session_id,
+          $3::int AS site_id,
+          $5::timestamp AS scheduled_shift_start,
+          $6::timestamp AS scheduled_shift_end
+      ),
+
+      operational_window AS (
+        SELECT
+          CASE
+            WHEN scheduled_shift_start IS NOT NULL
+              AND scheduled_shift_end IS NOT NULL
+              AND scheduled_shift_end > scheduled_shift_start
+              THEN scheduled_shift_start
+            ELSE (NOW() AT TIME ZONE $4::text)::date::timestamp
+          END AS window_start,
+          CASE
+            WHEN scheduled_shift_start IS NOT NULL
+              AND scheduled_shift_end IS NOT NULL
+              AND scheduled_shift_end > scheduled_shift_start
+              THEN scheduled_shift_end
+            ELSE ((NOW() AT TIME ZONE $4::text)::date + INTERVAL '1 day')
+          END AS window_end,
+          (
+            scheduled_shift_start IS NOT NULL
+            AND scheduled_shift_end IS NOT NULL
+            AND scheduled_shift_end > scheduled_shift_start
+          ) AS has_scheduled_shift
+        FROM active_session
+      ),
+
+      recurring_slots AS (
+        SELECT
+          NULL::integer AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'recurring' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
+          gs.expected_slot AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        CROSS JOIN LATERAL (
+          SELECT
+            (
+              (ps.created_at AT TIME ZONE $4::text)::date
+              + ps.start_time
+            ) AS anchor_time
+        ) w
+
+        CROSS JOIN LATERAL generate_series(
+          w.anchor_time,
+          w.anchor_time + INTERVAL '365 days',
+          (ps.interval_hours || ' hours')::interval
+        ) AS gs(expected_slot)
+
+        WHERE ps.schedule_type = 'recurring'
+          AND ps.active = true
+          AND ps.site_id = (SELECT site_id FROM active_session)
+          AND ps.start_time IS NOT NULL
+          AND ps.interval_hours IS NOT NULL
+          AND gs.expected_slot >= (SELECT window_start FROM operational_window)
+          AND gs.expected_slot < (SELECT window_end FROM operational_window)
+      ),
+
+      manual_slots AS (
+        SELECT
+          ps.id AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'manual' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
+          (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        WHERE ps.schedule_type = 'manual'
+          AND ps.active = true
+          AND ps.site_id = (SELECT site_id FROM active_session)
+          AND (ps.scheduled_date::timestamp + ps.scheduled_time)
+            >= (SELECT window_start FROM operational_window)
+          AND (ps.scheduled_date::timestamp + ps.scheduled_time)
+            < (SELECT window_end FROM operational_window)
+      ),
+
+      random_slots AS (
+        SELECT
+          rpo.id AS schedule_instance_id,
+          rpo.id AS schedule_id,
+          'random' AS schedule_type,
+          rpo.site_id,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ${PATROL_TIMING.revealMinutesBefore}::int AS reminder_minutes_before,
+          rpo.scheduled_at
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN patrol_points pp
+          ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
+        WHERE rpo.site_id = (SELECT site_id FROM active_session)
+          AND rpo.company_id = $7::int
+          AND rpd.company_id = $7::int
+          AND rpo.scheduled_at >= (SELECT window_start FROM operational_window)
+          AND rpo.scheduled_at < (SELECT window_end FROM operational_window)
+          AND (NOW() AT TIME ZONE $4::text) >=
+            rpo.scheduled_at - INTERVAL '${PATROL_TIMING.revealMinutesBefore} minutes'
+      ),
+
+      patrol_items AS (
+        SELECT * FROM recurring_slots
+        UNION ALL
+        SELECT * FROM manual_slots
+        UNION ALL
+        SELECT * FROM random_slots
+      ),
+
+      enriched AS (
+        SELECT
+          pi.*,
+
+          (
+            pi.scheduled_at - INTERVAL '${PATROL_TIMING.scanOpenMinutesBefore} minutes'
+          ) AS scan_available_from,
+
+          CASE
+            WHEN ow.has_scheduled_shift
+              THEN LEAST(
+                pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                ow.window_end
+              )
+            ELSE pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS scan_available_until,
+
+          CASE
+            WHEN ow.has_scheduled_shift
+              THEN LEAST(
+                pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes',
+                ow.window_end
+              )
+            ELSE pi.scheduled_at + INTERVAL '${PATROL_TIMING.missedAfterMinutes} minutes'
+          END AS missed_at,
+
+          EXISTS (
+            SELECT 1
+            FROM patrol_logs pl
+            WHERE pl.site_id = pi.site_id
+              AND pl.point_id = pi.point_id
+              AND COALESCE(pl.schedule_type, pi.schedule_type) = pi.schedule_type
+              AND (
+                pi.schedule_type = 'manual'
+                AND pl.schedule_id = pi.schedule_id
+                OR
+                pi.schedule_type = 'recurring'
+                AND pl.scheduled_at = pi.scheduled_at
+                OR
+                pi.schedule_type = 'random'
+                AND pl.random_occurrence_id = pi.schedule_id
+              )
+          ) AS already_completed
+        FROM patrol_items pi
+        CROSS JOIN operational_window ow
+      )
+
+      SELECT
+        schedule_instance_id,
+        schedule_id,
+        schedule_type,
+        site_id,
+        point_id,
+        checkpoint,
+        reminder_minutes_before,
+        to_char(scheduled_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scheduled_at,
+        to_char(scan_available_from, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_from,
+        to_char(scan_available_until, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS scan_available_until,
+
+        CASE
+          WHEN already_completed = true
+            THEN 'completed'
+
+          WHEN (NOW() AT TIME ZONE $4::text) < scan_available_from
+            THEN 'scheduled'
+
+          WHEN (NOW() AT TIME ZONE $4::text) >= scan_available_from
+            AND (NOW() AT TIME ZONE $4::text) < scheduled_at
+            THEN 'due_soon'
+
+          WHEN (NOW() AT TIME ZONE $4::text) >= scheduled_at
+            AND (NOW() AT TIME ZONE $4::text) < missed_at
+            THEN 'overdue'
+
+          WHEN (NOW() AT TIME ZONE $4::text) >= missed_at
+            THEN 'missed'
+
+          ELSE 'scheduled'
+        END AS status,
+
+        CASE
+          WHEN already_completed = true THEN false
+          WHEN (NOW() AT TIME ZONE $4::text) >= scan_available_from
+            AND (NOW() AT TIME ZONE $4::text) < missed_at
+            THEN true
+          ELSE false
+        END AS scan_enabled,
+
+        FLOOR(
+          EXTRACT(
+            EPOCH FROM (
+              (NOW() AT TIME ZONE $4::text) - scheduled_at
+            )
+          ) / 60
+        )::int AS minutes_delta
+
+      FROM enriched
+
+      ORDER BY scheduled_at ASC, point_id ASC
+      `,
+      [
+        guard_id,
+        session_id,
+        session.site_id,
+        companyTimezone,
+        session.scheduled_shift_start,
+        session.scheduled_shift_end,
+        session.company_id,
+      ]
+    );
+
+    const completedResult = await pool.query(
+  `
+  SELECT
+    pl.id,
+    pl.site_id,
+    pl.point_id,
+    pp.point_name AS checkpoint,
+    COALESCE(pl.schedule_type, 'recurring') AS schedule_type,
+    pl.schedule_id,
+    pl.scheduled_at,
+    pl.patrol_time,
+    pl.delay_minutes,
+    pl.completion_status,
+    pl.was_missed,
+    pl.latitude,
+    pl.longitude,
+    pl.accuracy,
+    CASE
+      WHEN pl.completion_status = 'completed_late'
+        THEN 'completed_late'
+      ELSE 'completed'
+    END AS status,
+    false AS scan_enabled
+  FROM patrol_logs pl
+  LEFT JOIN patrol_points pp
+    ON pp.id = pl.point_id
+  WHERE pl.guard_id = $1
+    AND pl.site_id = $2
+    AND (
+      (
+        $3::timestamp IS NOT NULL
+        AND $4::timestamp IS NOT NULL
+        AND $4::timestamp > $3::timestamp
+        AND pl.scheduled_at >= $3::timestamp
+        AND pl.scheduled_at < $4::timestamp
+      )
+      OR
+      (
+        NOT (
+          $3::timestamp IS NOT NULL
+          AND $4::timestamp IS NOT NULL
+          AND $4::timestamp > $3::timestamp
+        )
+        AND pl.patrol_time >= NOW() - INTERVAL '24 hours'
+      )
+    )
+  ORDER BY pl.patrol_time DESC
+  LIMIT 20
+  `,
+  [
+    guard_id,
+    session.site_id,
+    session.scheduled_shift_start,
+    session.scheduled_shift_end,
+  ]
+);
+
+    res.json({
+      status: "ok",
+      guard: {
+        id: session.guard_id,
+        name: session.guard_name,
+      },
+      session: {
+        id: session.session_id,
+        site_id: session.site_id,
+        login_time: session.login_time,
+        scheduled_shift_start: session.scheduled_shift_start,
+        scheduled_shift_end: session.scheduled_shift_end,
+        scheduled_shift_label: session.scheduled_shift_label,
+      },
+      site: {
+        id: session.site_id,
+        name: session.site_name,
+        location: session.site_location,
+      },
+      patrols: boardResult.rows,
+      completed_patrols: completedResult.rows,
+    });
+  } catch (err) {
+    console.error("Guard patrol board error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to load guard patrol board",
+      detail: err.message,
+    });
+  }
+});
+
+// ==========================
+// Push Notifications
+// ==========================
+
+app.get("/push/vapid-public-key", (req, res) => {
+  res.json({
+    status: "ok",
+    publicKey: process.env.VAPID_PUBLIC_KEY,
+  });
+});
+
+app.post("/push/subscribe", requireGuardAuth, async (req, res) => {
+  try {
+    const {
+      subscription,
+      user_agent,
+      device_name,
+    } = req.body;
+
+    const {
+      guard_id,
+      session_id,
+      site_id,
+      access_mode,
+      access_expires_at,
+    } = req.guard;
+
+    if (!subscription) {
+      return res.status(400).json({
+        status: "error",
+        message: "subscription is required",
+      });
+    }
+
+    if (
+      !subscription.endpoint ||
+      !subscription.keys ||
+      !subscription.keys.p256dh ||
+      !subscription.keys.auth
+    ) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid push subscription payload",
+      });
+    }
+
+    if (
+  access_mode ===
+    ACCESS_MODE_READ_ONLY ||
+  isTemporaryAccessExpired(
+    access_expires_at
+  )
+) {
+  return res.status(403).json({
+    status: "error",
+    code: "READ_ONLY_ACCESS",
+    message:
+      "Push subscriptions are disabled for read-only access",
+  });
+}
+
+    const result = await pool.query(
+      `
+      INSERT INTO push_subscriptions (
+        guard_id,
+        session_id,
+        site_id,
+        endpoint,
+        p256dh,
+        auth,
+        user_agent,
+        device_name,
+        active,
+        created_at,
+        last_seen
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), NOW())
+      ON CONFLICT (endpoint)
+      DO UPDATE SET
+        guard_id = EXCLUDED.guard_id,
+        session_id = EXCLUDED.session_id,
+        site_id = EXCLUDED.site_id,
+        p256dh = EXCLUDED.p256dh,
+        auth = EXCLUDED.auth,
+        user_agent = EXCLUDED.user_agent,
+        device_name = EXCLUDED.device_name,
+        active = TRUE,
+        last_seen = NOW()
+      RETURNING id, guard_id, session_id, site_id, active, created_at, last_seen
+      `,
+      [
+        guard_id,
+        session_id,
+        site_id,
+        subscription.endpoint,
+        subscription.keys.p256dh,
+        subscription.keys.auth,
+        user_agent || req.headers["user-agent"] || null,
+        device_name || null,
+      ]
+    );
+
+    res.json({
+      status: "ok",
+      message: "Push subscription saved",
+      subscription: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Push subscribe error:", err);
+
+    res.status(500).json({
+      status: "error",
+      message: "Failed to save push subscription",
+      detail: err.message,
+    });
+  }
+});
+
+app.post("/push/unsubscribe", requireGuardAuth, async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    const { guard_id, session_id } = req.guard;
+
+    const result = await pool.query(
+      `
+      UPDATE push_subscriptions
+      SET active = FALSE, last_seen = NOW()
+      WHERE guard_id = $1
+        AND session_id = $2
+        AND active = TRUE
+        AND ($3::text IS NULL OR endpoint = $3)
+      RETURNING id
+      `,
+      [guard_id, session_id, endpoint || null]
+    );
+
+    return res.json({
+      status: "ok",
+      deactivated_count: result.rowCount,
+    });
+  } catch (err) {
+    console.error("Push unsubscribe error:", err);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to deactivate push subscription",
+      detail: err.message,
+    });
+  }
+});
+
+async function sendPushNotificationToGuard({
+  guardId,
+  sessionId,
+  siteId,
+  payload,
+  ttlSeconds = 900,
+}) {
+  const subscriptions = await pool.query(
+    `
+    SELECT ps.*, s.company_id
+    FROM push_subscriptions ps
+    JOIN guard_sessions gs
+      ON gs.id = ps.session_id
+      AND gs.guard_id = ps.guard_id
+      AND gs.site_id = ps.site_id
+    JOIN sites s ON s.id = ps.site_id
+    WHERE ps.guard_id = $1
+      AND ps.session_id = $2
+      AND ps.site_id = $3
+      AND ps.active = TRUE
+      AND gs.logout_time IS NULL
+      AND (
+        gs.scheduled_shift_end IS NULL
+        OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+           > (NOW() AT TIME ZONE 'Europe/Athens')
+      )
+    `,
+    [guardId, sessionId, siteId]
+  );
+
+  if (subscriptions.rows.length === 0) {
+    return {
+      status: "no_subscriptions",
+      sent: [],
+    };
+  }
+
+  const results = [];
+
+  for (const sub of subscriptions.rows) {
+    try {
+      await webpush.sendNotification(
+        {
+          endpoint: sub.endpoint,
+          keys: {
+            p256dh: sub.p256dh,
+            auth: sub.auth,
+          },
+        },
+        JSON.stringify(payload),
+        {
+          TTL: ttlSeconds,
+          urgency: "high",
+        }
+      );
+
+      results.push({
+        subscription_id: sub.id,
+        success: true,
+      });
+    } catch (err) {
+      console.error("Push send error:", err);
+
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        await pool.query(
+          `UPDATE push_subscriptions
+           SET active = FALSE, last_seen = NOW()
+           WHERE id = $1`,
+          [sub.id]
+        );
+      }
+
+      results.push({
+        subscription_id: sub.id,
+        success: false,
+        error: err.message,
+      });
+    }
+  }
+
+  const resultsByCompany = new Map();
+  subscriptions.rows.forEach((sub, index) => {
+    const companyId = Number(sub.company_id);
+    const current = resultsByCompany.get(companyId) || {
+      sentCount: 0,
+      failedCount: 0,
+      error: null,
+    };
+    if (results[index]?.success) {
+      current.sentCount += 1;
+    } else {
+      current.failedCount += 1;
+      current.error = results[index]?.error || current.error;
+    }
+    resultsByCompany.set(companyId, current);
+  });
+
+  for (const [companyId, delivery] of resultsByCompany) {
+    await systemStatusService
+      .recordTenantPush(companyId, delivery)
+      .catch((err) => console.error("Push health telemetry error:", err));
+  }
+
+  return {
+    status: "ok",
+    sent: results,
+    sent_count: results.filter((result) => result.success).length,
+    failed_count: results.filter((result) => !result.success).length,
+  };
+}
+
+async function sendPatrolReminderPushIfNeeded({
+  guardId,
+  sessionId,
+  siteId,
+  scheduleId,
+  scheduleType,
+  scheduledAt,
+  checkpoint,
+  siteName,
+  reminderAt,
+}) {
+  const notificationType = "patrol_reminder";
+
+  const existing = await pool.query(
+    `
+    SELECT id
+    FROM patrol_push_notifications
+    WHERE guard_id = $1
+      AND site_id = $2
+      AND schedule_id = $3
+      AND schedule_type = $4
+      AND scheduled_at = $5::timestamp
+      AND notification_type = $6
+    LIMIT 1
+    `,
+    [
+      guardId,
+      siteId,
+      scheduleId,
+      scheduleType,
+      scheduledAt,
+      notificationType,
+    ]
+  );
+
+  if (existing.rows.length > 0) {
+    return {
+      status: "already_sent",
+    };
+  }
+
+  const payload = {
+  title: "Patrol Reminder",
+  body: `${siteName || "Site"} · ${checkpoint || "Checkpoint"}\nPatrol scheduled in 15 minutes.`,
+  url: "patrol.html",
+  schedule_id: scheduleId,
+  schedule_type: scheduleType,
+  scheduled_at: scheduledAt,
+};
+
+  const pushResult = await sendPushNotificationToGuard({
+    guardId,
+    sessionId,
+    siteId,
+    payload,
+    ttlSeconds: 900,
+  });
+
+  if ((pushResult.sent_count || 0) === 0) {
+    return { status: "not_delivered", pushResult };
+  }
+
+  await pool.query(
+    `
+    INSERT INTO patrol_push_notifications (
+      guard_id,
+      session_id,
+      site_id,
+      schedule_id,
+      schedule_type,
+      scheduled_at,
+      notification_type,
+      sent_at,
+      created_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6::timestamp, $7, NOW(), NOW())
+    ON CONFLICT (
+      guard_id,
+      site_id,
+      schedule_id,
+      schedule_type,
+      scheduled_at,
+      notification_type
+    )
+    DO NOTHING
+    `,
+    [
+      guardId,
+      sessionId,
+      siteId,
+      scheduleId,
+      scheduleType,
+      scheduledAt,
+      notificationType,
+    ]
+  );
+
+  return {
+    status: "sent",
+    pushResult,
+  };
+}
+
+let patrolPushSchedulerRunning = false;
+
+async function runPatrolPushScheduler() {
+  if (patrolPushSchedulerRunning) {
+    return;
+  }
+
+  patrolPushSchedulerRunning = true;
+  const runStartedAt = Date.now();
+  let duePatrols = 0;
+  let delivered = 0;
+  let failed = 0;
+
+  try {
+    const dueSoonResult = await pool.query(
+      `
+      WITH active_sessions AS (
+        SELECT DISTINCT ON (gs.guard_id, gs.site_id)
+          gs.id AS session_id,
+          gs.guard_id,
+          gs.site_id,
+          gs.scheduled_shift_start,
+          gs.scheduled_shift_end,
+          s.name AS site_name,
+          s.company_id,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone
+        FROM guard_sessions gs
+INNER JOIN guards g
+  ON g.id = gs.guard_id
+LEFT JOIN sites s
+  ON s.id = gs.site_id
+LEFT JOIN companies c
+  ON c.id = s.company_id
+WHERE gs.logout_time IS NULL
+  AND g.access_mode = 'standard'
+  AND (
+    gs.scheduled_shift_end IS NULL
+    OR gs.scheduled_shift_end + INTERVAL '15 minutes'
+       > (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
+  )
+ORDER BY
+  gs.guard_id,
+  gs.site_id,
+  gs.last_heartbeat DESC,
+  gs.id DESC
+      ),
+
+      recurring_slots AS (
+        SELECT
+          NULL::integer AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'recurring' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone,
+          gs.expected_slot AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        INNER JOIN sites s ON s.id = ps.site_id
+        INNER JOIN companies c ON c.id = s.company_id
+
+        CROSS JOIN LATERAL (
+          SELECT
+            (
+              (ps.created_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+              + ps.start_time
+            ) AS anchor_time,
+            (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date AS day_start,
+            ((NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date + INTERVAL '1 day') AS day_end
+        ) w
+
+        CROSS JOIN LATERAL generate_series(
+          w.anchor_time,
+          w.anchor_time + INTERVAL '365 days',
+          (ps.interval_hours || ' hours')::interval
+        ) AS gs(expected_slot)
+
+        WHERE ps.schedule_type = 'recurring'
+          AND ps.active = true
+          AND ps.start_time IS NOT NULL
+          AND ps.interval_hours IS NOT NULL
+          AND gs.expected_slot >= w.day_start
+          AND gs.expected_slot < w.day_end
+      ),
+
+      manual_slots AS (
+        SELECT
+          ps.id AS schedule_instance_id,
+          ps.id AS schedule_id,
+          'manual' AS schedule_type,
+          ps.site_id,
+          ps.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ps.reminder_minutes_before,
+          COALESCE(c.timezone, 'Europe/Athens') AS timezone,
+          (ps.scheduled_date::timestamp + ps.scheduled_time) AS scheduled_at
+        FROM patrol_schedules ps
+
+        JOIN patrol_points pp
+          ON pp.id = ps.patrol_point_id
+          AND pp.active = true
+
+        INNER JOIN sites s ON s.id = ps.site_id
+        INNER JOIN companies c ON c.id = s.company_id
+
+        WHERE ps.schedule_type = 'manual'
+          AND ps.active = true
+          AND ps.scheduled_date = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+      ),
+
+      random_slots AS (
+        SELECT
+          rpo.id AS schedule_instance_id,
+          rpo.id AS schedule_id,
+          'random' AS schedule_type,
+          rpo.site_id,
+          rpo.patrol_point_id AS point_id,
+          pp.point_name AS checkpoint,
+          ${PATROL_TIMING.revealMinutesBefore}::int AS reminder_minutes_before,
+          rpd.timezone,
+          rpo.scheduled_at
+        FROM random_patrol_occurrences rpo
+        INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
+        INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
+        WHERE rpd.local_date = (NOW() AT TIME ZONE rpd.timezone)::date
+      ),
+
+      patrol_items AS (
+        SELECT * FROM recurring_slots
+        UNION ALL
+        SELECT * FROM manual_slots
+        UNION ALL
+        SELECT * FROM random_slots
+      ),
+
+      enriched AS (
+        SELECT
+          pi.*,
+          pi.scheduled_at - INTERVAL '${PATROL_TIMING.revealMinutesBefore} minutes' AS reminder_at
+        FROM patrol_items pi
+      )
+
+      SELECT
+        e.schedule_id,
+        e.schedule_type,
+        e.site_id,
+        e.point_id,
+        e.checkpoint,
+        e.reminder_minutes_before,
+        e.scheduled_at,
+        e.reminder_at,
+        active_sessions.guard_id,
+        active_sessions.session_id,
+        active_sessions.site_name
+      FROM enriched e
+
+      JOIN active_sessions
+        ON active_sessions.site_id = e.site_id
+        AND (
+          active_sessions.scheduled_shift_start IS NULL
+          OR active_sessions.scheduled_shift_end IS NULL
+          OR active_sessions.scheduled_shift_end
+            <= active_sessions.scheduled_shift_start
+          OR (
+            e.scheduled_at >= active_sessions.scheduled_shift_start
             AND e.scheduled_at < active_sessions.scheduled_shift_end
           )
         )
