@@ -2068,14 +2068,14 @@ if (
       SELECT
         $1,
         $2,
-        $3,
+        $3::text,
         $4,
         $5,
         NOW(),
         NOW(),
         true
       FROM company_gate
-      WHERE $3 = 'system_owner'
+      WHERE $3::text = 'system_owner'
          OR company_gate.status IN ('active', 'pilot')
       RETURNING
         id,
