@@ -82,3 +82,39 @@ test("random generation is idempotent and preserves tenant/site/point scope", as
     assert.equal(params[3], configuration.patrol_point_id);
   }
 });
+
+test("same-day company reactivation generates only future random patrols", async () => {
+  const occurrences = [];
+  let generationType = null;
+  const configuration = {
+    company_id: 41,
+    site_id: 52,
+    patrol_point_id: 63,
+    patrols_per_day: 3,
+    timezone: "Europe/Athens",
+    local_date: "2026-09-22",
+    reactivation_current_minute: 600,
+    current_second: 0,
+  };
+  const client = {
+    async query(sql, params = []) {
+      if (/INSERT INTO random_patrol_days/.test(sql)) {
+        generationType = params[6];
+        return { rows: [{ id: 701 }] };
+      }
+      if (/INSERT INTO random_patrol_occurrences/.test(sql)) occurrences.push(params);
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = {
+    async query() { return { rows: [configuration] }; },
+    async connect() { return client; },
+  };
+
+  const result = await generateRandomPatrolsForCurrentLocalDay(pool);
+  assert.equal(result.generated_days, 1);
+  assert.equal(generationType, "partial_reactivation");
+  assert.equal(occurrences.length, 3);
+  assert.ok(occurrences.every((params) => Number(params[6]) >= 616));
+});

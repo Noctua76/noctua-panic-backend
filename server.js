@@ -255,9 +255,30 @@ to_char(
     JOIN sites s
       ON s.id = oe.site_id
 
+    JOIN companies c
+      ON c.id = s.company_id
+      AND c.status IN ('active', 'pilot')
+
+    LEFT JOIN LATERAL (
+      SELECT csa.changed_at
+      FROM company_status_audit_events csa
+      WHERE csa.company_id = c.id
+        AND csa.previous_status = 'inactive'
+        AND csa.new_status IN ('active', 'pilot')
+      ORDER BY csa.changed_at DESC
+      LIMIT 1
+    ) resumed ON TRUE
+
     WHERE oe.event_type = 'SHIFT_DELAY'
       AND oe.event_status = 'open'
       AND oe.email_status = 'pending'
+      AND ss.scheduled_end > (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))
+      AND (
+        resumed.changed_at IS NULL
+        OR ss.scheduled_start >= (
+          resumed.changed_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')
+        )
+      )
 
     ORDER BY oe.detected_at ASC
   `);
@@ -2029,6 +2050,12 @@ if (
 
     const sessionResult = await pool.query(
       `
+      WITH company_gate AS (
+        SELECT login_company.status
+        FROM companies login_company
+        WHERE login_company.id = $4
+        FOR SHARE
+      )
       INSERT INTO admin_sessions (
         user_id,
         username,
@@ -2039,7 +2066,7 @@ if (
         last_seen,
         is_active
       )
-      VALUES (
+      SELECT
         $1,
         $2,
         $3,
@@ -2048,7 +2075,9 @@ if (
         NOW(),
         NOW(),
         true
-      )
+      FROM company_gate
+      WHERE $3 = 'system_owner'
+         OR company_gate.status IN ('active', 'pilot')
       RETURNING
         id,
         user_id,
@@ -2068,6 +2097,14 @@ if (
         sessionToken,
       ]
     );
+
+    if (sessionResult.rows.length === 0) {
+      return res.status(403).json({
+        status: "error",
+        code: "COMPANY_INACTIVE",
+        message: "Company account is not active",
+      });
+    }
 
     const session = sessionResult.rows[0];
 
@@ -2423,12 +2460,15 @@ g.role,
 g.access_mode,
 g.temporary_access_started_at,
 g.access_expires_at,
-g.temporary_access_expiry_reason
+g.temporary_access_expiry_reason,
+c.status AS company_status
   FROM guard_sessions gs
   JOIN guards g
     ON g.id = gs.guard_id
   JOIN sites s
     ON s.id = gs.site_id
+  JOIN companies c
+    ON c.id = s.company_id
   WHERE
     gs.session_token = $1
     AND gs.logout_time IS NULL
@@ -2452,6 +2492,14 @@ g.temporary_access_expiry_reason
     }
 
     const guardAuth = result.rows[0];
+
+if (!["active", "pilot"].includes(guardAuth.company_status)) {
+  return res.status(403).json({
+    status: "error",
+    code: "COMPANY_INACTIVE",
+    message: "Company account is not active",
+  });
+}
 
 if (
   guardAuth.temporary_access_expiry_reason ||
@@ -3535,9 +3583,21 @@ function getScheduledShiftFromRules(shiftRules, date = new Date()) {
 async function generateScheduledShiftsForSite(siteId, targetDate) {
   const siteResult = await pool.query(
     `
-    SELECT id, shift_rules
-    FROM sites
-    WHERE id = $1
+    SELECT s.id, s.shift_rules, c.status AS company_status,
+           COALESCE(c.timezone, 'Europe/Athens') AS timezone,
+           resumed.changed_at AS operational_resumed_at
+    FROM sites s
+    JOIN companies c ON c.id = s.company_id
+    LEFT JOIN LATERAL (
+      SELECT csa.changed_at
+      FROM company_status_audit_events csa
+      WHERE csa.company_id = c.id
+        AND csa.previous_status = 'inactive'
+        AND csa.new_status IN ('active', 'pilot')
+      ORDER BY csa.changed_at DESC
+      LIMIT 1
+    ) resumed ON TRUE
+    WHERE s.id = $1
     `,
     [siteId]
   );
@@ -3547,6 +3607,9 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
   }
 
   const site = siteResult.rows[0];
+  if (!["active", "pilot"].includes(site.company_status)) {
+    return [];
+  }
   const rules =
     typeof site.shift_rules === "string"
       ? JSON.parse(site.shift_rules || "{}")
@@ -3599,9 +3662,20 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
           AND scheduled_start = $2
           AND scheduled_end = $3
       )
+        AND (
+          $5::timestamptz IS NULL
+          OR $2::timestamp >= ($5::timestamptz AT TIME ZONE $6::text)
+        )
       RETURNING *
       `,
-      [siteId, scheduledStart, scheduledEnd, shiftLabel]
+      [
+        siteId,
+        scheduledStart,
+        scheduledEnd,
+        shiftLabel,
+        site.operational_resumed_at || null,
+        site.timezone,
+      ]
     );
 
     if (result.rows.length > 0) {
@@ -3614,8 +3688,10 @@ async function generateScheduledShiftsForSite(siteId, targetDate) {
 
 async function generateScheduledShiftsForAllSites(targetDate) {
   const sites = await pool.query(`
-    SELECT id
-    FROM sites
+    SELECT s.id
+    FROM sites s
+    JOIN companies c ON c.id = s.company_id
+    WHERE c.status IN ('active', 'pilot')
   `);
 
   console.log("[SHIFT GENERATOR] Found", sites.rows.length, "sites");
@@ -3717,11 +3793,31 @@ async function detectShiftDelayEvents() {
       NOW(),
       'pending'
     FROM scheduled_shifts ss
+    JOIN sites delay_site ON delay_site.id = ss.site_id
+    JOIN companies delay_company
+      ON delay_company.id = delay_site.company_id
+      AND delay_company.status IN ('active', 'pilot')
+    LEFT JOIN LATERAL (
+      SELECT csa.changed_at
+      FROM company_status_audit_events csa
+      WHERE csa.company_id = delay_company.id
+        AND csa.previous_status = 'inactive'
+        AND csa.new_status IN ('active', 'pilot')
+      ORDER BY csa.changed_at DESC
+      LIMIT 1
+    ) resumed ON TRUE
     WHERE ss.scheduled_start + INTERVAL '15 minutes'
           <= (NOW() AT TIME ZONE 'Europe/Athens')
 
       AND ss.scheduled_end >
           (NOW() AT TIME ZONE 'Europe/Athens')
+
+      AND (
+        resumed.changed_at IS NULL
+        OR ss.scheduled_start >= (
+          resumed.changed_at AT TIME ZONE COALESCE(delay_company.timezone, 'Europe/Athens')
+        )
+      )
 
       AND NOT EXISTS (
   SELECT 1
@@ -4230,9 +4326,11 @@ app.post("/guard/login", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT *
-      FROM guards
-      WHERE username = $1
+      SELECT g.*, s.company_id, c.status AS company_status
+      FROM guards g
+      JOIN sites s ON s.id = g.site_id
+      JOIN companies c ON c.id = s.company_id
+      WHERE g.username = $1
       `,
       [username]
     );
@@ -4281,6 +4379,14 @@ app.post("/guard/login", async (req, res) => {
       return res.status(403).json({
         status: "error",
         message: "Guard account is inactive",
+      });
+    }
+
+    if (!["active", "pilot"].includes(guard.company_status)) {
+      return res.status(403).json({
+        status: "error",
+        code: "COMPANY_INACTIVE",
+        message: "Company account is not active",
       });
     }
 
@@ -4398,6 +4504,13 @@ const scheduledShift =
 
     const sessionResult = await pool.query(
       `
+      WITH company_gate AS (
+        SELECT login_company.status
+        FROM sites login_site
+        JOIN companies login_company ON login_company.id = login_site.company_id
+        WHERE login_site.id = $2
+        FOR SHARE OF login_company
+      )
       INSERT INTO guard_sessions (
     guard_id,
     site_id,
@@ -4412,7 +4525,7 @@ const scheduledShift =
     scheduled_shift_end,
     scheduled_shift_label
   )
-  VALUES (
+  SELECT
   $1,
   $2,
   (NOW() AT TIME ZONE 'Europe/Athens'),
@@ -4425,7 +4538,8 @@ const scheduledShift =
   $6::timestamp,
   $7::timestamp,
   $8
-)
+  FROM company_gate
+  WHERE company_gate.status IN ('active', 'pilot')
   RETURNING *
   `,
   [
@@ -4439,6 +4553,14 @@ const scheduledShift =
   scheduledShift?.label || null
 ]
 );
+
+if (sessionResult.rows.length === 0) {
+  return res.status(403).json({
+    status: "error",
+    code: "COMPANY_INACTIVE",
+    message: "Company account is not active",
+  });
+}
 
 console.log("NEW SESSION:", sessionResult.rows[0]);
 
@@ -4514,14 +4636,23 @@ app.post("/guard/change-password", async (req, res) => {
 
     await client.query("BEGIN");
     const result = await client.query(
-      `SELECT g.*, s.company_id
+      `SELECT g.*, s.company_id, c.status AS company_status
        FROM guards g
        INNER JOIN sites s ON s.id = g.site_id
+       INNER JOIN companies c ON c.id = s.company_id
        WHERE g.id = $1
        FOR UPDATE OF g`,
       [parsedToken.guardId]
     );
     const guard = result.rows[0];
+    if (!guard || !["active", "pilot"].includes(guard.company_status)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        status: "error",
+        code: "COMPANY_INACTIVE",
+        message: "Company account is not active",
+      });
+    }
     const credentialState = evaluatePasswordChangeCredential(
       guard,
       parsedToken.secret
@@ -10628,6 +10759,9 @@ async function sendPushNotificationToGuard({
       AND gs.guard_id = ps.guard_id
       AND gs.site_id = ps.site_id
     JOIN sites s ON s.id = ps.site_id
+    JOIN companies c
+      ON c.id = s.company_id
+      AND c.status IN ('active', 'pilot')
     WHERE ps.guard_id = $1
       AND ps.session_id = $2
       AND ps.site_id = $3
@@ -10861,6 +10995,7 @@ LEFT JOIN companies c
   ON c.id = s.company_id
 WHERE gs.logout_time IS NULL
   AND g.access_mode = 'standard'
+  AND c.status IN ('active', 'pilot')
   AND (
     gs.scheduled_shift_end IS NULL
     OR gs.scheduled_shift_end + INTERVAL '15 minutes'
@@ -10910,6 +11045,7 @@ ORDER BY
         ) AS gs(expected_slot)
 
         WHERE ps.schedule_type = 'recurring'
+          AND c.status IN ('active', 'pilot')
           AND ps.active = true
           AND ps.start_time IS NOT NULL
           AND ps.interval_hours IS NOT NULL
@@ -10938,6 +11074,7 @@ ORDER BY
         INNER JOIN companies c ON c.id = s.company_id
 
         WHERE ps.schedule_type = 'manual'
+          AND c.status IN ('active', 'pilot')
           AND ps.active = true
           AND ps.scheduled_date = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
       ),
@@ -10956,6 +11093,7 @@ ORDER BY
         FROM random_patrol_occurrences rpo
         INNER JOIN random_patrol_days rpd ON rpd.id = rpo.random_patrol_day_id
         INNER JOIN patrol_points pp ON pp.id = rpo.patrol_point_id AND pp.active = TRUE
+        INNER JOIN companies c ON c.id = rpo.company_id AND c.status IN ('active', 'pilot')
         WHERE rpd.local_date = (NOW() AT TIME ZONE rpd.timezone)::date
       ),
 

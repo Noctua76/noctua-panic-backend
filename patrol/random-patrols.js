@@ -86,9 +86,29 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
       rpc.patrol_point_id,
       rpc.patrols_per_day,
       COALESCE(c.timezone, 'Europe/Athens') AS timezone,
-      (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date AS local_date
+      (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date AS local_date,
+      CASE
+        WHEN resumed.changed_at IS NOT NULL
+         AND (resumed.changed_at AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+             = (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
+        THEN (
+          EXTRACT(HOUR FROM (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')))::int * 60
+          + EXTRACT(MINUTE FROM (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')))::int
+        )::int
+        ELSE NULL
+      END AS reactivation_current_minute,
+      EXTRACT(SECOND FROM (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')))::int AS current_second
     FROM random_patrol_configurations rpc
     INNER JOIN companies c ON c.id = rpc.company_id
+    LEFT JOIN LATERAL (
+      SELECT csa.changed_at
+      FROM company_status_audit_events csa
+      WHERE csa.company_id = c.id
+        AND csa.previous_status = 'inactive'
+        AND csa.new_status IN ('active', 'pilot')
+      ORDER BY csa.changed_at DESC
+      LIMIT 1
+    ) resumed ON TRUE
     INNER JOIN sites s
       ON s.id = rpc.site_id
       AND s.company_id = rpc.company_id
@@ -97,6 +117,7 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
       AND pp.site_id = rpc.site_id
       AND pp.active = TRUE
     WHERE rpc.enabled = TRUE
+      AND c.status IN ('active', 'pilot')
       AND rpc.effective_from_date <=
         (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::date
       AND (NOW() AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens'))::time
@@ -108,12 +129,21 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const minuteOffsets = generateRandomMinuteOffsets(configuration.patrols_per_day);
+      const isSameDayReactivation =
+        configuration.reactivation_current_minute !== null &&
+        configuration.reactivation_current_minute !== undefined;
+      const minuteOffsets = isSameDayReactivation
+        ? generatePartialDayMinuteOffsets({
+          currentMinute: Number(configuration.reactivation_current_minute),
+          currentSecond: Number(configuration.current_second),
+          maxCount: configuration.patrols_per_day,
+        })
+        : generateRandomMinuteOffsets(configuration.patrols_per_day);
       const generated = await createRandomPatrolDay(
         client,
         configuration,
         minuteOffsets,
-        "full_day"
+        isSameDayReactivation ? "partial_reactivation" : "full_day"
       );
       await client.query("COMMIT");
       if (generated.created) generatedDays += 1;

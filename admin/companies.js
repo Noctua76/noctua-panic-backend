@@ -208,6 +208,121 @@ async function createCompanyWithAdministrator({
   }
 }
 
+async function changeCompanyStatus({ pool, companyId, newStatus, actorUserId }) {
+  const parsedCompanyId = Number(companyId);
+  if (!Number.isInteger(parsedCompanyId) || parsedCompanyId <= 0) {
+    throw new CompanyOnboardingError("COMPANY_ID_INVALID", "Invalid company id");
+  }
+  if (!COMPANY_STATUSES.has(newStatus)) {
+    throw new CompanyOnboardingError("COMPANY_STATUS_INVALID", "Invalid company status");
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const currentResult = await client.query(
+      `SELECT id, name, status, timezone
+         FROM companies
+        WHERE id = $1
+        FOR UPDATE`,
+      [parsedCompanyId]
+    );
+    const company = currentResult.rows[0];
+    if (!company) {
+      throw new CompanyOnboardingError("COMPANY_NOT_FOUND", "Company not found", 404);
+    }
+
+    if (company.status === newStatus) {
+      await client.query("COMMIT");
+      return {
+        company,
+        previous_status: company.status,
+        new_status: newStatus,
+        changed: false,
+        shutdown: { dashboard_sessions: 0, guard_sessions: 0, push_subscriptions: 0 },
+      };
+    }
+
+    const updatedResult = await client.query(
+      `UPDATE companies
+          SET status = $1
+        WHERE id = $2
+        RETURNING id, name, status, timezone`,
+      [newStatus, parsedCompanyId]
+    );
+    const shutdown = { dashboard_sessions: 0, guard_sessions: 0, push_subscriptions: 0 };
+
+    if (newStatus === "inactive") {
+      const dashboardSessions = await client.query(
+        `UPDATE admin_sessions ads
+            SET is_active = FALSE,
+                logout_time = COALESCE(ads.logout_time, NOW()),
+                session_duration_seconds = COALESCE(
+                  ads.session_duration_seconds,
+                  GREATEST(0, EXTRACT(EPOCH FROM (NOW() - ads.login_time))::int)
+                ),
+                session_end_reason = COALESCE(ads.session_end_reason, 'company_inactive')
+           FROM users u
+          WHERE u.id = ads.user_id
+            AND u.company_id = $1
+            AND u.role <> 'system_owner'
+            AND ads.is_active = TRUE
+          RETURNING ads.id`,
+        [parsedCompanyId]
+      );
+      shutdown.dashboard_sessions = dashboardSessions.rowCount;
+
+      const guardSessions = await client.query(
+        `UPDATE guard_sessions gs
+            SET logout_time = COALESCE(gs.logout_time, NOW() AT TIME ZONE 'Europe/Athens'),
+                last_heartbeat = NOW() AT TIME ZONE 'Europe/Athens',
+                status = 'company_inactive'
+           FROM guards g, sites s
+          WHERE g.id = gs.guard_id
+            AND s.id = gs.site_id
+            AND s.company_id = $1
+            AND gs.logout_time IS NULL
+          RETURNING gs.id`,
+        [parsedCompanyId]
+      );
+      shutdown.guard_sessions = guardSessions.rowCount;
+
+      const pushSubscriptions = await client.query(
+        `UPDATE push_subscriptions ps
+            SET active = FALSE, last_seen = NOW()
+           FROM sites s
+          WHERE s.id = ps.site_id
+            AND s.company_id = $1
+            AND ps.active = TRUE
+          RETURNING ps.id`,
+        [parsedCompanyId]
+      );
+      shutdown.push_subscriptions = pushSubscriptions.rowCount;
+    }
+
+    await client.query(
+      `INSERT INTO company_status_audit_events
+         (company_id, previous_status, new_status, changed_by, changed_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [parsedCompanyId, company.status, newStatus, actorUserId]
+    );
+    await client.query("COMMIT");
+
+    return {
+      company: updatedResult.rows[0],
+      previous_status: company.status,
+      new_status: newStatus,
+      changed: true,
+      shutdown,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 function createCompaniesRouter({ pool, hashPassword, generateTemporaryPassword }) {
   const router = express.Router();
 
@@ -247,12 +362,32 @@ function createCompaniesRouter({ pool, hashPassword, generateTemporaryPassword }
     }
   });
 
+  router.put("/:id/status", async (req, res) => {
+    try {
+      const result = await changeCompanyStatus({
+        pool,
+        companyId: req.params.id,
+        newStatus: req.body?.status,
+        actorUserId: req.auth.user_id,
+      });
+      return res.json({ status: "ok", ...result });
+    } catch (error) {
+      console.error("Change company status error:", error);
+      return res.status(error.status || 500).json({
+        status: "error",
+        code: error.code || "COMPANY_STATUS_CHANGE_FAILED",
+        message: error.message,
+      });
+    }
+  });
+
   return router;
 }
 
 module.exports = {
   COMPANY_STATUSES,
   CompanyOnboardingError,
+  changeCompanyStatus,
   createCompaniesRouter,
   createCompanyWithAdministrator,
   inspectCompaniesSchema,

@@ -13,6 +13,7 @@ const MIGRATIONS = [
   "2026-09-23-dashboard-rbac-corrections.sql",
   "2026-09-24-dashboard-password-reset-sessions.sql",
   "2026-09-25-temporary-preview-rbac.sql",
+  "2026-09-26-company-status-lifecycle.sql",
 ];
 
 async function runMigrations(pool) {
