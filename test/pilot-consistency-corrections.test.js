@@ -6,7 +6,10 @@ const {
   INCIDENT_RESOLVED_RECENT_HOURS,
   isResolvedIncidentRecent,
 } = require("../incident-timeline");
-const { shouldReverseGeocodeLocation } = require("../guard-location");
+const {
+  parseGuardCoordinates,
+  shouldReverseGeocodeLocation,
+} = require("../guard-location");
 
 const serverSource = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
 const systemStatusSource = fs.readFileSync(
@@ -95,4 +98,18 @@ test("live Guard locations remain tenant scoped", () => {
 
   assert.match(route, /\$1::boolean = true\s*OR s\.company_id = \$2/);
   assert.match(route, /req\.auth\.company_id/);
+});
+
+test("Guard coordinates accept zero and reject missing or non-finite values", () => {
+  assert.deepEqual(parseGuardCoordinates(0, 0), { latitude: 0, longitude: 0 });
+  assert.deepEqual(parseGuardCoordinates("0", "23.75"), {
+    latitude: 0,
+    longitude: 23.75,
+  });
+  assert.equal(parseGuardCoordinates(null, 23.75), null);
+  assert.equal(parseGuardCoordinates(38, undefined), null);
+  assert.equal(parseGuardCoordinates("", 23.75), null);
+  assert.equal(parseGuardCoordinates(38, "   "), null);
+  assert.equal(parseGuardCoordinates("invalid", 23.75), null);
+  assert.equal(parseGuardCoordinates(Number.POSITIVE_INFINITY, 23.75), null);
 });

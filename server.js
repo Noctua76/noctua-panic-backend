@@ -50,6 +50,7 @@ const { createCompaniesRouter } = require("./admin/companies");
 const { INCIDENT_RESOLVED_RECENT_HOURS } = require("./incident-timeline");
 const {
   GUARD_LOCATION_UPDATE_SQL,
+  parseGuardCoordinates,
   shouldReverseGeocodeLocation,
 } = require("./guard-location");
 
@@ -13048,12 +13049,20 @@ app.post("/guard/location", requireGuardAuth, async (req, res) => {
 
 const { guard_id, session_id } = req.guard;
 
-    if (!guard_id || !session_id || !latitude || !longitude) {
+    const coordinates = parseGuardCoordinates(latitude, longitude);
+
+    if (
+      !guard_id
+      || !session_id
+      || !coordinates
+    ) {
   return res.status(400).json({
     status: "error",
     message: "guard_id, session_id, latitude and longitude are required"
   });
 }
+
+const { latitude: parsedLatitude, longitude: parsedLongitude } = coordinates;
 
 const previousLocationResult = await pool.query(
   `
@@ -13082,14 +13091,14 @@ const needsReverseGeocoding = shouldReverseGeocodeLocation({
   previousAccuracy: previousLocation.last_location_accuracy,
   previousAddress: previousLocation.last_location_address,
   previousGeocodedAt: previousLocation.last_reverse_geocode_at,
-  latitude,
-  longitude,
+  latitude: parsedLatitude,
+  longitude: parsedLongitude,
   accuracy,
 });
 
 if (needsReverseGeocoding) {
   try {
-    locationAddress = await reverseGeocode(latitude, longitude);
+    locationAddress = await reverseGeocode(parsedLatitude, parsedLongitude);
   } catch (geoErr) {
     console.error("Reverse geocoding skipped:", geoErr);
     locationAddress = null;
@@ -13097,8 +13106,8 @@ if (needsReverseGeocoding) {
 }
 
     await pool.query(GUARD_LOCATION_UPDATE_SQL, [
-    latitude,
-    longitude,
+    parsedLatitude,
+    parsedLongitude,
     accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
     speed || null,
     battery || null,

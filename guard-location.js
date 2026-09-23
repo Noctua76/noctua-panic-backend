@@ -32,6 +32,28 @@ function validCoordinate(value) {
   return Number.isFinite(Number(value));
 }
 
+function parseGuardCoordinates(latitude, longitude) {
+  if (
+    latitude === null
+    || latitude === undefined
+    || longitude === null
+    || longitude === undefined
+    || (typeof latitude === "string" && latitude.trim() === "")
+    || (typeof longitude === "string" && longitude.trim() === "")
+  ) {
+    return null;
+  }
+
+  const parsedLatitude = Number(latitude);
+  const parsedLongitude = Number(longitude);
+
+  if (!Number.isFinite(parsedLatitude) || !Number.isFinite(parsedLongitude)) {
+    return null;
+  }
+
+  return { latitude: parsedLatitude, longitude: parsedLongitude };
+}
+
 function distanceMeters(latitudeA, longitudeA, latitudeB, longitudeB) {
   if (![latitudeA, longitudeA, latitudeB, longitudeB].every(validCoordinate)) {
     return Number.POSITIVE_INFINITY;
@@ -92,5 +114,6 @@ module.exports = {
   REVERSE_GEOCODE_MIN_DISTANCE_METERS,
   REVERSE_GEOCODE_RETRY_INTERVAL_MS,
   distanceMeters,
+  parseGuardCoordinates,
   shouldReverseGeocodeLocation,
 };
