@@ -15,6 +15,7 @@ const MIGRATIONS = [
   "2026-09-25-temporary-preview-rbac.sql",
   "2026-09-26-company-status-lifecycle.sql",
   "2026-09-27-company-inactive-intervals.sql",
+  "2026-09-28-guard-location-geocoding.sql",
 ];
 
 async function runMigrations(pool) {

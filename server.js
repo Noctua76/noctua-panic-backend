@@ -47,6 +47,8 @@ const { resetDashboardUserPassword } = require("./auth/dashboard-user-password-r
 const { enforceDashboardPasswordChange } = require("./auth/dashboard-password-gate");
 const { changeDashboardPassword } = require("./auth/dashboard-password-change");
 const { createCompaniesRouter } = require("./admin/companies");
+const { INCIDENT_RESOLVED_RECENT_HOURS } = require("./incident-timeline");
+const { shouldReverseGeocodeLocation } = require("./guard-location");
 
 // ================================
 // TIMEZONE HELPERS
@@ -5158,7 +5160,7 @@ app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
       i.status IN ('active', 'in_progress')
       OR (
         i.status = 'resolved'
-        AND i.resolved_time > NOW() - INTERVAL '1 hour'
+        AND i.resolved_time > NOW() - ($3::int * INTERVAL '1 hour')
       )
     )
     AND (
@@ -5177,6 +5179,7 @@ app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
   [
     isSystemOwner,
     req.auth.company_id,
+    INCIDENT_RESOLVED_RECENT_HOURS,
   ]
 );
 
@@ -13049,13 +13052,45 @@ const { guard_id, session_id } = req.guard;
   });
 }
 
-let locationAddress = null;
+const previousLocationResult = await pool.query(
+  `
+  SELECT
+    last_latitude,
+    last_longitude,
+    last_location_accuracy,
+    last_location_address,
+    last_geocoded_latitude,
+    last_geocoded_longitude,
+    last_reverse_geocode_at
+  FROM guard_sessions
+  WHERE guard_id = $1
+    AND id = $2
+    AND logout_time IS NULL
+  LIMIT 1
+  `,
+  [guard_id, session_id]
+);
 
-try {
-  locationAddress = await reverseGeocode(latitude, longitude);
-} catch (geoErr) {
-  console.error("Reverse geocoding skipped:", geoErr);
-  locationAddress = null;
+const previousLocation = previousLocationResult.rows[0] || {};
+let locationAddress = null;
+const needsReverseGeocoding = shouldReverseGeocodeLocation({
+  previousLatitude: previousLocation.last_geocoded_latitude,
+  previousLongitude: previousLocation.last_geocoded_longitude,
+  previousAccuracy: previousLocation.last_location_accuracy,
+  previousAddress: previousLocation.last_location_address,
+  previousGeocodedAt: previousLocation.last_reverse_geocode_at,
+  latitude,
+  longitude,
+  accuracy,
+});
+
+if (needsReverseGeocoding) {
+  try {
+    locationAddress = await reverseGeocode(latitude, longitude);
+  } catch (geoErr) {
+    console.error("Reverse geocoding skipped:", geoErr);
+    locationAddress = null;
+  }
 }
 
     await pool.query(
@@ -13067,7 +13102,10 @@ try {
     last_location_accuracy = $3,
     last_speed = $4,
     last_battery_level = $5,
-    last_location_address = $6,
+    last_location_address = COALESCE($6, last_location_address),
+    last_geocoded_latitude = CASE WHEN $6 IS NOT NULL THEN $1 ELSE last_geocoded_latitude END,
+    last_geocoded_longitude = CASE WHEN $6 IS NOT NULL THEN $2 ELSE last_geocoded_longitude END,
+    last_reverse_geocode_at = CASE WHEN $9::boolean THEN NOW() ELSE last_reverse_geocode_at END,
     last_location_at = NOW()
   WHERE guard_id = $7
     AND id = $8
@@ -13081,7 +13119,8 @@ try {
     battery || null,
     locationAddress || null,
     guard_id,
-    session_id
+    session_id,
+    needsReverseGeocoding
   ]
 );
 
