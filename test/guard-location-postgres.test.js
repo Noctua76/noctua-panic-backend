@@ -50,7 +50,7 @@ test("real PostgreSQL accepts the Guard location update without type ambiguity",
     `);
 
     await client.query(GUARD_LOCATION_UPDATE_SQL, [
-      38.04001, 23.79001, 18.4, 0, 76, null, 7, 1, false,
+      38.04001, 23.79001, 18, 0, 76, null, 7, 1, false,
     ]);
     const stationary = await client.query(`SELECT * FROM guard_sessions WHERE id = 1`);
     assert.equal(stationary.rows[0].last_latitude, "38.04001000");
