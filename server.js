@@ -48,7 +48,10 @@ const { enforceDashboardPasswordChange } = require("./auth/dashboard-password-ga
 const { changeDashboardPassword } = require("./auth/dashboard-password-change");
 const { createCompaniesRouter } = require("./admin/companies");
 const { INCIDENT_RESOLVED_RECENT_HOURS } = require("./incident-timeline");
-const { shouldReverseGeocodeLocation } = require("./guard-location");
+const {
+  GUARD_LOCATION_UPDATE_SQL,
+  shouldReverseGeocodeLocation,
+} = require("./guard-location");
 
 // ================================
 // TIMEZONE HELPERS
@@ -13093,25 +13096,7 @@ if (needsReverseGeocoding) {
   }
 }
 
-    await pool.query(
-  `
-  UPDATE guard_sessions
-  SET
-    last_latitude = $1,
-    last_longitude = $2,
-    last_location_accuracy = $3,
-    last_speed = $4,
-    last_battery_level = $5,
-    last_location_address = COALESCE($6, last_location_address),
-    last_geocoded_latitude = CASE WHEN $6 IS NOT NULL THEN $1 ELSE last_geocoded_latitude END,
-    last_geocoded_longitude = CASE WHEN $6 IS NOT NULL THEN $2 ELSE last_geocoded_longitude END,
-    last_reverse_geocode_at = CASE WHEN $9::boolean THEN NOW() ELSE last_reverse_geocode_at END,
-    last_location_at = NOW()
-  WHERE guard_id = $7
-    AND id = $8
-    AND logout_time IS NULL
-  `,
-  [
+    await pool.query(GUARD_LOCATION_UPDATE_SQL, [
     latitude,
     longitude,
     accuracy !== null && accuracy !== undefined ? Math.round(Number(accuracy)) : null,
@@ -13121,8 +13106,7 @@ if (needsReverseGeocoding) {
     guard_id,
     session_id,
     needsReverseGeocoding
-  ]
-);
+  ]);
 
     res.json({
       status: "ok",

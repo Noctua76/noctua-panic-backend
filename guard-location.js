@@ -1,6 +1,33 @@
 const REVERSE_GEOCODE_MIN_DISTANCE_METERS = 100;
 const REVERSE_GEOCODE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 
+const GUARD_LOCATION_UPDATE_SQL = `
+  UPDATE guard_sessions
+  SET
+    last_latitude = $1::numeric,
+    last_longitude = $2::numeric,
+    last_location_accuracy = $3::integer,
+    last_speed = $4::numeric,
+    last_battery_level = $5::integer,
+    last_location_address = COALESCE($6::text, last_location_address),
+    last_geocoded_latitude = CASE
+      WHEN $6::text IS NOT NULL THEN $1::double precision
+      ELSE last_geocoded_latitude
+    END,
+    last_geocoded_longitude = CASE
+      WHEN $6::text IS NOT NULL THEN $2::double precision
+      ELSE last_geocoded_longitude
+    END,
+    last_reverse_geocode_at = CASE
+      WHEN $9::boolean THEN NOW()
+      ELSE last_reverse_geocode_at
+    END,
+    last_location_at = NOW()
+  WHERE guard_id = $7
+    AND id = $8
+    AND logout_time IS NULL
+`;
+
 function validCoordinate(value) {
   return Number.isFinite(Number(value));
 }
@@ -61,6 +88,7 @@ function shouldReverseGeocodeLocation({
 }
 
 module.exports = {
+  GUARD_LOCATION_UPDATE_SQL,
   REVERSE_GEOCODE_MIN_DISTANCE_METERS,
   REVERSE_GEOCODE_RETRY_INTERVAL_MS,
   distanceMeters,

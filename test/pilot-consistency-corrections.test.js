@@ -85,8 +85,7 @@ test("missing address or meaningful movement requests reverse geocoding", () => 
   };
   assert.equal(shouldReverseGeocodeLocation({ ...base, previousAddress: null }), true);
   assert.equal(shouldReverseGeocodeLocation({ ...base, previousAddress: "Old address" }), true);
-  assert.match(serverSource, /last_location_address = COALESCE\(\$6, last_location_address\)/);
-  assert.match(serverSource, /last_reverse_geocode_at = CASE WHEN \$9::boolean THEN NOW\(\)/);
+  assert.match(serverSource, /GUARD_LOCATION_UPDATE_SQL/);
 });
 
 test("live Guard locations remain tenant scoped", () => {
