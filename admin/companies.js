@@ -1,7 +1,8 @@
 const express = require("express");
+const { SITE_PREFIX_PATTERN, suggestSitePrefix } = require("../sites/operational-id");
 
 const COMPANY_STATUSES = new Set(["active", "pilot", "inactive"]);
-const REQUIRED_COMPANY_COLUMNS = ["id", "name", "status", "timezone"];
+const REQUIRED_COMPANY_COLUMNS = ["id", "name", "status", "timezone", "site_prefix"];
 
 class CompanyOnboardingError extends Error {
   constructor(code, message, status = 400) {
@@ -34,6 +35,9 @@ function validateCompanyOnboardingInput(body = {}) {
   const name = normalizeOptionalText(company.name);
   const timezone = normalizeOptionalText(company.timezone) || "Europe/Athens";
   const status = normalizeOptionalText(company.status) || "active";
+  const sitePrefix = company.site_prefix === undefined
+    ? suggestSitePrefix(name)
+    : String(company.site_prefix).trim().toUpperCase();
   const fullName = normalizeOptionalText(administrator.full_name);
   const username = normalizeOptionalText(administrator.username);
 
@@ -45,6 +49,9 @@ function validateCompanyOnboardingInput(body = {}) {
   if (!COMPANY_STATUSES.has(status)) {
     throw new CompanyOnboardingError("COMPANY_STATUS_INVALID", "Invalid company status");
   }
+  if (!SITE_PREFIX_PATTERN.test(sitePrefix)) {
+    throw new CompanyOnboardingError("SITE_PREFIX_INVALID", "Operational Site Prefix must be 2–8 uppercase letters or digits");
+  }
   if (!fullName) throw new CompanyOnboardingError("ADMIN_NAME_REQUIRED", "Administrator full name is required");
   if (!username) throw new CompanyOnboardingError("ADMIN_USERNAME_REQUIRED", "Administrator username is required");
   if (fullName.length > 180 || username.length > 120) {
@@ -52,7 +59,7 @@ function validateCompanyOnboardingInput(body = {}) {
   }
 
   return {
-    company: { name, timezone, status },
+    company: { name, timezone, status, site_prefix: sitePrefix },
     administrator: {
       full_name: fullName,
       username,
@@ -85,7 +92,7 @@ async function listCompanies(pool) {
   const schema = await inspectCompaniesSchema(pool);
   const createdAtExpression = schema.hasCreatedAt ? "c.created_at" : "NULL::timestamptz";
   const result = await pool.query(
-    `SELECT c.id, c.name, c.status, c.timezone,
+    `SELECT c.id, c.name, c.status, c.timezone, c.site_prefix,
             ${createdAtExpression} AS created_at,
             (SELECT COUNT(*)::int FROM sites s WHERE s.company_id = c.id) AS sites_count,
             (SELECT COUNT(*)::int
@@ -121,10 +128,10 @@ async function createCompanyWithAdministrator({
     const returningCreatedAt = schema.hasCreatedAt ? ", created_at" : "";
 
     const companyResult = await client.query(
-      `INSERT INTO companies (name, status, timezone)
-       VALUES ($1, $2, $3)
-       RETURNING id, name, status, timezone${returningCreatedAt}`,
-      [input.company.name, input.company.status, input.company.timezone]
+      `INSERT INTO companies (name, status, timezone, site_prefix)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, status, timezone, site_prefix${returningCreatedAt}`,
+      [input.company.name, input.company.status, input.company.timezone, input.company.site_prefix]
     );
     const company = {
       ...companyResult.rows[0],
@@ -403,6 +410,9 @@ function createCompaniesRouter({
     } catch (error) {
       console.error("Create company error:", error);
       if (error.code === "23505") {
+        if (error.constraint === "companies_site_prefix_unique") {
+          return res.status(409).json({ status: "error", code: "SITE_PREFIX_EXISTS", message: "Operational Site Prefix is already assigned to another company" });
+        }
         return res.status(409).json({ status: "error", code: "COMPANY_OR_USERNAME_EXISTS", message: "Company name or username already exists" });
       }
       return res.status(error.status || 500).json({

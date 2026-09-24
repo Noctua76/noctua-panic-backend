@@ -10,7 +10,7 @@ const {
 } = require("../admin/companies");
 const { createDashboardRbac, routePermission } = require("../auth/dashboard-rbac");
 
-const companyColumns = ["id", "name", "status", "timezone", "created_at"].map((column_name) => ({
+const companyColumns = ["id", "name", "status", "timezone", "site_prefix", "created_at"].map((column_name) => ({
   column_name,
   data_type: column_name === "created_at" ? "timestamp with time zone" : "text",
   udt_name: column_name === "created_at" ? "timestamptz" : "text",
@@ -25,7 +25,7 @@ function makePool({ failAt = null } = {}) {
       if (failAt && normalized.includes(failAt)) throw new Error("forced failure");
       if (normalized.startsWith("SELECT column_name")) return { rows: companyColumns };
       if (normalized.startsWith("INSERT INTO companies")) {
-        return { rows: [{ id: 42, name: params[0], status: params[1], timezone: params[2], created_at: "2026-09-22T10:00:00Z" }] };
+        return { rows: [{ id: 42, name: params[0], status: params[1], timezone: params[2], site_prefix: params[3], created_at: "2026-09-22T10:00:00Z" }] };
       }
       if (normalized.startsWith("SELECT id, code, name FROM dashboard_roles")) {
         return { rows: [{ id: 7, code: "company_administrator", name: "Company Administrator" }] };
@@ -50,6 +50,9 @@ test("company onboarding accepts IANA timezones and rejects fixed offsets", () =
   assert.equal(isValidIanaTimezone("UTC+03:00"), false);
   assert.equal(isValidIanaTimezone("Not/AZone"), false);
   assert.equal(validateCompanyOnboardingInput(validBody).company.status, "active");
+  assert.equal(validateCompanyOnboardingInput(validBody).company.site_prefix, "AS");
+  assert.equal(validateCompanyOnboardingInput({ ...validBody, company: { ...validBody.company, site_prefix: "abc" } }).company.site_prefix, "ABC");
+  assert.throws(() => validateCompanyOnboardingInput({ ...validBody, company: { ...validBody.company, site_prefix: "A!" } }), /Prefix/);
 });
 
 test("System Owner company creation is atomic and provisions only the first administrator", async () => {
@@ -67,6 +70,7 @@ test("System Owner company creation is atomic and provisions only the first admi
   assert.equal(result.company.id, 42);
   assert.equal(result.company.timezone, "Europe/Athens");
   assert.equal(result.company.status, "active");
+  assert.equal(result.company.site_prefix, "AS");
   assert.equal(result.administrator.company_id, 42);
   assert.equal(result.administrator.role_code, "company_administrator");
   assert.equal(result.administrator.must_change_password, true);
@@ -137,4 +141,3 @@ test("Companies API bypasses generic permission classification and requires Syst
   assert.equal(statusCode, 403);
   assert.equal(payload.code, "SYSTEM_OWNER_REQUIRED");
 });
-

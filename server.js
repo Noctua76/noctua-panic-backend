@@ -47,6 +47,7 @@ const { resetDashboardUserPassword } = require("./auth/dashboard-user-password-r
 const { enforceDashboardPasswordChange } = require("./auth/dashboard-password-gate");
 const { changeDashboardPassword } = require("./auth/dashboard-password-change");
 const { createCompaniesRouter } = require("./admin/companies");
+const { createSiteWithOperationalId } = require("./sites/operational-id");
 const { resolveTenantContext, recordTenantAudit, enforceTenantContextBoundary, createTenantContextRouter } = require("./auth/tenant-context");
 const { INCIDENT_RESOLVED_RECENT_HOURS } = require("./incident-timeline");
 const {
@@ -4350,7 +4351,8 @@ app.post("/guard/login", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT g.*, s.company_id, c.status AS company_status
+      SELECT g.*, s.company_id, s.site_code, s.location AS site_location,
+             c.status AS company_status
       FROM guards g
       JOIN sites s ON s.id = g.site_id
       JOIN companies c ON c.id = s.company_id
@@ -4619,6 +4621,8 @@ if (
         phone: guard.phone,
         role: guard.role,
 site_id: guard.site_id,
+site_code: guard.site_code,
+site_location: guard.site_location,
 access_mode: guard.access_mode,
 temporary_access_started_at:
   guard.temporary_access_started_at,
@@ -4916,6 +4920,7 @@ app.get(
         `
         SELECT
           s.id AS site_id,
+          s.site_code,
           s.name AS site_name,
           s.location AS site_location,
 
@@ -6348,6 +6353,8 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
       `
       SELECT
   sites.id,
+  sites.site_number,
+  sites.site_code,
   sites.company_id,
   sites.name,
   sites.location,
@@ -6455,47 +6462,21 @@ app.post("/settings/sites", requireAuth, async (req, res) => {
       });
     }
 
-    const companyResult = await pool.query(
-      `
-      SELECT id
-      FROM companies
-      WHERE id = $1
-      `,
-      [targetCompanyId]
-    );
+    const site = await createSiteWithOperationalId({
+      pool, companyId: targetCompanyId, name: siteName,
+      location: siteLocation, requiredShifts,
+    });
 
-    if (companyResult.rows.length === 0) {
+    if (!site) {
       return res.status(404).json({
         status: "error",
         message: "Company not found",
       });
     }
 
-    const result = await pool.query(
-      `
-      INSERT INTO sites (
-        company_id,
-        name,
-        location,
-        status,
-        required_shifts,
-        created_at
-      )
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      RETURNING *
-      `,
-      [
-        targetCompanyId,
-        siteName,
-        siteLocation,
-        "active",
-        requiredShifts,
-      ]
-    );
-
     return res.json({
       status: "ok",
-      site: result.rows[0],
+      site,
     });
   } catch (err) {
     console.error("Settings site POST error:", err);
@@ -12368,6 +12349,7 @@ app.get("/patrols/sites", requireAuth, async (req, res) => {
       WITH site_summary AS (
         SELECT
           s.id AS site_id,
+          s.site_code,
           s.name AS site_name,
           s.location AS site_location,
           s.status AS site_status,
@@ -12391,6 +12373,7 @@ app.get("/patrols/sites", requireAuth, async (req, res) => {
 
         GROUP BY
           s.id,
+          s.site_code,
           s.name,
           s.location,
           s.status
@@ -12709,6 +12692,7 @@ if (siteResult.rows.length === 0) {
       `
       SELECT
         id AS site_id,
+        site_code,
         name AS site_name,
         location AS site_location,
         status AS site_status
