@@ -47,6 +47,7 @@ const { resetDashboardUserPassword } = require("./auth/dashboard-user-password-r
 const { enforceDashboardPasswordChange } = require("./auth/dashboard-password-gate");
 const { changeDashboardPassword } = require("./auth/dashboard-password-change");
 const { createCompaniesRouter } = require("./admin/companies");
+const { resolveTenantContext, canMutateTenantRequest, recordTenantAudit, createTenantContextRouter } = require("./auth/tenant-context");
 const { INCIDENT_RESOLVED_RECENT_HOURS } = require("./incident-timeline");
 const {
   GUARD_LOCATION_UPDATE_SQL,
@@ -135,11 +136,8 @@ async function getShiftDelayEmailRecipients(companyId) {
       email,
       secondary_email
     FROM users
-    WHERE
-(
-  (company_id = $1 AND role = 'supervisor')
-  OR role = 'system_owner'
-)
+WHERE company_id = $1
+AND role IN ('supervisor', 'system_owner')
 AND status = 'active'
 AND access_mode = 'standard'
       AND (
@@ -574,7 +572,6 @@ app.get("/admin/active", requireAuth, async (req, res) => {
           u.access_mode,
           'standard'
         ) AS access_mode,
-        u.temporary_access_label,
         u.temporary_access_started_at,
         u.access_expires_at,
         (
@@ -629,11 +626,8 @@ app.get("/admin/active", requireAuth, async (req, res) => {
           gs.login_time,
           gs.last_heartbeat AS last_seen,
           g.access_mode,
-          g.temporary_access_label,
           g.temporary_access_started_at,
           g.access_expires_at,
-          s.id AS site_id,
-          s.name AS site_name,
           true AS is_temporary,
           'guard_web_app' AS preview_surface
         FROM guard_sessions gs
@@ -713,6 +707,13 @@ app.post("/admin/heartbeat", requireAuth, async (req, res) => {
     return res.json({
       status: "ok",
       last_seen: result.rows[0].last_seen,
+      tenant_context: {
+        tenant_context_active: req.auth.tenant_context_active,
+        tenant_context_mode: req.auth.tenant_context_mode,
+        tenant_context_can_mutate: req.auth.tenant_context_can_mutate,
+        tenant_context_elevated_until: req.auth.tenant_context_elevated_until,
+        tenant_context_company_status: req.auth.tenant_context_company_status,
+      },
     });
   } catch (err) {
     console.error("Admin heartbeat error:", err);
@@ -785,11 +786,11 @@ app.get(
       const { user, from, to, active } = req.query;
 
       const isSystemOwner =
-        req.auth.role === "system_owner";
+        false;
 
         await closeExpiredTemporaryAdminSessions({
   isSystemOwner,
-  companyId: req.auth.company_id,
+  companyId: req.auth.effective_company_id,
 });
 
       let query = `
@@ -841,14 +842,14 @@ app.get(
         LEFT JOIN users u
           ON u.id = ads.user_id
         WHERE (
-          $1::boolean = true
-          OR ads.company_id = $2
+          $1::boolean IS FALSE
+          AND ads.company_id = $2
         )
       `;
 
       const values = [
         isSystemOwner,
-        req.auth.company_id,
+        req.auth.effective_company_id,
         ACCESS_MODE_READ_ONLY,
       ];
 
@@ -939,16 +940,16 @@ app.get(
       const { from, to } = req.query;
 
       const isSystemOwner =
-        req.auth.role === "system_owner";
+        false;
 
         await closeExpiredTemporaryAdminSessions({
   isSystemOwner,
-  companyId: req.auth.company_id,
+  companyId: req.auth.effective_company_id,
 });
 
       const companyTimezone =
         await getCompanyTimezone(
-          req.auth.company_id
+          req.auth.effective_company_id
         );
 
       let query = `
@@ -999,14 +1000,14 @@ app.get(
         LEFT JOIN users u
           ON u.id = ads.user_id
         WHERE (
-          $1::boolean = true
-          OR ads.company_id = $2
+          $1::boolean IS FALSE
+          AND ads.company_id = $2
         )
       `;
 
       const values = [
         isSystemOwner,
-        req.auth.company_id,
+        req.auth.effective_company_id,
         ACCESS_MODE_READ_ONLY,
       ];
 
@@ -1366,13 +1367,12 @@ app.post("/admin/users", requireAuth, async (req, res) => {
       return res.status(403).json({ status: "error", message: "Only the System Owner can assign System Owner" });
     }
 
-    let targetCompanyId = req.auth.company_id;
-    if (req.auth.is_system_owner) {
-      const parsedCompanyId = Number(company_id ?? req.auth.company_id);
-      if (!Number.isInteger(parsedCompanyId) || parsedCompanyId <= 0) {
-        return res.status(400).json({ status: "error", message: "Invalid company_id" });
-      }
-      targetCompanyId = parsedCompanyId;
+    const targetCompanyId = req.auth.effective_company_id;
+    if (req.auth.is_system_owner && company_id != null && Number(company_id) !== Number(targetCompanyId)) {
+      return res.status(403).json({ status: "error", code: "TENANT_SCOPE_REQUIRED" });
+    }
+    if (req.auth.tenant_context_active && targetRole.code === "system_owner") {
+      return res.status(403).json({ status: "error", code: "PLATFORM_ROLE_UNAVAILABLE_IN_TENANT" });
     }
     const companyResult = await client.query(`SELECT id FROM companies WHERE id=$1`, [targetCompanyId]);
     if (!companyResult.rows.length) return res.status(404).json({ status: "error", message: "Company not found" });
@@ -1442,6 +1442,11 @@ app.put("/admin/users/:id", requireAuth, async (req, res) => {
     if (!req.auth.is_system_owner && targetRole?.code === "system_owner") {
       await client.query("ROLLBACK");
       return res.status(403).json({ status: "error", message: "Only the System Owner can assign System Owner" });
+    }
+    if (req.auth.tenant_context_active &&
+        (targetRole?.code === "system_owner" || current.role_code === "system_owner")) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ status: "error", code: "PLATFORM_ROLE_UNAVAILABLE_IN_TENANT" });
     }
 
     const removesSystemOwner = (current.role_code === "system_owner" || current.role === "system_owner") &&
@@ -2164,45 +2169,8 @@ temporary_access_expiry_reason:
 });
 
 function resolveAdminUsersCompanyScope(req) {
-  // Customer users are always restricted to their authenticated company.
-  if (!req.auth.is_system_owner) {
-    return {
-      companyId: req.auth.company_id,
-      error: null,
-    };
-  }
-
-  // Until the System Owner Control Panel provides a selected company,
-  // default to the company stored in the authenticated session.
-  const requestedCompanyId = req.query.company_id;
-
-  if (
-    requestedCompanyId === undefined ||
-    requestedCompanyId === null ||
-    requestedCompanyId === ""
-  ) {
-    return {
-      companyId: req.auth.company_id,
-      error: null,
-    };
-  }
-
-  const parsedCompanyId = Number(requestedCompanyId);
-
-  if (
-    !Number.isInteger(parsedCompanyId) ||
-    parsedCompanyId <= 0
-  ) {
-    return {
-      companyId: null,
-      error: "Invalid company_id",
-    };
-  }
-
-  return {
-    companyId: parsedCompanyId,
-    error: null,
-  };
+  // The client cannot select the operational tenant via a query parameter.
+  return { companyId: req.auth.effective_company_id, error: null };
 }
 
 // ----------------------------------------------------------
@@ -2238,6 +2206,14 @@ async function requireAuth(req, res, next) {
         ads.login_time,
         ads.last_seen,
         ads.is_active,
+        ads.tenant_context_company_id,
+        ads.tenant_context_mode,
+        ads.tenant_context_started_at,
+        ads.tenant_context_elevated_at,
+        ads.tenant_context_elevated_until,
+        ads.tenant_context_reason,
+        tenant_company.name AS tenant_context_company_name,
+        tenant_company.status AS tenant_context_company_status,
 
         u.full_name,
         u.username,
@@ -2263,6 +2239,8 @@ c.name AS company_name,
 
       LEFT JOIN companies c
         ON c.id = u.company_id
+      LEFT JOIN companies tenant_company
+        ON tenant_company.id = ads.tenant_context_company_id
 
       WHERE ads.session_token = $1
         AND ads.is_active = true
@@ -2405,6 +2383,56 @@ company_id: auth.company_id,
           ? "platform"
           : "company",
     };
+
+    if (auth.tenant_context_company_id && auth.role !== "system_owner") {
+      return res.status(403).json({ status: "error", code: "INVALID_TENANT_CONTEXT" });
+    }
+    Object.assign(req.auth, resolveTenantContext(auth));
+    req.auth.tenant_context_reason = auth.tenant_context_reason;
+    if (auth.role === "system_owner" && auth.tenant_context_company_id &&
+        auth.tenant_context_mode === "administrative" && !req.auth.tenant_context_can_mutate) {
+      const auditClient = await pool.connect();
+      try {
+        await auditClient.query("BEGIN");
+        const expired = await auditClient.query(
+          `UPDATE admin_sessions SET tenant_context_mode='read_only',
+             tenant_context_elevated_at=NULL, tenant_context_elevated_until=NULL,
+             tenant_context_reason=NULL
+           WHERE id=$1 AND tenant_context_mode='administrative'
+             AND (tenant_context_elevated_until<=NOW() OR
+               NOT EXISTS (SELECT 1 FROM companies c WHERE c.id=tenant_context_company_id
+                 AND c.status IN ('active','pilot')))
+           RETURNING tenant_context_company_id`, [auth.session_id]);
+        if (expired.rows.length) {
+          await recordTenantAudit(auditClient, req.auth, "TENANT_ADMIN_ACCESS_EXPIRED",
+            auth.tenant_context_company_id, req.method, req.path, 200, "read_only", auth.tenant_context_reason);
+        }
+        await auditClient.query("COMMIT");
+      } catch (error) {
+        await auditClient.query("ROLLBACK").catch(() => {});
+        throw error;
+      } finally { auditClient.release(); }
+    }
+    const requestPath = getRequestPath(req);
+    if (req.auth.tenant_context_active &&
+        (requestPath.startsWith("/admin/companies") ||
+         (requestPath.startsWith("/admin/roles") && !READ_ONLY_SAFE_METHODS.has(req.method)) ||
+         requestPath.startsWith("/admin/temporary-access") || requestPath === "/system/status/global" ||
+         requestPath === "/send-sms" || requestPath === "/test-sms")) {
+      return res.status(403).json({ status: "error", code: "PLATFORM_CONTROL_UNAVAILABLE_IN_TENANT" });
+    }
+    if (!canMutateTenantRequest(req.auth, req.method, requestPath)) {
+      return res.status(403).json({ status: "error", code: "TENANT_CONTEXT_READ_ONLY" });
+    }
+    if (req.auth.tenant_context_active && req.auth.tenant_context_can_mutate &&
+        !READ_ONLY_SAFE_METHODS.has(req.method) &&
+        !requestPath.startsWith("/admin/tenant-context/") &&
+        !new Set(["/admin/heartbeat", "/admin/logout"]).has(requestPath)) {
+      res.once("finish", () => {
+        recordTenantAudit(pool, req.auth, "TENANT_MUTATION", req.auth.effective_company_id,
+          req.method, requestPath, res.statusCode).catch(error => console.error("Tenant mutation audit failed", error));
+      });
+    }
 
     if (enforceDashboardPasswordChange(req, res)) {
       return;
@@ -2584,6 +2612,8 @@ next();
 // AUTH CONTEXT TEST
 // ----------------------------------------------------------
 
+app.use(createTenantContextRouter({ pool, requireAuth }));
+
 app.get("/auth/context", requireAuth, async (req, res) => {
   return res.json({
     status: "ok",
@@ -2633,10 +2663,11 @@ app.get(
             JOIN companies c
               ON c.id = u.company_id
             WHERE u.access_mode = $1
+              AND u.company_id = $2
               AND u.temporary_access_group_id IS NOT NULL
             ORDER BY u.created_at DESC
             `,
-            [ACCESS_MODE_READ_ONLY]
+            [ACCESS_MODE_READ_ONLY, req.auth.effective_company_id]
           ),
 
           pool.query(
@@ -2658,9 +2689,10 @@ app.get(
             JOIN sites s
               ON s.id = g.site_id
             WHERE g.access_mode = $1
+              AND s.company_id = $2
               AND g.temporary_access_group_id IS NOT NULL
             `,
-            [ACCESS_MODE_READ_ONLY]
+            [ACCESS_MODE_READ_ONLY, req.auth.effective_company_id]
           ),
         ]);
 
@@ -2874,10 +2906,10 @@ app.post(
         FROM sites s
         JOIN companies c
           ON c.id = s.company_id
-        WHERE s.id = $1
+        WHERE s.id = $1 AND s.company_id = $2
         LIMIT 1
         `,
-        [siteId]
+        [siteId, req.auth.effective_company_id]
       );
 
       if (siteResult.rows.length === 0) {
@@ -3165,6 +3197,12 @@ app.post(
             "Invalid temporary access group id",
         });
       }
+
+      const ownership = await client.query(
+        `SELECT 1 FROM users WHERE temporary_access_group_id=$1
+           AND access_mode='read_only' AND company_id=$2`,
+        [groupId, req.auth.effective_company_id]);
+      if (!ownership.rows.length) return res.status(404).json({ status: "error", message: "Temporary access was not found" });
 
       await client.query("BEGIN");
 
@@ -3919,15 +3957,16 @@ app.get("/admin/roles", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT r.id, r.code, r.name, r.description, r.scope, r.is_system_role,
-              r.is_active, r.authorization_version, COUNT(DISTINCT ur.user_id)::int AS user_count,
+              r.is_active, r.authorization_version, COUNT(DISTINCT role_user.id)::int AS user_count,
               COALESCE(array_agg(p.code ORDER BY p.code) FILTER (WHERE p.code IS NOT NULL), '{}') AS permissions
        FROM dashboard_roles r
        LEFT JOIN user_dashboard_roles ur ON ur.role_id = r.id
+       LEFT JOIN users role_user ON role_user.id = ur.user_id AND role_user.company_id = $2
        LEFT JOIN dashboard_role_permissions rp ON rp.role_id = r.id
        LEFT JOIN dashboard_permissions p ON p.id = rp.permission_id
        WHERE r.is_active = TRUE OR $1::boolean = TRUE
        GROUP BY r.id ORDER BY r.is_system_role DESC, r.name ASC`,
-      [req.auth.is_system_owner]
+      [req.auth.is_system_owner, req.auth.effective_company_id]
     );
     const roles = result.rows.filter((role) => req.auth.is_system_owner || role.code !== "system_owner");
     return res.json({ status: "ok", roles });
@@ -3963,7 +4002,7 @@ app.post("/admin/roles", requireAuth, dashboardRbac.requireSystemOwner, async (r
         [role.id, permissionCodes]
       );
     }
-    await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id, roleId: role.id, companyId: req.auth.company_id, after: { ...role, permissions: permissionCodes } });
+    await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id, roleId: role.id, companyId: req.auth.effective_company_id, after: { ...role, permissions: permissionCodes } });
     await client.query("COMMIT");
     dashboardRbac.invalidateAll();
     return res.status(201).json({ status: "ok", role: { ...role, permissions: permissionCodes, user_count: 0 } });
@@ -3998,7 +4037,7 @@ app.post("/admin/roles/:id/clone", requireAuth, dashboardRbac.requireSystemOwner
        SELECT $1,permission_id FROM dashboard_role_permissions WHERE role_id=$2`, [role.id, roleId]
     );
     await recordRbacAudit(client, { type: "ROLE_CREATED", actorUserId: req.auth.user_id,
-      roleId: role.id, companyId: req.auth.company_id, after: { ...role, cloned_from: roleId, permissions: original.permissions } });
+      roleId: role.id, companyId: req.auth.effective_company_id, after: { ...role, cloned_from: roleId, permissions: original.permissions } });
     await client.query("COMMIT");
     return res.status(201).json({ status: "ok", role: { ...role, permissions: original.permissions, user_count: 0 } });
   } catch (err) {
@@ -4040,7 +4079,7 @@ app.put("/admin/roles/:id", requireAuth, dashboardRbac.requireSystemOwner, async
     }
     const affected = await client.query(`SELECT user_id FROM user_dashboard_roles WHERE role_id=$1`, [roleId]);
     await dashboardRbac.revokeAuthorizationSessions(client, affected.rows.map((row) => row.user_id));
-    await recordRbacAudit(client, { type: isActive ? "ROLE_PERMISSION_CHANGED" : "ROLE_DEACTIVATED", actorUserId: req.auth.user_id, roleId, companyId: req.auth.company_id, before, after: { ...updated.rows[0], permissions: permissionCodes } });
+    await recordRbacAudit(client, { type: isActive ? "ROLE_PERMISSION_CHANGED" : "ROLE_DEACTIVATED", actorUserId: req.auth.user_id, roleId, companyId: req.auth.effective_company_id, before, after: { ...updated.rows[0], permissions: permissionCodes } });
     await client.query("COMMIT");
     dashboardRbac.invalidateAll();
     return res.json({ status: "ok", role: { ...updated.rows[0], permissions: permissionCodes } });
@@ -4718,8 +4757,8 @@ app.post(
       const { site_id, date } = req.body;
 
       const parsedSiteId = Number(site_id);
-      const isSystemOwner =
-        req.auth.role === "system_owner";
+      const tenantBypass =
+        false;
 
       if (
         !Number.isInteger(parsedSiteId) ||
@@ -4747,14 +4786,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           parsedSiteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -4889,7 +4928,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const result = await pool.query(
         `
@@ -4957,14 +4996,14 @@ LEFT JOIN guards g
   ON g.id = gs.guard_id
 
         WHERE
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
 
         ORDER BY s.id ASC
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -4985,7 +5024,7 @@ LEFT JOIN guards g
 
 app.get("/dashboard/metrics", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
     const guardsResult = await pool.query(
       `
@@ -5001,13 +5040,13 @@ WHERE gs.logout_time IS NULL
        > (NOW() AT TIME ZONE 'Europe/Athens')
   )
         AND (
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
         )
       `,
       [
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ]
     );
 
@@ -5019,13 +5058,13 @@ WHERE gs.logout_time IS NULL
         ON s.id = i.site_id
       WHERE i.status IN ('active', 'in_progress')
         AND (
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
         )
       `,
       [
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ]
     ).catch(() => ({
       rows: [{ count: 0 }],
@@ -5039,13 +5078,13 @@ WHERE gs.logout_time IS NULL
         ON s.id = i.site_id
       WHERE DATE(i.created_at) = CURRENT_DATE
         AND (
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
         )
       `,
       [
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ]
     ).catch(() => ({
       rows: [{ count: 0 }],
@@ -5068,15 +5107,15 @@ WHERE gs.logout_time IS NULL
         AND i.trigger_time IS NOT NULL
         AND i.resolved_time IS NOT NULL
         AND (
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
         )
       ORDER BY i.resolved_time DESC
       LIMIT 1
       `,
       [
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ]
     ).catch(() => ({
       rows: [{ duration_seconds: null }],
@@ -5136,7 +5175,7 @@ WHERE gs.logout_time IS NULL
 // ----------------------------------------------------------
 app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
     await ensureAlertEventsTable();
 
     const incidentResult = await pool.query(
@@ -5168,8 +5207,8 @@ app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
       )
     )
     AND (
-      $1::boolean = true
-      OR s.company_id = $2
+      $1::boolean IS FALSE
+      AND s.company_id = $2
     )
   ORDER BY
     CASE
@@ -5181,8 +5220,8 @@ app.get("/dashboard/incident-timeline", requireAuth, async (req, res) => {
   LIMIT 1
   `,
   [
-    isSystemOwner,
-    req.auth.company_id,
+    tenantBypass,
+    req.auth.effective_company_id,
     INCIDENT_RESOLVED_RECENT_HOURS,
   ]
 );
@@ -5462,7 +5501,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const result = await pool.query(
         `
@@ -5703,8 +5742,8 @@ END
 
         WHERE
   (
-    $1::boolean = true
-    OR s.company_id = $2
+    $1::boolean IS FALSE
+    AND s.company_id = $2
   )
   AND ss.scheduled_end > to_char((NOW() AT TIME ZONE 'Europe/Athens')::date, 'YYYY-MM-DD')::timestamp
   AND ss.scheduled_start < (
@@ -5715,8 +5754,8 @@ END
 ORDER BY ss.scheduled_start ASC
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -5742,7 +5781,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const result = await pool.query(
         `
@@ -5772,14 +5811,14 @@ app.get(
         WHERE
   g.access_mode = 'standard'
   AND (
-    $1::boolean = true
-    OR s.company_id = $2
+    $1::boolean IS FALSE
+    AND s.company_id = $2
   )
         ORDER BY g.full_name ASC
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -5825,7 +5864,7 @@ app.put(
         assignment_status,
       } = req.body;
 
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       await client.query("BEGIN");
 
@@ -5839,15 +5878,15 @@ app.put(
           ON s.id = g.site_id
         WHERE g.id = $1
           AND (
-            $2::boolean = true
-            OR s.company_id = $3
+            $2::boolean IS FALSE
+            AND s.company_id = $3
           )
         FOR UPDATE
         `,
         [
           id,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -5867,14 +5906,14 @@ app.put(
           FROM sites
           WHERE id = $1
             AND (
-              $2::boolean = true
-              OR company_id = $3
+              $2::boolean IS FALSE
+              AND company_id = $3
             )
           `,
           [
             site_id,
-            isSystemOwner,
-            req.auth.company_id,
+            tenantBypass,
+            req.auth.effective_company_id,
           ]
         );
 
@@ -5950,7 +5989,7 @@ app.put(
 // ----------------------------------------------------------
 app.get("/sites", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
 const result = await pool.query(
   `
@@ -6071,15 +6110,15 @@ END AS status_class
 
   WHERE s.status <> 'archived'
   AND (
-    $1::boolean = true
-    OR s.company_id = $2
+    $1::boolean IS FALSE
+    AND s.company_id = $2
   )
 
 ORDER BY s.id ASC
   `,
   [
-    isSystemOwner,
-    req.auth.company_id,
+    tenantBypass,
+    req.auth.effective_company_id,
   ]
 );
 
@@ -6167,7 +6206,7 @@ async function ensureIncidentGuardResponsesTable() {
 app.get("/settings/alert-recipients", requireAuth, async (req, res) => {
   try {
     const recipients = await getEffectiveAlertRecipients(
-      req.auth.company_id
+      req.auth.effective_company_id
     );
 
     return res.json({
@@ -6209,7 +6248,7 @@ app.post("/settings/alert-recipients", requireAuth, async (req, res) => {
       RETURNING *
       `,
       [
-        req.auth.company_id,
+        req.auth.effective_company_id,
         full_name,
         phone,
         sms_enabled,
@@ -6248,7 +6287,7 @@ app.put(
         `,
         [
           id,
-          req.auth.company_id,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -6290,7 +6329,7 @@ app.delete(
         `,
         [
           id,
-          req.auth.company_id,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -6321,7 +6360,7 @@ app.delete(
 
 app.get("/settings/sites", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
     const result = await pool.query(
       `
@@ -6364,14 +6403,14 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
       LEFT JOIN users u
       ON u.id = sites.active_changed_by
       WHERE (
-  $1::boolean = true
-  OR sites.company_id = $2
+  $1::boolean IS FALSE
+  AND sites.company_id = $2
 )
       ORDER BY id ASC
       `,
       [
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ]
     );
 
@@ -6422,7 +6461,7 @@ app.post("/settings/sites", requireAuth, async (req, res) => {
       });
     }
 
-    const targetCompanyId = Number(req.auth.company_id);
+    const targetCompanyId = Number(req.auth.effective_company_id);
 
     if (
       !Number.isInteger(targetCompanyId) ||
@@ -6523,7 +6562,7 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
       });
     }
 
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
     const result = await pool.query(
       `
@@ -6562,8 +6601,8 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         special_warnings = COALESCE($23, special_warnings)
       WHERE id = $24
         AND (
-          $25::boolean = true
-          OR company_id = $26
+          $25::boolean IS FALSE
+          AND company_id = $26
         )
       RETURNING *
       `,
@@ -6592,8 +6631,8 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         emergency_instructions || null,
         special_warnings || null,
         siteId,
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ]
     );
 
@@ -6625,7 +6664,7 @@ app.post(
   async (req, res) => {
     try {
       const siteId = Number(req.params.id);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(siteId) || siteId <= 0) {
         return res.status(400).json({
@@ -6642,14 +6681,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -6719,16 +6758,16 @@ app.post(
           sop_updated_at = NOW()
         WHERE id = $2
           AND (
-            $3::boolean = true
-            OR company_id = $4
+            $3::boolean IS FALSE
+            AND company_id = $4
           )
         RETURNING *
         `,
         [
           publicUrl,
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -6764,7 +6803,7 @@ app.post(
     try {
       const siteId = Number(req.params.id);
       const slot = Number(req.params.slot);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(siteId) || siteId <= 0) {
         return res.status(400).json({
@@ -6788,14 +6827,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -6859,16 +6898,16 @@ app.post(
         SET ${columnName} = $1
         WHERE id = $2
           AND (
-            $3::boolean = true
-            OR company_id = $4
+            $3::boolean IS FALSE
+            AND company_id = $4
           )
         RETURNING id
         `,
         [
           data.publicUrl,
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -6901,7 +6940,7 @@ app.put(
   async (req, res) => {
     try {
       const siteId = Number(req.params.id);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(siteId) || siteId <= 0) {
         return res.status(400).json({
@@ -6923,15 +6962,15 @@ SET
   active_changed_by = $4
 WHERE id = $1
   AND (
-    $2::boolean = true
-    OR company_id = $3
+    $2::boolean IS FALSE
+    AND company_id = $3
   )
 RETURNING *
         `,
         [
   siteId,
-  isSystemOwner,
-  req.auth.company_id,
+  tenantBypass,
+  req.auth.effective_company_id,
   req.auth.user_id,
 ]
       );
@@ -6964,7 +7003,7 @@ app.put(
   async (req, res) => {
     try {
       const siteId = Number(req.params.id);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(siteId) || siteId <= 0) {
         return res.status(400).json({
@@ -6979,15 +7018,15 @@ app.put(
         SET status = 'archived'
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         RETURNING *
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7022,7 +7061,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const result = await pool.query(
         `
@@ -7060,14 +7099,14 @@ app.get(
         WHERE
   g.access_mode = 'standard'
   AND (
-    $1::boolean = true
-    OR s.company_id = $2
+    $1::boolean IS FALSE
+    AND s.company_id = $2
   )
         ORDER BY g.id ASC
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7119,7 +7158,7 @@ app.post(
         });
       }
 
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       await client.query("BEGIN");
 
@@ -7129,14 +7168,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           site_id,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7243,7 +7282,7 @@ app.put(
         active,
       } = req.body;
 
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       await client.query("BEGIN");
 
@@ -7257,15 +7296,15 @@ app.put(
           ON s.id = g.site_id
         WHERE g.id = $1
           AND (
-            $2::boolean = true
-            OR s.company_id = $3
+            $2::boolean IS FALSE
+            AND s.company_id = $3
           )
         FOR UPDATE
         `,
         [
           id,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7285,14 +7324,14 @@ app.put(
           FROM sites
           WHERE id = $1
             AND (
-              $2::boolean = true
-              OR company_id = $3
+              $2::boolean IS FALSE
+              AND company_id = $3
             )
           `,
           [
             site_id,
-            isSystemOwner,
-            req.auth.company_id,
+            tenantBypass,
+            req.auth.effective_company_id,
           ]
         );
 
@@ -7365,7 +7404,7 @@ app.put(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const result = await pool.query(
         `
@@ -7375,8 +7414,8 @@ app.put(
         WHERE g.id = $1
           AND s.id = g.site_id
           AND (
-            $2::boolean = true
-            OR s.company_id = $3
+            $2::boolean IS FALSE
+            AND s.company_id = $3
           )
         RETURNING
           g.id,
@@ -7390,8 +7429,8 @@ app.put(
         `,
         [
           id,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7426,7 +7465,7 @@ async function resetGuardPassword(req, res) {
       return res.status(400).json({ status: "error", message: "Invalid guard id" });
     }
 
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
     const temporaryPassword = generateTemporaryPassword();
     const passwordHash = await bcrypt.hash(temporaryPassword, 10);
     const temporaryPasswordTtlHours = getTempPasswordTtlHours();
@@ -7442,10 +7481,10 @@ async function resetGuardPassword(req, res) {
        FROM sites s
        WHERE g.id = $3 AND s.id = g.site_id
          AND g.access_mode = 'standard'
-         AND ($4::boolean = TRUE OR s.company_id = $5)
+         AND ($4::boolean IS FALSE AND s.company_id = $5)
        RETURNING g.id, g.full_name, g.username, g.site_id,
                  g.temporary_password_expires_at, s.company_id`,
-      [passwordHash, temporaryPasswordTtlHours, guardId, isSystemOwner, req.auth.company_id]
+      [passwordHash, temporaryPasswordTtlHours, guardId, tenantBypass, req.auth.effective_company_id]
     );
 
     if (result.rows.length === 0) {
@@ -7521,8 +7560,8 @@ app.post(
       const { site_id, date } = req.body;
 
       const parsedSiteId = Number(site_id);
-      const isSystemOwner =
-        req.auth.role === "system_owner";
+      const tenantBypass =
+        false;
 
       if (
         !Number.isInteger(parsedSiteId) ||
@@ -7550,14 +7589,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           parsedSiteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7600,8 +7639,8 @@ app.get(
     try {
       await ensureAlertEventsTable();
 
-      const isSystemOwner =
-        req.auth.role === "system_owner";
+      const tenantBypass =
+        false;
 
       const result = await pool.query(
         `
@@ -7609,14 +7648,14 @@ app.get(
         FROM alert_events ae
         LEFT JOIN sites s ON s.id = ae.site_id
         WHERE
-          $1::boolean = true
-          OR COALESCE(ae.company_id, s.company_id) = $2
+          $1::boolean IS FALSE
+          AND COALESCE(ae.company_id, s.company_id) = $2
         ORDER BY ae.created_at DESC
         LIMIT 50
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -7643,9 +7682,9 @@ app.get(
   requireAuth,
   async (req, res) => {
   try {
-    const companyId = req.auth.company_id;
-const isSystemOwner =
-  req.auth.role === "system_owner";
+    const companyId = req.auth.effective_company_id;
+const tenantBypass =
+  false;
 
     const siteResult = await pool.query(
       `
@@ -7654,10 +7693,10 @@ const isSystemOwner =
   COALESCE(SUM(required_shifts), 0)::int AS required_shifts
 FROM sites
 WHERE
-  ($1::boolean = true OR company_id = $2)
+  ($1::boolean IS FALSE AND company_id = $2)
       `,
       [
-    isSystemOwner,
+    tenantBypass,
     companyId,
   ]
     );
@@ -7672,10 +7711,10 @@ WHERE
   INNER JOIN sites s
     ON s.id = ae.site_id
   WHERE
-    ($1::boolean = true OR s.company_id = $2)
+    ($1::boolean IS FALSE AND s.company_id = $2)
   `,
   [
-    isSystemOwner,
+    tenantBypass,
     companyId,
   ]
 );
@@ -7689,10 +7728,10 @@ WHERE
   WHERE
   g.active = true
   AND g.access_mode = 'standard'
-  AND ($1::boolean = true OR s.company_id = $2)
+  AND ($1::boolean IS FALSE AND s.company_id = $2)
   `,
   [
-    isSystemOwner,
+    tenantBypass,
     companyId,
   ]
 );
@@ -7924,7 +7963,7 @@ app.post("/alerts/test", requireAuth, async (req, res) => {
     const result = await alertDispatcher.dispatchAlertNotifications({
       mode: "test",
       source: "Dashboard Settings",
-      companyId: req.auth.company_id,
+      companyId: req.auth.effective_company_id,
       message: text,
     });
 
@@ -7951,7 +7990,7 @@ app.get("/settings/test-alerts/:testId", requireAuth, async (req, res) => {
     }
 
     const result = await testAlertResultReader.getById(
-      req.auth.company_id,
+      req.auth.effective_company_id,
       testId
     );
     if (!result) {
@@ -7990,7 +8029,7 @@ app.get("/settings/test-alert-history", requireAuth, async (req, res) => {
         ORDER BY created_at DESC, id DESC
         LIMIT $2 OFFSET $3
         `,
-        [req.auth.company_id, limit, offset]
+        [req.auth.effective_company_id, limit, offset]
       ),
       pool.query(
         `
@@ -7999,7 +8038,7 @@ app.get("/settings/test-alert-history", requireAuth, async (req, res) => {
         WHERE company_id = $1
           AND event_type = 'test_alert'
         `,
-        [req.auth.company_id]
+        [req.auth.effective_company_id]
       ),
     ]);
 
@@ -8028,10 +8067,10 @@ app.get("/settings/test-alert-history", requireAuth, async (req, res) => {
 app.get("/settings/alert-configuration", requireAuth, async (req, res) => {
   try {
     const resolution = await alertDispatcher.getAlertRecipientsForCompany(
-      req.auth.company_id
+      req.auth.effective_company_id
     );
     const recipients = resolution.recipients;
-    const savedResult = await getLatestTestAlertResult(req.auth.company_id);
+    const savedResult = await getLatestTestAlertResult(req.auth.effective_company_id);
 
     return res.json({
       status: "ok",
@@ -8088,199 +8127,9 @@ app.get("/settings/config", async (req, res) => {
 // ----------------------------------------------------------
 // SYSTEM STATUS
 // ----------------------------------------------------------
-app.get("/system/status/legacy-internal", requireAuth, async (req, res) => {
-
-  const startedAt = Date.now();
-
-  try {
-
-    let webAppStatus = "offline";
-
-try {
-  const guardWebAppHealthUrl =
-    process.env.GUARD_WEBAPP_HEALTH_URL ||
-    "https://guard.aegislink.noctuacore.ai/health.json";
-  const webCheck = await fetch(
-    guardWebAppHealthUrl,
-    {
-      cache: "no-store"
-    }
-  );
-
-  if (webCheck.ok) {
-    const webData = await webCheck.json();
-
-    if (webData.status === "ok") {
-      webAppStatus = "online";
-    }
-  }
-} catch {
-  webAppStatus = "offline";
-}
-
-    const status = {
-      checked_at: new Date().toISOString(),
-      overall_status: "operational",
-
-      services: {
-
-        web_app: {
-         label: "Web App",
-         status: webAppStatus
-        },
-
-        backend_api: {
-          label: "Backend API",
-          status: "operational",
-          message: "Backend responding"
-        },
-
-        database: {
-          label: "Database",
-          status: "unknown"
-        },
-
-        guard_sessions: {
-          label: "Guard Sessions",
-          status: "unknown"
-        },
-
-        incidents: {
-          label: "Incidents",
-          status: "unknown"
-        },
-
-        sms_gateway: {
-  label: "SMS Gateway",
-  status:
-    process.env.VONAGE_API_KEY &&
-    process.env.VONAGE_API_SECRET &&
-    process.env.VONAGE_SMS_FROM
-      ? "operational"
-      : "offline",
-  configured:
-    Boolean(
-      process.env.VONAGE_API_KEY &&
-      process.env.VONAGE_API_SECRET &&
-      process.env.VONAGE_SMS_FROM
-    )
-},
-
-        voice_calls: {
-  label: "Voice Calls",
-  status:
-    process.env.VONAGE_APPLICATION_ID &&
-    process.env.VONAGE_PRIVATE_KEY &&
-    process.env.VONAGE_FROM_NUMBER
-      ? "operational"
-      : "offline",
-  configured:
-    Boolean(
-      process.env.VONAGE_APPLICATION_ID &&
-      process.env.VONAGE_PRIVATE_KEY &&
-      process.env.VONAGE_FROM_NUMBER
-    )
-},
-
-        ai_intake: {
-  label: "AI Intake",
-  status: process.env.OPENAI_API_KEY
-    ? "operational"
-    : "offline",
-  configured: Boolean(process.env.OPENAI_API_KEY)
-}
-
-      }
-
-    };
-
-    // DATABASE
-
-    const dbCheck =
-      await pool.query(
-        "SELECT NOW() AS server_time"
-      );
-
-    status.services.database = {
-      label: "Database",
-      status: "operational",
-      server_time:
-        dbCheck.rows[0].server_time
-    };
-
-    // ACTIVE GUARDS
-
-    const guards =
-  await pool.query(`
-SELECT COUNT(*)::int AS active_guards
-
-FROM guard_sessions gs
-INNER JOIN guards g
-  ON g.id = gs.guard_id
-
-WHERE gs.logout_time IS NULL
-
-AND g.access_mode = 'standard'
-
-AND (
-  gs.scheduled_shift_end IS NULL
-  OR gs.scheduled_shift_end + INTERVAL '15 minutes'
-     > (NOW() AT TIME ZONE 'Europe/Athens')
-)
-
-AND gs.last_heartbeat >
-NOW() - INTERVAL '90 seconds'
-`);
-
-    status.services.guard_sessions = {
-      label: "Guard Sessions",
-      status: "operational",
-      active_guards:
-        guards.rows[0].active_guards
-    };
-
-    // INCIDENTS
-
-    const incidents =
-      await pool.query(`
-SELECT COUNT(*)::int AS active_incidents
-
-FROM incidents
-
-WHERE status IN (
-'active',
-'in_progress'
-)
-`);
-
-    status.services.incidents = {
-      label: "Incidents",
-      status: "operational",
-      active_incidents:
-        incidents.rows[0]
-        .active_incidents
-    };
-
-    status.response_time_ms =
-      Date.now() - startedAt;
-
-    res.json(status);
-
-  } catch(err){
-
-    console.error(
-      "System status error:",
-      err
-    );
-
-    res.status(500).json({
-      overall_status:"degraded",
-      message:err.message
-    });
-
-  }
-
-});
+// Retired: the legacy endpoint returned platform-wide operational counts.
+app.get("/system/status/legacy-internal", requireAuth, (_req, res) =>
+  res.status(410).json({ status: "error", code: "ENDPOINT_RETIRED" }));
 
 app.use(
   "/admin/patrol-corrections",
@@ -8322,7 +8171,7 @@ app.get("/system/status", async (_req, res) => {
 app.get("/system/status/tenant", requireAuth, async (req, res) => {
   try {
     return res.json(
-      await systemStatusService.getTenantStatus(req.auth.company_id)
+      await systemStatusService.getTenantStatus(req.auth.effective_company_id)
     );
   } catch (err) {
     console.error("Tenant system status error:", err);
@@ -8718,7 +8567,7 @@ app.post('/webhooks/event', eventHook);
 app.get("/incidents/live", requireAuth, async (req, res) => {
 
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
     const result = await pool.query(
   `
@@ -8754,15 +8603,15 @@ app.get("/incidents/live", requireAuth, async (req, res) => {
     ON g.id = i.guard_ref
 
   WHERE (
-    $1::boolean = true
-    OR s.company_id = $2
+    $1::boolean IS FALSE
+    AND s.company_id = $2
   )
 
   ORDER BY i.trigger_time DESC
   `,
   [
-    isSystemOwner,
-    req.auth.company_id,
+    tenantBypass,
+    req.auth.effective_company_id,
   ]
 );
 
@@ -8780,7 +8629,7 @@ app.get("/incidents/live", requireAuth, async (req, res) => {
 
 app.get("/incidents/site-monitoring", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
     await pool.query(
   `
   UPDATE incidents i
@@ -8792,13 +8641,13 @@ app.get("/incidents/site-monitoring", requireAuth, async (req, res) => {
     AND i.auto_reset_time IS NOT NULL
     AND i.auto_reset_time <= NOW()
     AND (
-      $1::boolean = true
-      OR s.company_id = $2
+      $1::boolean IS FALSE
+      AND s.company_id = $2
     )
   `,
   [
-    isSystemOwner,
-    req.auth.company_id,
+    tenantBypass,
+    req.auth.effective_company_id,
   ]
 );
 
@@ -8919,14 +8768,14 @@ END AS display_status
   LIMIT 1
 ) ae ON true
 WHERE (
-  $1::boolean = true
-  OR s.company_id = $2
+  $1::boolean IS FALSE
+  AND s.company_id = $2
 )
       ORDER BY s.id ASC
       `,
   [
-    isSystemOwner,
-    req.auth.company_id,
+    tenantBypass,
+    req.auth.effective_company_id,
   ]
 );
 
@@ -9013,8 +8862,8 @@ app.get(
       await ensureIncidentGuardResponsesTable();
 
       const incidentId = Number(req.params.id);
-      const isSystemOwner =
-        req.auth.role === "system_owner";
+      const tenantBypass =
+        false;
 
       if (
         !Number.isInteger(incidentId) ||
@@ -9035,14 +8884,14 @@ app.get(
           ON s.id = i.site_id
         WHERE i.id = $1
           AND (
-            $2::boolean = true
-            OR s.company_id = $3
+            $2::boolean IS FALSE
+            AND s.company_id = $3
           )
         `,
         [
           incidentId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -9102,8 +8951,8 @@ app.post(
   async (req, res) => {
     try {
       const incidentId = Number(req.params.id);
-      const isSystemOwner =
-        req.auth.role === "system_owner";
+      const tenantBypass =
+        false;
 
       if (
         !Number.isInteger(incidentId) ||
@@ -9124,14 +8973,14 @@ app.post(
           ON s.id = i.site_id
         WHERE i.id = $1
           AND (
-            $2::boolean = true
-            OR s.company_id = $3
+            $2::boolean IS FALSE
+            AND s.company_id = $3
           )
         `,
         [
           incidentId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -9232,15 +9081,15 @@ app.post(
 
 app.get("/incidents/resolved", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
     const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
+  req.auth.effective_company_id
 );
     const { date, site_id } = req.query;
 
     const values = [
-  isSystemOwner,
-  req.auth.company_id,
+  tenantBypass,
+  req.auth.effective_company_id,
 ];
     let query = `
       SELECT
@@ -9299,8 +9148,8 @@ app.get("/incidents/resolved", requireAuth, async (req, res) => {
 
       WHERE i.status = 'resolved'
       AND (
-  $1::boolean = true
-  OR s.company_id = $2
+  $1::boolean IS FALSE
+  AND s.company_id = $2
 )
     `;
 
@@ -9414,10 +9263,10 @@ app.get(
   const incidentId = Number(req.params.id);
 
 const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
+  req.auth.effective_company_id
 );
 
-const isSystemOwner = req.auth.role === "system_owner";
+const tenantBypass = false;
 
 if (
   !Number.isInteger(incidentId) ||
@@ -9454,14 +9303,14 @@ i.incident_location_timestamp,
       LEFT JOIN guards g ON g.id = i.guard_ref
       WHERE i.id = $1
   AND (
-    $2::boolean = true
-    OR s.company_id = $3
+    $2::boolean IS FALSE
+    AND s.company_id = $3
   )
       `,
       [
   incidentId,
-  isSystemOwner,
-  req.auth.company_id,
+  tenantBypass,
+  req.auth.effective_company_id,
 ]
     );
 
@@ -10154,7 +10003,7 @@ app.get(
   async (req, res) => {
     try {
       const siteId = Number(req.params.siteId);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(siteId) || siteId <= 0) {
         return res.status(400).json({
@@ -10169,14 +10018,14 @@ app.get(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -11787,7 +11636,7 @@ app.post(
   async (req, res) => {
     try {
       const siteId = Number(req.params.siteId);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const {
         point_name,
@@ -11844,14 +11693,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -11904,7 +11753,7 @@ app.put(
   async (req, res) => {
     try {
       const pointId = Number(req.params.id);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(pointId) || pointId <= 0) {
         return res.status(400).json({
@@ -11921,15 +11770,15 @@ app.put(
         WHERE pp.id = $1
           AND s.id = pp.site_id
           AND (
-            $2::boolean = true
-            OR s.company_id = $3
+            $2::boolean IS FALSE
+            AND s.company_id = $3
           )
         RETURNING pp.*
         `,
         [
           pointId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -11961,7 +11810,7 @@ app.post(
   async (req, res) => {
     try {
       const pointId = Number(req.params.id);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       if (!Number.isInteger(pointId) || pointId <= 0) {
         return res.status(400).json({
@@ -11980,16 +11829,16 @@ app.post(
         WHERE pp.id = $2
           AND s.id = pp.site_id
           AND (
-            $3::boolean = true
-            OR s.company_id = $4
+            $3::boolean IS FALSE
+            AND s.company_id = $4
           )
         RETURNING pp.*
         `,
         [
           qrToken,
           pointId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -12021,7 +11870,7 @@ app.put(
   async (req, res) => {
     try {
       const pointId = Number(req.params.id);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const normalizedInterval = Number(
         req.body.expected_interval_minutes
@@ -12053,16 +11902,16 @@ app.put(
         WHERE pp.id = $2
           AND s.id = pp.site_id
           AND (
-            $3::boolean = true
-            OR s.company_id = $4
+            $3::boolean IS FALSE
+            AND s.company_id = $4
           )
         RETURNING pp.*
         `,
         [
           normalizedInterval,
           pointId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -12094,7 +11943,7 @@ app.post(
   async (req, res) => {
     try {
       const siteId = Number(req.params.siteId);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const {
         scheduled_date,
@@ -12149,14 +11998,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -12246,7 +12095,7 @@ app.post(
 
     try {
       const siteId = Number(req.params.siteId);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const {
         interval_hours,
@@ -12310,14 +12159,14 @@ app.post(
         FROM sites
         WHERE id = $1
           AND (
-            $2::boolean = true
-            OR company_id = $3
+            $2::boolean IS FALSE
+            AND company_id = $3
           )
         `,
         [
           siteId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -12458,16 +12307,16 @@ app.get(
     try {
       const { siteId } = req.params;
 
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const siteResult = await pool.query(
         `
         SELECT id
         FROM sites
         WHERE id = $1
-          AND ($2::boolean = true OR company_id = $3)
+          AND ($2::boolean IS FALSE AND company_id = $3)
         `,
-        [siteId, isSystemOwner, req.auth.company_id]
+        [siteId, tenantBypass, req.auth.effective_company_id]
       );
 
       if (siteResult.rows.length === 0) {
@@ -12531,7 +12380,7 @@ app.get(
 
 app.get("/patrols/sites", requireAuth, async (req, res) => {
   try {
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
     const result = await pool.query(`
       WITH site_summary AS (
@@ -12824,7 +12673,7 @@ END AS patrol_status,
 
       WHERE
   ss.active_points > 0
-  AND ($1::boolean = true OR EXISTS (
+  AND ($1::boolean IS FALSE AND EXISTS (
     SELECT 1
     FROM sites s
     WHERE s.id = ss.site_id
@@ -12832,7 +12681,7 @@ END AS patrol_status,
   ))
 
             ORDER BY ss.site_id ASC
-    `, [isSystemOwner, req.auth.company_id]);
+    `, [tenantBypass, req.auth.effective_company_id]);
 
     res.json({
       status: "ok",
@@ -12854,16 +12703,16 @@ app.get(
   requireAuth,
   async (req, res) => {
   const { siteId } = req.params;
-  const isSystemOwner = req.auth.role === "system_owner";
+  const tenantBypass = false;
 
 const siteResult = await pool.query(
   `
   SELECT id
   FROM sites
   WHERE id = $1
-    AND ($2::boolean = true OR company_id = $3)
+    AND ($2::boolean IS FALSE AND company_id = $3)
   `,
-  [siteId, isSystemOwner, req.auth.company_id]
+  [siteId, tenantBypass, req.auth.effective_company_id]
 );
 
 if (siteResult.rows.length === 0) {
@@ -12920,7 +12769,7 @@ FROM patrol_points
 
 app.get("/patrol-points/:id/qr", requireAuth, async (req, res) => {
   const pointId = Number(req.params.id);
-  const isSystemOwner = req.auth.role === "system_owner";
+  const tenantBypass = false;
 
   if (!Number.isInteger(pointId) || pointId <= 0) {
     return res.status(400).json({
@@ -12942,11 +12791,11 @@ app.get("/patrol-points/:id/qr", requireAuth, async (req, res) => {
         ON s.id = pp.site_id
       WHERE pp.id = $1
         AND (
-          $2::boolean = true
-          OR s.company_id = $3
+          $2::boolean IS FALSE
+          AND s.company_id = $3
         )
       `,
-      [pointId, isSystemOwner, req.auth.company_id]
+      [pointId, tenantBypass, req.auth.effective_company_id]
     );
 
     if (result.rows.length === 0) {
@@ -13137,8 +12986,8 @@ app.get(
   requireAuth,
   async (req, res) => {
   try {
-    const isSystemOwner =
-  req.auth.role === "system_owner";
+    const tenantBypass =
+  false;
     const result = await pool.query(`
       SELECT
     gs.id AS session_id,
@@ -13161,14 +13010,14 @@ app.get(
   gs.logout_time IS NULL
   AND g.access_mode = 'standard'
   AND (
-    $1::boolean = true
-    OR s.company_id = $2
+    $1::boolean IS FALSE
+    AND s.company_id = $2
   )
   ORDER BY g.full_name ASC
   `,
   [
-    isSystemOwner,
-    req.auth.company_id,
+    tenantBypass,
+    req.auth.effective_company_id,
   ]
 );
 
@@ -13256,7 +13105,7 @@ app.get("/patrols/missed-history", requireAuth, async (req, res) => {
   try {
     const { site_id, point_id, from, to, type = "all" } = req.query;
 
-    const isSystemOwner = req.auth.role === "system_owner";
+    const tenantBypass = false;
 
     const result = await pool.query(
       `
@@ -13524,8 +13373,8 @@ FROM combined
             WHERE ($1::int IS NULL OR site_id = $1::int)
         AND ($2::int IS NULL OR point_id = $2::int)
         AND (
-          $6::boolean = true
-          OR EXISTS (
+          $6::boolean IS FALSE
+          AND EXISTS (
             SELECT 1
             FROM sites tenant_site
             WHERE tenant_site.id = combined.site_id
@@ -13553,8 +13402,8 @@ AND (
   from || null,
   to || null,
   type || "all",
-  isSystemOwner,
-  req.auth.company_id,
+  tenantBypass,
+  req.auth.effective_company_id,
 ]
     );
 
@@ -13574,14 +13423,14 @@ if (siteIds.length > 0) {
 FROM sites
 WHERE id = ANY($1::int[])
   AND (
-    $2::boolean = true
-    OR company_id = $3
+    $2::boolean IS FALSE
+    AND company_id = $3
   )
     `,
     [
   siteIds,
-  isSystemOwner,
-  req.auth.company_id,
+  tenantBypass,
+  req.auth.effective_company_id,
 ]
   );
 
@@ -13641,7 +13490,7 @@ app.get(
   try {
     const { site_id, from, to, point_id, type = "all" } = req.query;
     const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
+  req.auth.effective_company_id
 );
 
     const params = new URLSearchParams();
@@ -13982,7 +13831,7 @@ app.put(
   async (req, res) => {
     try {
       const scheduleId = Number(req.params.scheduleId);
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const cancelReason =
         typeof req.body.cancel_reason === "string" &&
@@ -14012,8 +13861,8 @@ app.put(
           AND ps.cancelled_at IS NULL
           AND s.id = ps.site_id
           AND (
-            $4::boolean = true
-            OR s.company_id = $5
+            $4::boolean IS FALSE
+            AND s.company_id = $5
           )
         RETURNING ps.*
         `,
@@ -14021,8 +13870,8 @@ app.put(
           req.auth.username,
           cancelReason,
           scheduleId,
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -14054,11 +13903,11 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const values = [
-        isSystemOwner,
-        req.auth.company_id,
+        tenantBypass,
+        req.auth.effective_company_id,
       ];
 
       let whereClause = `
@@ -14069,8 +13918,8 @@ app.get(
             COALESCE(c.timezone, 'Europe/Athens')
           )
           AND (
-            $1::boolean = true
-            OR s.company_id = $2
+            $1::boolean IS FALSE
+            AND s.company_id = $2
           )
       `;
 
@@ -14267,7 +14116,7 @@ app.get(
   requireAuth,
   async (req, res) => {
     try {
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const countResult = await pool.query(
         `
@@ -14286,14 +14135,14 @@ app.get(
             COALESCE(c.timezone, 'Europe/Athens')
           )
           AND (
-            $1::boolean = true
-            OR s.company_id = $2
+            $1::boolean IS FALSE
+            AND s.company_id = $2
           )
         GROUP BY pl.site_id
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -14335,8 +14184,8 @@ app.get(
           AND g.site_id = pl.site_id
 
         WHERE (
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
         )
           AND is_company_operational_at(
             s.company_id,
@@ -14348,8 +14197,8 @@ app.get(
         LIMIT 50
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
         ]
       );
 
@@ -14384,7 +14233,7 @@ app.get(
         status = "all",
       } = req.query;
 
-      const isSystemOwner = req.auth.role === "system_owner";
+      const tenantBypass = false;
 
       const parsedSiteId = site_id ? Number(site_id) : null;
       const parsedPointId = point_id ? Number(point_id) : null;
@@ -14451,8 +14300,8 @@ app.get(
           AND g.site_id = pl.site_id
 
         WHERE (
-          $1::boolean = true
-          OR s.company_id = $2
+          $1::boolean IS FALSE
+          AND s.company_id = $2
         )
 
           AND is_company_operational_at(
@@ -14483,8 +14332,8 @@ app.get(
         LIMIT 300
         `,
         [
-          isSystemOwner,
-          req.auth.company_id,
+          tenantBypass,
+          req.auth.effective_company_id,
           parsedSiteId,
           parsedPointId,
           from || null,
@@ -14513,14 +14362,14 @@ app.get(
           FROM sites
           WHERE id = ANY($1::int[])
             AND (
-              $2::boolean = true
-              OR company_id = $3
+              $2::boolean IS FALSE
+              AND company_id = $3
             )
           `,
           [
             siteIds,
-            isSystemOwner,
-            req.auth.company_id,
+            tenantBypass,
+            req.auth.effective_company_id,
           ]
         );
 
@@ -14608,7 +14457,7 @@ app.get(
     } = req.query;
 
     const companyTimezone = await getCompanyTimezone(
-  req.auth.company_id
+  req.auth.effective_company_id
 );
 
     const params = new URLSearchParams();

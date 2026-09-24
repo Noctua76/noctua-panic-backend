@@ -59,7 +59,7 @@ test("patrol read endpoints expose only qr_generated metadata", () => {
     'app.get("/patrols/missed-history"'
   );
   assert.match(qrEndpoint, /pp\.qr_token/);
-  assert.match(qrEndpoint, /OR s\.company_id = \$3/);
+  assert.match(qrEndpoint, /AND s\.company_id = \$3/);
 });
 
 test("revoked Dashboard bearer sessions have a stable invalid-session response", () => {

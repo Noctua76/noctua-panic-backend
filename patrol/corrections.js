@@ -306,6 +306,14 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
         });
       }
 
+      const siteOwnership = await pool.query(
+        "SELECT id FROM sites WHERE id=$1 AND company_id=$2",
+        [siteId, req.auth.effective_company_id]
+      );
+      if (!siteOwnership.rows.length) {
+        return res.status(404).json({ status: "error", message: "Site not found" });
+      }
+
       const result = await pool.query(
         `
         WITH completed AS (
@@ -514,7 +522,7 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
 
       const occurrence = await loadOccurrence(pool, occurrenceKey);
 
-      if (!occurrence) {
+      if (!occurrence || Number(occurrence.company_id) !== Number(req.auth.effective_company_id)) {
         return res.status(404).json({
           status: "error",
           message: "Patrol occurrence was not found or is not eligible",

@@ -96,8 +96,8 @@ test("live Guard locations remain tenant scoped", () => {
   const end = serverSource.indexOf("// ----------------------------------------------------------\n// START SERVER", start);
   const route = serverSource.slice(start, end);
 
-  assert.match(route, /\$1::boolean = true\s*OR s\.company_id = \$2/);
-  assert.match(route, /req\.auth\.company_id/);
+  assert.match(route, /\$1::boolean IS FALSE\s*AND s\.company_id = \$2/);
+  assert.match(route, /req\.auth\.effective_company_id/);
 });
 
 test("Guard coordinates accept zero and reject missing or non-finite values", () => {

@@ -94,10 +94,10 @@ test("regular admin filters are always tenant scoped", () => {
   assert.deepEqual(result.values, [42]);
 });
 
-test("system owner may explicitly filter a company", () => {
-  const result = buildAdminFilters({ company_id: "8" }, { role: "system_owner", company_id: 1 });
+test("system owner cannot change Shift Report tenant with a query parameter", () => {
+  const result = buildAdminFilters({ company_id: "8" }, { role: "system_owner", company_id: 1, effective_company_id: 7 });
   assert.match(result.where, /r\.company_id = \$1/);
-  assert.deepEqual(result.values, [8]);
+  assert.deepEqual(result.values, [7]);
 });
 
 test("site, guard and lifecycle filters are parameterized", () => {

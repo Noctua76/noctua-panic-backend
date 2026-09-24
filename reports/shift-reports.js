@@ -108,8 +108,7 @@ function buildAdminFilters(query, auth, startIndex = 1) {
     values.push(value);
     clauses.push(sql.replace("?", `$${startIndex + values.length - 1}`));
   };
-  if (auth.role !== "system_owner") add("r.company_id = ?", auth.company_id);
-  else if (query.company_id) add("r.company_id = ?", normalizePositiveInteger(query.company_id, "company_id"));
+  add("r.company_id = ?", auth.effective_company_id ?? auth.company_id);
   if (query.site_id) add("r.site_id = ?", normalizePositiveInteger(query.site_id, "site_id"));
   if (query.guard_id) add("r.guard_id = ?", normalizePositiveInteger(query.guard_id, "guard_id"));
   if (query.category) {
@@ -220,7 +219,6 @@ function formatShiftWallClock(value) {
 
 function describeFilters(query = {}) {
   const entries = [
-    ["Company", query.company_id],
     ["Site", query.site_id],
     ["Guard", query.guard_id],
     ["From", query.from],
@@ -379,10 +377,8 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
     const id = normalizePositiveInteger(reportId, "report id");
     const values = [id];
     let scope = "";
-    if (req.auth.role !== "system_owner") {
-      values.push(req.auth.company_id);
-      scope = ` AND r.company_id=$${values.length}`;
-    }
+    values.push(req.auth.effective_company_id ?? req.auth.company_id);
+    scope = ` AND r.company_id=$${values.length}`;
     const result = await client.query(
       `SELECT ${REPORT_SELECT} WHERE r.id=$1${scope} LIMIT 1${lock ? " FOR UPDATE OF r" : ""}`,
       values
@@ -395,10 +391,8 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
     try {
       const values = [];
       let scope = "";
-      if (req.auth.role !== "system_owner") {
-        values.push(req.auth.company_id);
-        scope = " AND company_id=$1";
-      }
+      values.push(req.auth.effective_company_id ?? req.auth.company_id);
+      scope = " AND company_id=$1";
       const result = await pool.query(
         `SELECT COUNT(*)::int AS unread FROM guard_shift_reports WHERE status='NEW'${scope}`,
         values

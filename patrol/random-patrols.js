@@ -157,16 +157,15 @@ async function generateRandomPatrolsForCurrentLocalDay(pool) {
 }
 
 async function getAuthorizedSite(pool, auth, siteId) {
-  const isSystemOwner = auth.is_system_owner === true || auth.role === "system_owner";
   const result = await pool.query(
     `
     SELECT s.id, s.company_id, s.name, COALESCE(c.timezone, 'Europe/Athens') AS timezone,
            c.name AS company_name
     FROM sites s
     INNER JOIN companies c ON c.id = s.company_id
-    WHERE s.id = $1 AND ($2::boolean = TRUE OR s.company_id = $3)
+    WHERE s.id = $1 AND $2::boolean IS FALSE AND s.company_id = $3
     `,
-    [siteId, isSystemOwner, auth.company_id]
+    [siteId, false, auth.effective_company_id ?? auth.company_id]
   );
   return result.rows[0] || null;
 }
