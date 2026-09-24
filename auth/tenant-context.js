@@ -1,4 +1,6 @@
+const crypto = require("node:crypto");
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const READ_ONLY_CONTROL_PATHS = new Set([
   "/admin/heartbeat", "/admin/logout",
   "/admin/tenant-context/enter", "/admin/tenant-context/elevate",
@@ -38,16 +40,63 @@ function canMutateTenantRequest(auth, method, path) {
   return SAFE_METHODS.has(method) || READ_ONLY_CONTROL_PATHS.has(path);
 }
 
-async function recordTenantAudit(queryable, auth, eventType, targetCompanyId, method, path, status, mode = null, reason = null) {
+async function recordTenantAudit(queryable, auth, eventType, targetCompanyId, method, path, status, mode = null, reason = null, requestId = null) {
   await queryable.query(
     `INSERT INTO system_owner_tenant_access_audit
        (session_id, actor_user_id, actor_username, actor_home_company_id,
-        target_company_id, event_type, mode, reason, request_method, request_path, response_status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        target_company_id, event_type, mode, reason, request_method, request_path, response_status, request_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [auth.session_id, auth.user_id, auth.username, auth.actor_company_id,
       targetCompanyId, eventType, mode ?? auth.tenant_context_mode,
-      reason ?? auth.tenant_context_reason, method, path, status]
+      reason ?? auth.tenant_context_reason, method, path, status, requestId]
   );
+}
+
+async function enforceTenantContextBoundary(req, res, pool, requestPath) {
+  const auth = req.auth;
+  if (!auth.tenant_context_active) return false;
+
+  if (requestPath.startsWith("/admin/companies") ||
+      requestPath.startsWith("/admin/roles") ||
+      requestPath.startsWith("/admin/temporary-access") ||
+      requestPath === "/system/status/global" ||
+      requestPath === "/send-sms" || requestPath === "/test-sms") {
+    res.status(403).json({ status: "error", code: "PLATFORM_CONTROL_UNAVAILABLE_IN_TENANT" });
+    return true;
+  }
+  if (!auth.tenant_context_can_mutate &&
+      /^\/patrol-points\/[^/]+\/qr\/?$/.test(requestPath)) {
+    res.status(403).json({ status: "error", code: "TENANT_CONTEXT_READ_ONLY" });
+    return true;
+  }
+  if (!canMutateTenantRequest(auth, req.method, requestPath)) {
+    res.status(403).json({ status: "error", code: "TENANT_CONTEXT_READ_ONLY" });
+    return true;
+  }
+
+  if (auth.tenant_context_can_mutate && MUTATION_METHODS.has(req.method) &&
+      !requestPath.startsWith("/admin/tenant-context/") &&
+      requestPath !== "/admin/heartbeat" && requestPath !== "/admin/logout") {
+    const requestId = crypto.randomUUID();
+    // Await a committed insert before any operational route can run.
+    try {
+      await recordTenantAudit(pool, auth, "TENANT_MUTATION_ATTEMPT", auth.effective_company_id,
+        req.method, requestPath, null, "administrative", auth.tenant_context_reason, requestId);
+    } catch (error) {
+      console.error("CRITICAL Tenant mutation attempt audit unavailable", requestId, error);
+      res.status(503).json({ status: "error", code: "TENANT_AUDIT_UNAVAILABLE" });
+      return true;
+    }
+
+    // Capture the actor and context now; the response may finish after other middleware runs.
+    const auditAuth = { ...auth };
+    res.once("finish", () => {
+      recordTenantAudit(pool, auditAuth, "TENANT_MUTATION_RESULT", auditAuth.effective_company_id,
+        req.method, requestPath, res.statusCode, "administrative", auditAuth.tenant_context_reason, requestId)
+        .catch(error => console.error("CRITICAL Tenant mutation result audit failed", requestId, error));
+    });
+  }
+  return false;
 }
 
 function createTenantContextRouter({ pool, requireAuth }) {
@@ -157,4 +206,4 @@ function createTenantContextRouter({ pool, requireAuth }) {
   return router;
 }
 
-module.exports = { resolveTenantContext, canMutateTenantRequest, recordTenantAudit, createTenantContextRouter };
+module.exports = { resolveTenantContext, canMutateTenantRequest, recordTenantAudit, enforceTenantContextBoundary, createTenantContextRouter };

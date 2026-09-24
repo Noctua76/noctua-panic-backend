@@ -17,6 +17,7 @@ const MIGRATIONS = [
   "2026-09-27-company-inactive-intervals.sql",
   "2026-09-28-guard-location-geocoding.sql",
   "2026-09-29-system-owner-tenant-context.sql",
+  "2026-09-30-system-owner-mutation-audit.sql",
 ];
 
 async function runMigrations(pool) {

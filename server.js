@@ -47,7 +47,7 @@ const { resetDashboardUserPassword } = require("./auth/dashboard-user-password-r
 const { enforceDashboardPasswordChange } = require("./auth/dashboard-password-gate");
 const { changeDashboardPassword } = require("./auth/dashboard-password-change");
 const { createCompaniesRouter } = require("./admin/companies");
-const { resolveTenantContext, canMutateTenantRequest, recordTenantAudit, createTenantContextRouter } = require("./auth/tenant-context");
+const { resolveTenantContext, recordTenantAudit, enforceTenantContextBoundary, createTenantContextRouter } = require("./auth/tenant-context");
 const { INCIDENT_RESOLVED_RECENT_HOURS } = require("./incident-timeline");
 const {
   GUARD_LOCATION_UPDATE_SQL,
@@ -2414,25 +2414,7 @@ company_id: auth.company_id,
       } finally { auditClient.release(); }
     }
     const requestPath = getRequestPath(req);
-    if (req.auth.tenant_context_active &&
-        (requestPath.startsWith("/admin/companies") ||
-         (requestPath.startsWith("/admin/roles") && !READ_ONLY_SAFE_METHODS.has(req.method)) ||
-         requestPath.startsWith("/admin/temporary-access") || requestPath === "/system/status/global" ||
-         requestPath === "/send-sms" || requestPath === "/test-sms")) {
-      return res.status(403).json({ status: "error", code: "PLATFORM_CONTROL_UNAVAILABLE_IN_TENANT" });
-    }
-    if (!canMutateTenantRequest(req.auth, req.method, requestPath)) {
-      return res.status(403).json({ status: "error", code: "TENANT_CONTEXT_READ_ONLY" });
-    }
-    if (req.auth.tenant_context_active && req.auth.tenant_context_can_mutate &&
-        !READ_ONLY_SAFE_METHODS.has(req.method) &&
-        !requestPath.startsWith("/admin/tenant-context/") &&
-        !new Set(["/admin/heartbeat", "/admin/logout"]).has(requestPath)) {
-      res.once("finish", () => {
-        recordTenantAudit(pool, req.auth, "TENANT_MUTATION", req.auth.effective_company_id,
-          req.method, requestPath, res.statusCode).catch(error => console.error("Tenant mutation audit failed", error));
-      });
-    }
+    if (await enforceTenantContextBoundary(req, res, pool, requestPath)) return;
 
     if (enforceDashboardPasswordChange(req, res)) {
       return;
