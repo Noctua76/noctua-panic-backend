@@ -4,7 +4,8 @@ function suggestSitePrefix(name) {
   const words = String(name || "").toUpperCase().match(/[A-Z0-9]+/g) || [];
   if (/^DEFENSOR CIVITATIS SECURITY$/i.test(String(name || "").trim())) return "DEF";
   const initials = words.slice(0, 3).map(word => word[0]).join("");
-  return initials.length >= 2 ? initials : (words[0] || "").slice(0, 3);
+  const candidate = initials.length >= 2 ? initials : (words[0] || "").slice(0, 3);
+  return candidate.length >= 2 ? candidate : "CO";
 }
 
 function formatSiteCode(prefix, number) {
