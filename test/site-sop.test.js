@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { registerSiteSopRoutes } = require("../site-sop");
+const { registerSiteSopRoutes, legacyPublicObject } = require("../site-sop");
 
 function setup(companyId = 1) {
   const routes = {};
@@ -41,4 +41,14 @@ test("private SOP download succeeds only in owning tenant", async () => {
   await denied.route(denied.req, denied.res);
   assert.equal(denied.res.code, 404);
   assert.equal(denied.downloads(), 0);
+});
+
+test("legacy cleanup is limited to the same provider, bucket and site", () => {
+  const site = { id: 17, company_id: 1 };
+  const provider = "https://project.supabase.co";
+  const path = "/storage/v1/object/public/aegis-sop-files/sites/site-17/sop.pdf";
+  assert.equal(legacyPublicObject(provider + path, site, provider, "aegis-sop-files"), "sites/site-17/sop.pdf");
+  assert.equal(legacyPublicObject("https://other.supabase.co" + path, site, provider, "aegis-sop-files"), null);
+  assert.equal(legacyPublicObject(provider + path.replace("site-17", "site-18"), site, provider, "aegis-sop-files"), null);
+  assert.equal(legacyPublicObject(provider + path.replace("aegis-sop-files", "other-bucket"), site, provider, "aegis-sop-files"), null);
 });

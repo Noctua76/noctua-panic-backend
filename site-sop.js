@@ -1,4 +1,19 @@
 const PRIVATE_BUCKET = "aegis-site-sops-private";
+const crypto = require("node:crypto");
+
+function legacyPublicObject(url, site, supabaseUrl, bucket) {
+  if (!url || !supabaseUrl) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.origin !== new URL(supabaseUrl).origin || parsed.search || parsed.hash) return null;
+    const prefix = `/storage/v1/object/public/${bucket}/`;
+    if (!parsed.pathname.startsWith(prefix)) return null;
+    const path = decodeURIComponent(parsed.pathname.slice(prefix.length));
+    if (!path.startsWith(`sites/site-${site.id}/`) &&
+        !path.startsWith(`companies/company-${site.company_id}/sites/site-${site.id}/`)) return null;
+    return path;
+  } catch { return null; }
+}
 
 function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
   async function privateBucket() {
@@ -23,7 +38,7 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
     const id = Number(req.params.id);
     if (!Number.isSafeInteger(id) || id <= 0) return null;
     const result = await pool.query(
-      `SELECT id, company_id, sop_storage_path FROM sites WHERE id=$1 AND company_id=$2`,
+      `SELECT id, company_id, sop_storage_path, sop_file_url FROM sites WHERE id=$1 AND company_id=$2`,
       [id, req.auth.effective_company_id]
     );
     return result.rows[0] || null;
@@ -55,13 +70,20 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
         return res.status(400).json({ status: "error", message: "A PDF file is required" });
       }
       const bucket = await privateBucket();
-      const path = `companies/company-${site.company_id}/sites/site-${site.id}/sop-${Date.now()}-${require("node:crypto").randomUUID()}.pdf`;
+      const path = `companies/company-${site.company_id}/sites/site-${site.id}/sop-${Date.now()}-${crypto.randomUUID()}.pdf`;
       const { error } = await bucket.upload(path, req.file.buffer, { contentType: "application/pdf", upsert: false });
       if (error) throw error;
+      const verified = await bucket.download(path);
+      if (verified.error || !verified.data ||
+          crypto.createHash("sha256").update(Buffer.from(await verified.data.arrayBuffer())).digest("hex") !==
+          crypto.createHash("sha256").update(req.file.buffer).digest("hex")) {
+        await bucket.remove([path]).catch(() => {});
+        throw new Error("Private SOP copy failed integrity verification");
+      }
       let updated;
       try {
         updated = await pool.query(
-          `UPDATE sites SET sop_storage_path=$1, sop_file_url=NULL, sop_updated_at=NOW()
+          `UPDATE sites SET sop_storage_path=$1, sop_updated_at=NOW()
            WHERE id=$2 AND company_id=$3 RETURNING id, sop_updated_at`,
           [path, site.id, site.company_id]
         );
@@ -69,7 +91,28 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
         await bucket.remove([path]).catch(() => {});
         throw error;
       }
-      return res.json({ status: "ok", site: updated.rows[0], sop_available: true });
+      const legacyBucket = process.env.SUPABASE_SOP_BUCKET || "aegis-sop-files";
+      const legacyPath = legacyPublicObject(site.sop_file_url, site, process.env.SUPABASE_URL, legacyBucket);
+      let publicCopyRemoved = false;
+      if (legacyPath) {
+        try {
+          const old = await supabase.storage.from(legacyBucket).download(legacyPath);
+          if (!old.error && old.data &&
+              crypto.createHash("sha256").update(Buffer.from(await old.data.arrayBuffer())).digest("hex") ===
+              crypto.createHash("sha256").update(req.file.buffer).digest("hex")) {
+            const removal = await supabase.storage.from(legacyBucket).remove([legacyPath]);
+            if (!removal.error) publicCopyRemoved = true;
+          }
+        } catch (cleanupError) {
+          console.error("Legacy public SOP cleanup failed", cleanupError);
+        }
+      }
+      if (publicCopyRemoved || !site.sop_file_url) {
+        await pool.query(`UPDATE sites SET sop_file_url=NULL WHERE id=$1 AND company_id=$2 AND sop_storage_path=$3`,
+          [site.id, site.company_id, path]);
+      }
+      return res.json({ status: "ok", site: updated.rows[0], sop_available: true,
+        public_copy_removed: publicCopyRemoved, legacy_public_copy_pending: Boolean(site.sop_file_url && !publicCopyRemoved) });
     } catch (error) {
       console.error("Private SOP upload failed", error);
       return res.status(503).json({ status: "error", message: "Private SOP storage unavailable" });
@@ -77,4 +120,4 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
   });
 }
 
-module.exports = { registerSiteSopRoutes, PRIVATE_BUCKET };
+module.exports = { registerSiteSopRoutes, legacyPublicObject, PRIVATE_BUCKET };
