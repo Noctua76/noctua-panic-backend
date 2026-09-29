@@ -1,0 +1,1 @@
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS sop_storage_path TEXT;
