@@ -32,6 +32,7 @@ const {
 const { PATROL_TIMING } = require("./patrol/lifecycle");
 const { createShiftReportsRouter } = require("./reports/shift-reports");
 const { createSupabaseGuardReportsStorage } = require("./storage/supabase-storage");
+const { registerSiteSopRoutes } = require("./site-sop");
 const {
   PASSWORD_SETUP_TOKEN_TTL_MINUTES,
   commitGuardPasswordReset,
@@ -6379,6 +6380,7 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
   sites.operational_notes,
   sites.sop_text,
   sites.sop_file_url,
+  sites.sop_storage_path,
   sites.sop_title,
   sites.sop_version,
   sites.sop_updated_at,
@@ -6544,7 +6546,7 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         supervisor_contact_phone = COALESCE($11, supervisor_contact_phone),
         operational_notes = COALESCE($12, operational_notes),
         sop_text = COALESCE($13, sop_text),
-        sop_file_url = COALESCE($14, sop_file_url),
+        sop_file_url = sop_file_url,
         sop_title = COALESCE($15, sop_title),
         sop_version = COALESCE($16, sop_version),
         sop_updated_at = CASE
@@ -6583,7 +6585,7 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         supervisor_contact_phone || null,
         operational_notes || null,
         sop_text || null,
-        sop_file_url || null,
+        null, // Public SOP URLs cannot be set through the site profile.
         sop_title || null,
         sop_version || null,
         coverage_type || null,
@@ -6620,143 +6622,7 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
   }
 });
 
-app.post(
-  "/settings/sites/:id/sop/upload",
-  requireAuth,
-  upload.single("sop_file"),
-  async (req, res) => {
-    try {
-      const siteId = Number(req.params.id);
-      const tenantBypass = false;
-
-      if (!Number.isInteger(siteId) || siteId <= 0) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid site id",
-        });
-      }
-
-      const siteResult = await pool.query(
-        `
-        SELECT
-          id,
-          company_id
-        FROM sites
-        WHERE id = $1
-          AND (
-            $2::boolean IS FALSE
-            AND company_id = $3
-          )
-        `,
-        [
-          siteId,
-          tenantBypass,
-          req.auth.effective_company_id,
-        ]
-      );
-
-      if (siteResult.rows.length === 0) {
-        return res.status(404).json({
-          status: "error",
-          message: "Site not found",
-        });
-      }
-
-      if (!req.file) {
-        return res.status(400).json({
-          status: "error",
-          message: "No SOP file uploaded",
-        });
-      }
-
-      if (req.file.mimetype !== "application/pdf") {
-        return res.status(400).json({
-          status: "error",
-          message: "Only PDF files are allowed",
-        });
-      }
-
-      const bucket =
-        process.env.SUPABASE_SOP_BUCKET || "aegis-sop-files";
-
-      const safeOriginalName = req.file.originalname
-        .replace(/\s+/g, "-")
-        .replace(/[^a-zA-Z0-9._-]/g, "");
-
-      const filePath =
-        `companies/company-${siteResult.rows[0].company_id}/` +
-        `sites/site-${siteId}/` +
-        `sop-${Date.now()}-${safeOriginalName}`;
-
-      const { error: uploadError } = await supabase.storage
-        .from(bucket)
-        .upload(filePath, req.file.buffer, {
-          contentType: "application/pdf",
-          upsert: true,
-        });
-
-      if (uploadError) {
-        console.error(
-          "Supabase SOP upload error:",
-          uploadError
-        );
-
-        return res.status(500).json({
-          status: "error",
-          message: "Failed to upload SOP file",
-        });
-      }
-
-      const { data: publicUrlData } = supabase.storage
-        .from(bucket)
-        .getPublicUrl(filePath);
-
-      const publicUrl = publicUrlData.publicUrl;
-
-      const result = await pool.query(
-        `
-        UPDATE sites
-        SET
-          sop_file_url = $1,
-          sop_updated_at = NOW()
-        WHERE id = $2
-          AND (
-            $3::boolean IS FALSE
-            AND company_id = $4
-          )
-        RETURNING *
-        `,
-        [
-          publicUrl,
-          siteId,
-          tenantBypass,
-          req.auth.effective_company_id,
-        ]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          status: "error",
-          message: "Site not found",
-        });
-      }
-
-      return res.json({
-        status: "ok",
-        message: "SOP file uploaded",
-        site: result.rows[0],
-        sop_file_url: publicUrl,
-      });
-    } catch (err) {
-      console.error("SOP upload endpoint error:", err);
-
-      return res.status(500).json({
-        status: "error",
-        message: "SOP upload failed",
-      });
-    }
-  }
-);
+registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload });
 
 app.post(
   "/settings/sites/:id/documents/:slot/upload",
