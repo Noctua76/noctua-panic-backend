@@ -4382,7 +4382,7 @@ app.post("/guard/login", async (req, res) => {
     if (guard.password_hash && guard.password_hash.startsWith("$2")) {
       validPassword = await bcrypt.compare(password, guard.password_hash);
     } else {
-      validPassword = password === guard.password_hash;
+      await bcrypt.compare(password, INVALID_ACCOUNT_PASSWORD_HASH);
     }
 
     if (!validPassword) {
