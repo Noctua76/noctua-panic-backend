@@ -192,6 +192,55 @@ test("guard login returns password change requirement before session creation", 
   assert.ok(branch > 0 && sessionInsert > branch);
 });
 
+test("guard login uses bcrypt and a dummy comparison without a plaintext fallback", () => {
+  const start = serverSource.indexOf('app.post("/guard/login"');
+  const end = serverSource.indexOf('app.post("/guard/change-password"', start);
+  assert.ok(start >= 0 && end > start);
+  const route = serverSource.slice(start, end);
+
+  assert.doesNotMatch(route, /\bpassword\s*={2,3}\s*guard\.password_hash\b/);
+  assert.doesNotMatch(route, /\bguard\.password_hash\s*={2,3}\s*password\b/);
+  assert.match(route, /if\s*\(guard\.password_hash\s*&&\s*guard\.password_hash\.startsWith\("\$2"\)\)\s*\{\s*validPassword\s*=\s*await bcrypt\.compare\(password, guard\.password_hash\);\s*\}\s*else\s*\{\s*await bcrypt\.compare\(password, INVALID_ACCOUNT_PASSWORD_HASH\);\s*\}/);
+});
+
+test("guard login verification accepts valid bcrypt and rejects legacy or malformed credentials", async () => {
+  const bcrypt = require("bcrypt");
+  const routeStart = serverSource.indexOf('app.post("/guard/login"');
+  const start = serverSource.indexOf("let validPassword = false;", routeStart);
+  const end = serverSource.indexOf("if (!validPassword)", start);
+  assert.ok(routeStart >= 0 && start > routeStart && end > start);
+  const dummyHash = serverSource.match(/const INVALID_ACCOUNT_PASSWORD_HASH\s*=\s*"([^"]+)";/)[1];
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const verify = new AsyncFunction(
+    "bcrypt", "password", "guard", "INVALID_ACCOUNT_PASSWORD_HASH",
+    `${serverSource.slice(start, end)}\nreturn validPassword;`
+  );
+  const password = "Guard-Test-Password-1!";
+  const hash = await bcrypt.hash(password, 4);
+  const calls = [];
+  const trackedBcrypt = {
+    async compare(supplied, stored) {
+      calls.push([supplied, stored]);
+      return bcrypt.compare(supplied, stored);
+    },
+  };
+
+  assert.equal(await verify(trackedBcrypt, password, { password_hash: hash }, dummyHash), true);
+  assert.deepEqual(calls.pop(), [password, hash]);
+  assert.equal(await verify(trackedBcrypt, "Wrong-Password-1!", { password_hash: hash }, dummyHash), false);
+  assert.deepEqual(calls.pop(), ["Wrong-Password-1!", hash]);
+
+  for (const stored of [password, "malformed-hash", "", null]) {
+    assert.equal(await verify(trackedBcrypt, password, { password_hash: stored }, dummyHash), false);
+    assert.deepEqual(calls.pop(), [password, dummyHash]);
+  }
+  for (const stored of ["$2", "$2b$10$malformed"]) {
+    assert.equal(await verify(trackedBcrypt, password, { password_hash: stored }, dummyHash), false);
+    assert.deepEqual(calls.pop(), [password, stored]);
+  }
+  assert.equal(calls.length, 0);
+});
+
 test("expired temporary password has a dedicated error code", () => {
   assert.match(serverSource, /code: "TEMP_PASSWORD_EXPIRED"/);
 });
