@@ -12400,17 +12400,10 @@ AND gs.expected_slot < w.day_end
         'point_name', u.point_name,
         'schedule_type', u.schedule_type,
         'scheduled_at',
-          CASE
-            WHEN u.schedule_type = 'manual'
-            THEN to_char(
-              u.scheduled_at,
-              'YYYY-MM-DD"T"HH24:MI:SS.MS'
-            )
-            ELSE to_char(
-  u.scheduled_at,
-  'YYYY-MM-DD"T"HH24:MI:SS.MS'
-)
-          END,
+          to_char(
+            (u.scheduled_at AT TIME ZONE u.timezone) AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          ),
         'status',
   CASE
   WHEN u.scheduled_at + INTERVAL '2 hours' <= (NOW() AT TIME ZONE u.timezone)
@@ -12473,8 +12466,8 @@ END,
         CASE
   WHEN sn.next_patrol IS NULL THEN NULL
   ELSE to_char(
-    sn.next_patrol,
-    'YYYY-MM-DD"T"HH24:MI:SS.MS'
+    (sn.next_patrol AT TIME ZONE sn.next_timezone) AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
   )
 END AS next_patrol,
 sn.next_patrol_point_id,
