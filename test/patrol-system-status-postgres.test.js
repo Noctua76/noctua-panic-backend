@@ -5,7 +5,7 @@ const { PATROL_MISSED_STATS_SQL } = require("../patrol/system-status-missed");
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
-test("System Status counts recurring, manual and random missed patrols at the exact two-hour boundary", {
+test("System Status counts all patrol types at +2h and excludes inactive manual schedules", {
   skip: !databaseUrl && "TEST_DATABASE_URL is not configured",
 }, async () => {
   const client = new Client({ connectionString: databaseUrl });
@@ -94,7 +94,8 @@ test("System Status counts recurring, manual and random missed patrols at the ex
         (101, 10, 'manual', TRUE, TIMESTAMPTZ '2026-10-18 00:00:00+03', DATE '2026-10-18', TIME '17:59'),
         (102, 10, 'manual', TRUE, TIMESTAMPTZ '2026-10-18 00:00:00+03', DATE '2026-10-18', TIME '18:01'),
         (103, 10, 'manual', TRUE, TIMESTAMPTZ '2026-10-18 00:00:00+03', DATE '2026-10-18', TIME '17:00'),
-        (104, 10, 'manual', TRUE, TIMESTAMPTZ '2026-10-18 00:00:00+03', DATE '2026-10-18', TIME '16:00');
+        (104, 10, 'manual', TRUE, TIMESTAMPTZ '2026-10-18 00:00:00+03', DATE '2026-10-18', TIME '16:00'),
+        (105, 10, 'manual', FALSE, TIMESTAMPTZ '2026-10-18 00:00:00+03', DATE '2026-10-18', TIME '18:45');
 
       INSERT INTO patrol_logs
         (id, schedule_id, schedule_type, scheduled_at)
@@ -134,6 +135,21 @@ test("System Status counts recurring, manual and random missed patrols at the ex
     ]);
     assert.equal(exact.rows[0].missed_last_30_days, 3);
     assert.equal(exact.rows[0].last_missed_at.toISOString(), "2026-10-18T15:00:00.000Z");
+
+    const afterCancelledManualBoundary = await client.query(PATROL_MISSED_STATS_SQL, [
+      1,
+      "2026-10-18T17:45:00.000Z",
+    ]);
+    assert.equal(
+      afterCancelledManualBoundary.rows[0].missed_last_30_days,
+      5,
+      "inactive manual schedule must not increase the missed count"
+    );
+    assert.equal(
+      afterCancelledManualBoundary.rows[0].last_missed_at.toISOString(),
+      "2026-10-18T15:30:00.000Z",
+      "inactive manual schedule must not replace the latest valid missed patrol"
+    );
 
     const otherTenant = await client.query(PATROL_MISSED_STATS_SQL, [
       2,

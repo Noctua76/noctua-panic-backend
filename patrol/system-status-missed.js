@@ -51,6 +51,7 @@ const PATROL_MISSED_STATS_SQL = `
     CROSS JOIN runtime
     WHERE s.company_id = $1
       AND ps.schedule_type = 'manual'
+      AND ps.active = TRUE
       AND ps.scheduled_date + ps.scheduled_time
         >= (runtime.utc_now AT TIME ZONE COALESCE(c.timezone, 'Europe/Athens')) - INTERVAL '30 days'
       AND ps.scheduled_date + ps.scheduled_time + INTERVAL '2 hours'
