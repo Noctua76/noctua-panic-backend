@@ -797,7 +797,9 @@ app.get(
 
       let query = `
         SELECT
+          CONCAT('dashboard:', ads.id) AS session_key,
           ads.id,
+          'dashboard' AS surface,
           ads.username,
           ads.role,
           ads.login_time,
@@ -890,18 +892,6 @@ app.get(
         `;
       }
 
-      if (
-        active === "true" ||
-        active === "false"
-      ) {
-        values.push(active === "true");
-
-        query += `
-          AND ads.is_active =
-            $${values.length}
-        `;
-      }
-
       query += `
         ORDER BY ads.login_time DESC
       `;
@@ -911,9 +901,104 @@ app.get(
         values
       );
 
+      let guardQuery = `
+        SELECT
+          CONCAT('guard_web_app:', gs.id) AS session_key,
+          gs.id,
+          'guard_web_app' AS surface,
+          g.username,
+          'guard' AS role,
+          gs.login_time AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens') AS login_time,
+          gs.last_heartbeat AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens') AS last_seen,
+          gs.logout_time AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens') AS logout_time,
+          (gs.logout_time IS NULL) AS is_active,
+          GREATEST(
+            0,
+            FLOOR(EXTRACT(EPOCH FROM (
+              COALESCE(gs.logout_time, gs.last_heartbeat, gs.login_time)
+              - gs.login_time
+            )))::int
+          ) AS session_duration_seconds,
+          CASE
+            WHEN gs.status = 'logged_out' THEN 'logout'
+            WHEN gs.status = 'temporary_access_expired' THEN 'temporary_access_expired'
+            WHEN gs.status = 'temporary_access_revoked' THEN 'temporary_access_revoked'
+            WHEN gs.status = 'auto_closed' THEN 'auto_closed'
+            WHEN gs.logout_time IS NOT NULL THEN 'closed'
+            WHEN gs.last_heartbeat <=
+              (NOW() AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens'))
+              - INTERVAL '90 seconds'
+            THEN 'stale'
+            ELSE NULL
+          END AS session_end_reason,
+          g.access_mode,
+          g.temporary_access_label,
+          g.temporary_access_started_at,
+          g.access_expires_at,
+          g.temporary_access_revoked_at,
+          true AS is_temporary,
+          (
+            gs.logout_time IS NULL
+            AND gs.last_heartbeat >
+              (NOW() AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens'))
+              - INTERVAL '90 seconds'
+            AND g.active = true
+            AND g.temporary_access_revoked_at IS NULL
+            AND (
+              g.access_expires_at IS NULL
+              OR g.access_expires_at > NOW()
+            )
+          ) AS is_currently_online
+        FROM guard_sessions gs
+        INNER JOIN guards g ON g.id = gs.guard_id
+        INNER JOIN sites s ON s.id = gs.site_id
+        INNER JOIN companies c ON c.id = s.company_id
+        WHERE s.company_id = $1
+          AND g.access_mode = $2
+      `;
+
+      const guardValues = [
+        req.auth.effective_company_id,
+        ACCESS_MODE_READ_ONLY,
+      ];
+
+      if (user) {
+        guardValues.push(user);
+        guardQuery += ` AND g.username = $${guardValues.length}`;
+      }
+
+      if (from) {
+        guardValues.push(from);
+        guardQuery += `
+          AND COALESCE(gs.logout_time, gs.last_heartbeat, gs.login_time)
+            >= $${guardValues.length}::date
+        `;
+      }
+
+      if (to) {
+        guardValues.push(to);
+        guardQuery += `
+          AND COALESCE(gs.logout_time, gs.last_heartbeat, gs.login_time)
+            < ($${guardValues.length}::date + INTERVAL '1 day')
+        `;
+      }
+
+      const guardResult = await pool.query(guardQuery, guardValues);
+      let sessions = [...result.rows, ...guardResult.rows]
+        .sort((left, right) =>
+          new Date(right.login_time).getTime() - new Date(left.login_time).getTime()
+        );
+
+      if (active === "true" || active === "false") {
+        const activeFilter = active === "true";
+        sessions = sessions.filter(
+          (session) => session.is_currently_online === activeFilter
+        );
+      }
+
       return res.json({
         status: "ok",
-        sessions: result.rows,
+        sessions,
       });
     } catch (err) {
       console.error(
@@ -956,6 +1041,9 @@ app.get(
 
       let query = `
         SELECT
+          CONCAT('dashboard:', ads.id) AS session_key,
+          ads.id,
+          'dashboard' AS surface,
           ads.username,
           ads.role,
           ads.login_time,
@@ -1049,6 +1137,89 @@ app.get(
         values
       );
 
+      let guardQuery = `
+        SELECT
+          CONCAT('guard_web_app:', gs.id) AS session_key,
+          gs.id,
+          'guard_web_app' AS surface,
+          g.username,
+          'guard' AS role,
+          gs.login_time AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens') AS login_time,
+          gs.last_heartbeat AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens') AS last_seen,
+          gs.logout_time AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens') AS logout_time,
+          (gs.logout_time IS NULL) AS is_active,
+          GREATEST(
+            0,
+            FLOOR(EXTRACT(EPOCH FROM (
+              COALESCE(gs.logout_time, gs.last_heartbeat, gs.login_time)
+              - gs.login_time
+            )))::int
+          ) AS session_duration_seconds,
+          CASE
+            WHEN gs.status = 'logged_out' THEN 'logout'
+            WHEN gs.status = 'temporary_access_expired' THEN 'temporary_access_expired'
+            WHEN gs.status = 'temporary_access_revoked' THEN 'temporary_access_revoked'
+            WHEN gs.status = 'auto_closed' THEN 'auto_closed'
+            WHEN gs.logout_time IS NOT NULL THEN 'closed'
+            WHEN gs.last_heartbeat <=
+              (NOW() AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens'))
+              - INTERVAL '90 seconds'
+            THEN 'stale'
+            ELSE NULL
+          END AS session_end_reason,
+          g.access_mode,
+          g.temporary_access_label,
+          g.temporary_access_started_at,
+          g.access_expires_at,
+          g.temporary_access_revoked_at,
+          true AS is_temporary,
+          (
+            gs.logout_time IS NULL
+            AND gs.last_heartbeat >
+              (NOW() AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens'))
+              - INTERVAL '90 seconds'
+            AND g.active = true
+            AND g.temporary_access_revoked_at IS NULL
+            AND (
+              g.access_expires_at IS NULL
+              OR g.access_expires_at > NOW()
+            )
+          ) AS is_currently_online
+        FROM guard_sessions gs
+        INNER JOIN guards g ON g.id = gs.guard_id
+        INNER JOIN sites s ON s.id = gs.site_id
+        INNER JOIN companies c ON c.id = s.company_id
+        WHERE s.company_id = $1
+          AND g.access_mode = $2
+      `;
+
+      const guardValues = [
+        req.auth.effective_company_id,
+        ACCESS_MODE_READ_ONLY,
+      ];
+
+      if (from) {
+        guardValues.push(from);
+        guardQuery += `
+          AND COALESCE(gs.logout_time, gs.last_heartbeat, gs.login_time)
+            >= $${guardValues.length}::date
+        `;
+      }
+
+      if (to) {
+        guardValues.push(to);
+        guardQuery += `
+          AND COALESCE(gs.logout_time, gs.last_heartbeat, gs.login_time)
+            < ($${guardValues.length}::date + INTERVAL '1 day')
+        `;
+      }
+
+      const guardResult = await pool.query(guardQuery, guardValues);
+      const sessions = [...result.rows, ...guardResult.rows]
+        .sort((left, right) =>
+          new Date(right.login_time).getTime() - new Date(left.login_time).getTime()
+        );
+
       const dateFields = [
         "login_time",
         "last_seen",
@@ -1058,7 +1229,7 @@ app.get(
         "temporary_access_revoked_at",
       ];
 
-      result.rows.forEach((row) => {
+      sessions.forEach((row) => {
         dateFields.forEach((field) => {
           row[field] = row[field]
             ? new Date(row[field]).toLocaleString(
@@ -1092,6 +1263,7 @@ app.get(
       };
 
       const headers = [
+        "surface",
         "username",
         "role",
         "access_mode",
@@ -1109,7 +1281,7 @@ app.get(
         "temporary_access_revoked_at",
       ];
 
-      const csvRows = result.rows.map(
+      const csvRows = sessions.map(
         (row) =>
           headers
             .map((header) =>
