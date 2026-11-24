@@ -466,61 +466,94 @@ const {
       guardId,
       siteId,
       timestamp,
-      message
+      message: incidentAnswers === undefined ? message : "[structured guard responses]"
     });
 
-    if (incidentAnswers && typeof incidentAnswers === "object") {
-  await ensureIncidentGuardResponsesTable();
+    if (incidentAnswers !== undefined) {
+      const incidentId = Number(req.body.incidentId);
+      const questionLabels = {
+        incident_type: "Τι είδους περιστατικό ήταν;",
+        location: "Πού ακριβώς εντοπίστηκε;",
+        actions_taken: "Ολοκλήρωσες τις απαιτούμενες ενέργειες; Τι έκανες;"
+      };
+      const keys = Object.keys(questionLabels);
+      const reject = (status, code) => {
+        console.warn("Guard response submission rejected", {
+          code, incidentId: Number.isSafeInteger(incidentId) ? incidentId : null,
+          guardId, siteId, sessionId,
+        });
+        return res.status(status).json({ status: "error", code, responsesSaved: false });
+      };
+      if (!Number.isSafeInteger(incidentId) || incidentId <= 0 ||
+          Number(req.body.sessionId) !== Number(sessionId)) {
+        return reject(400, "INCIDENT_ASSOCIATION_REQUIRED");
+      }
+      if (!incidentAnswers || Array.isArray(incidentAnswers) ||
+          typeof incidentAnswers !== "object" || Object.keys(incidentAnswers).length !== 3 ||
+          keys.some(key => typeof incidentAnswers[key] !== "string" ||
+            !incidentAnswers[key].trim() || incidentAnswers[key].length > 5000)) {
+        return reject(400, "GUARD_RESPONSES_INVALID");
+      }
 
-  const incidentResult = await pool.query(
-    `
-    SELECT id
-    FROM incidents
-    WHERE guard_ref = $1
-      AND site_id = $2
-      AND status IN ('active', 'in_progress')
-    ORDER BY trigger_time DESC
-    LIMIT 1
-    `,
-    [guardId, siteId]
-  );
-
-  const incidentId =
-    incidentResult.rows[0]?.id || null;
-
-  const questionLabels = {
-    incident_type: "Τι είδους περιστατικό ήταν;",
-    location: "Πού ακριβώς εντοπίστηκε;",
-    actions_taken: "Ολοκλήρωσες τις απαιτούμενες ενέργειες; Τι έκανες;"
-  };
-
-  for (const [questionKey, answer] of Object.entries(incidentAnswers)) {
-    await pool.query(
-      `
-      INSERT INTO incident_guard_responses (
-        incident_id,
-        guard_id,
-        site_id,
-        session_id,
-        question_key,
-        question_text,
-        answer,
-        created_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-      `,
-      [
-  incidentId,
-  guardId,
-  siteId,
-  sessionId,
-  questionKey,
-  questionLabels[questionKey] || questionKey,
-  answer || ""
-]
-    );
-  }
-}
+      await ensureIncidentGuardResponsesTable();
+      const connection = await pool.connect();
+      try {
+        await connection.query("BEGIN");
+        // Incident timestamps are UTC; guard session timestamps use company local time.
+        const incidentResult = await connection.query(`
+          SELECT i.id
+          FROM incidents i
+          JOIN sites s ON s.id = i.site_id
+          JOIN companies c ON c.id = s.company_id
+          JOIN guard_sessions gs ON gs.id = $4
+            AND gs.guard_id = i.guard_ref AND gs.site_id = i.site_id
+          WHERE i.id = $1 AND i.guard_ref = $2 AND i.site_id = $3
+            AND i.company_id = $5 AND s.company_id = $5
+            AND gs.logout_time IS NULL
+            AND (i.trigger_time AT TIME ZONE 'UTC') >=
+              (gs.login_time AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens'))
+            AND i.status IN ('active', 'in_progress')
+          FOR UPDATE OF i
+        `, [incidentId, guardId, siteId, sessionId, req.guard.company_id]);
+        if (incidentResult.rows.length !== 1) {
+          await connection.query("ROLLBACK");
+          return reject(409, "INCIDENT_ASSOCIATION_INVALID");
+        }
+        const existing = await connection.query(`
+          SELECT question_key, answer, guard_id, site_id, session_id
+          FROM incident_guard_responses WHERE incident_id = $1
+        `, [incidentId]);
+        if (existing.rows.length) {
+          const same = existing.rows.length === 3 && keys.every(key =>
+            existing.rows.filter(row => row.question_key === key &&
+              row.answer === incidentAnswers[key].trim() &&
+              Number(row.guard_id) === Number(guardId) &&
+              Number(row.site_id) === Number(siteId) &&
+              Number(row.session_id) === Number(sessionId)).length === 1);
+          if (!same) {
+            await connection.query("ROLLBACK");
+            return reject(409, "GUARD_RESPONSES_CONFLICT");
+          }
+        } else {
+          await connection.query(`
+            INSERT INTO incident_guard_responses
+              (incident_id, guard_id, site_id, session_id, question_key, question_text, answer, created_at)
+            SELECT $1, $2, $3, $4, q.key, q.label, q.answer, NOW()
+            FROM unnest($5::text[], $6::text[], $7::text[]) AS q(key, label, answer)
+          `, [incidentId, guardId, siteId, sessionId, keys,
+            keys.map(key => questionLabels[key]), keys.map(key => incidentAnswers[key].trim())]);
+        }
+        await connection.query("COMMIT");
+        console.log("GUARD_RESPONSES_SAVED", { incidentId, guardId, siteId, sessionId, responseCount: 3 });
+        // Operational evidence is acknowledged without waiting for optional AI processing.
+        return res.json({ status: "ok", incidentId, responsesSaved: true, responseCount: 3 });
+      } catch (error) {
+        await connection.query("ROLLBACK");
+        throw error;
+      } finally {
+        connection.release();
+      }
+    }
 
     // 2) Περνάμε το log στον Assistant για περίληψη / δομημένη καταγραφή
     const assistantLog = await processIncidentLog(
