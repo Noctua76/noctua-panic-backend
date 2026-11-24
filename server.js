@@ -441,7 +441,7 @@ async function processIncidentLog(message) {
 // ----------------------------------------------------------
 // Endpoint: δέχεται incident logs από το webapp
 // ----------------------------------------------------------
-app.post('/incident-log', requireGuardAuth, async (req, res) => {
+app.post(['/incident-log', '/incident-log/guard-responses'], requireGuardAuth, async (req, res) => {
   try {
     const {
   timestamp,
@@ -469,7 +469,7 @@ const {
       message: incidentAnswers === undefined ? message : "[structured guard responses]"
     });
 
-    if (incidentAnswers !== undefined) {
+    if (incidentAnswers !== undefined || req.path === "/incident-log/guard-responses") {
       const incidentId = Number(req.body.incidentId);
       const questionLabels = {
         incident_type: "Τι είδους περιστατικό ήταν;",
@@ -499,9 +499,9 @@ const {
       const connection = await pool.connect();
       try {
         await connection.query("BEGIN");
-        // Incident timestamps are UTC; guard session timestamps use company local time.
+        // Storage convention: incidents are UTC wall time; Guard logins are Athens wall time.
         const incidentResult = await connection.query(`
-          SELECT i.id
+          SELECT i.id, i.status
           FROM incidents i
           JOIN sites s ON s.id = i.site_id
           JOIN companies c ON c.id = s.company_id
@@ -511,8 +511,34 @@ const {
             AND i.company_id = $5 AND s.company_id = $5
             AND gs.logout_time IS NULL
             AND (i.trigger_time AT TIME ZONE 'UTC') >=
-              (gs.login_time AT TIME ZONE COALESCE(NULLIF(c.timezone, ''), 'Europe/Athens'))
-            AND i.status IN ('active', 'in_progress')
+              (gs.login_time AT TIME ZONE 'Europe/Athens')
+            -- A missing/ambiguous local login instant cannot prove session ownership.
+            AND ((gs.login_time AT TIME ZONE 'Europe/Athens') AT TIME ZONE 'Europe/Athens') = gs.login_time
+            AND NOT EXISTS (
+              SELECT 1 FROM generate_series(-1, 1) AS h(delta)
+              WHERE h.delta <> 0 AND
+                (((gs.login_time AT TIME ZONE 'Europe/Athens') + h.delta * INTERVAL '1 hour')
+                  AT TIME ZONE 'Europe/Athens') = gs.login_time
+            )
+            -- Reject every other session that could have owned this incident instant.
+            -- Guard auto-close/temporary expiry store UTC; explicit logout and shift/password/company close store Athens time.
+            AND NOT EXISTS (
+              SELECT 1 FROM guard_sessions other
+              CROSS JOIN generate_series(-1, 1) AS h(delta)
+              WHERE other.guard_id = gs.guard_id AND other.id <> gs.id
+                AND (((other.login_time AT TIME ZONE 'Europe/Athens') + h.delta * INTERVAL '1 hour')
+                  AT TIME ZONE 'Europe/Athens') = other.login_time
+                AND (other.login_time AT TIME ZONE 'Europe/Athens') + h.delta * INTERVAL '1 hour'
+                  <= (i.trigger_time AT TIME ZONE 'UTC')
+                AND (other.logout_time IS NULL OR
+                  CASE
+                    WHEN other.status IN ('auto_closed', 'temporary_access_expired', 'temporary_access_revoked')
+                      THEN other.logout_time AT TIME ZONE 'UTC'
+                    WHEN other.status IN ('logged_out', 'shift_boundary_timeout', 'password_reset', 'company_inactive')
+                      THEN other.logout_time AT TIME ZONE 'Europe/Athens'
+                    ELSE GREATEST(other.logout_time AT TIME ZONE 'UTC', other.logout_time AT TIME ZONE 'Europe/Athens')
+                  END >= (i.trigger_time AT TIME ZONE 'UTC'))
+            )
           FOR UPDATE OF i
         `, [incidentId, guardId, siteId, sessionId, req.guard.company_id]);
         if (incidentResult.rows.length !== 1) {
@@ -535,6 +561,11 @@ const {
             return reject(409, "GUARD_RESPONSES_CONFLICT");
           }
         } else {
+          // A read-only receipt replay is allowed after resolution; new evidence is not.
+          if (!['active', 'in_progress'].includes(incidentResult.rows[0].status)) {
+            await connection.query("ROLLBACK");
+            return reject(409, "INCIDENT_NOT_ACCEPTING_RESPONSES");
+          }
           await connection.query(`
             INSERT INTO incident_guard_responses
               (incident_id, guard_id, site_id, session_id, question_key, question_text, answer, created_at)

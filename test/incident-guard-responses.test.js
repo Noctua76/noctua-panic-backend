@@ -10,7 +10,7 @@ function section(start, end) {
   assert.ok(a >= 0 && b > a, start);
   return source.slice(a, b);
 }
-const logSource = section("app.post('/incident-log'", '// ACTIVE ADMINS');
+const logSource = section("app.post(['/incident-log'", '// ACTIVE ADMINS');
 const panicSource = section("app.post('/alert'", '// Vonage delivery webhooks');
 const responseSource = section('app.get(\n  "/incidents/:id/guard-responses"', 'app.get("/incidents/resolved"');
 const reportSource = section('function formatDuration(', '// QR PATROL POINTS API');
@@ -22,8 +22,10 @@ function routes(pool, ai = async () => 'summary') {
   const requireGuardAuth = () => {}, requireAuth = () => {};
   const sandbox = {
     app: Object.fromEntries(['get','post'].map(method => [method, (route, auth, handler) => {
-      assert.equal(auth, ['/alert','/incident-log'].includes(route) ? requireGuardAuth : requireAuth);
-      handlers[`${method} ${route}`] = handler;
+      for (const endpoint of Array.isArray(route) ? route : [route]) {
+        assert.equal(auth, ['/alert','/incident-log','/incident-log/guard-responses'].includes(endpoint) ? requireGuardAuth : requireAuth);
+        handlers[`${method} ${endpoint}`] = handler;
+      }
     }])), pool, requireGuardAuth, requireAuth,
     ensureIncidentGuardResponsesTable: async () => {},
     processIncidentLog: async text => { aiCalls++; return ai(text); },
@@ -37,6 +39,7 @@ function routes(pool, ai = async () => 'summary') {
   vm.runInNewContext(logSource + panicSource + responseSource + reportSource, sandbox);
   async function invoke(route, req) {
     const res = { statusCode: 200, headers: {}, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; }, setHeader(k,v) { this.headers[k] = v; }, send(body) { this.body = body; return this; } };
+    req.path ||= route.split(' ')[1];
     await handlers[route](req, res); return res;
   }
   return { invoke, dispatches, diagnostics, aiCalls: () => aiCalls, pdfHtml: () => pdfHtml, sandbox };
@@ -63,7 +66,7 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
     CREATE TABLE companies (id integer PRIMARY KEY, timezone text);
     CREATE TABLE sites (id integer PRIMARY KEY, company_id integer, name text, location text);
     CREATE TABLE guards (id integer PRIMARY KEY, full_name text, username text);
-    CREATE TABLE guard_sessions (id integer PRIMARY KEY, guard_id integer, site_id integer, login_time timestamp, logout_time timestamp);
+    CREATE TABLE guard_sessions (id integer PRIMARY KEY, guard_id integer, site_id integer, login_time timestamp, logout_time timestamp, status text DEFAULT 'online');
     CREATE TABLE incidents (id bigserial PRIMARY KEY, incident_ref text, company_id integer, guard_ref bigint, site_id integer,
       status text, priority text, trigger_time timestamp, resolved_time timestamp, auto_reset_time timestamp, ai_summary text, needs_support boolean,
       incident_latitude numeric, incident_longitude numeric, incident_accuracy integer, incident_battery_level integer,
@@ -78,7 +81,7 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
     INSERT INTO companies VALUES (1,'Europe/Athens'),(2,'Europe/Athens');
     INSERT INTO sites VALUES (1,1,'Test Site','Athens'),(2,2,'Other Tenant','Other Site');
     INSERT INTO guards VALUES (1,'Test Guard','test_guard'),(2,'Other Guard','other_guard');
-    INSERT INTO guard_sessions VALUES
+    INSERT INTO guard_sessions (id,guard_id,site_id,login_time,logout_time) VALUES
       (253,1,1,(NOW() AT TIME ZONE 'Europe/Athens') - INTERVAL '1 hour',NULL),
       (254,1,1,(NOW() AT TIME ZONE 'Europe/Athens') + INTERVAL '1 hour',NULL);
   `);
@@ -87,7 +90,7 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
     const res = await r.invoke('post /alert', { guard, body: { source: 'aegis-link-webapp', latitude: 38, longitude: 23, accuracy: 10, battery: 90 } });
     assert.equal(res.statusCode, 200, JSON.stringify(res.body)); return Number(res.body.incident.id);
   };
-  const submit = (id, extra = {}, instance = r, auth = guard) => instance.invoke('post /incident-log', {
+  const submit = (id, extra = {}, instance = r, auth = guard) => instance.invoke('post /incident-log/guard-responses', {
     guard: auth, body: { message: 'Incident follow-up (3-question flow)', incidentId: id, sessionId: auth.session_id, incidentAnswers: answers, ...extra },
   });
   const count = async id => Number((await pool.query('SELECT count(*) FROM incident_guard_responses WHERE incident_id=$1', [id])).rows[0].count);
@@ -146,6 +149,68 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
     const pdf = await r.invoke('get /incidents/:id/report/pdf', { params: { id }, headers: { authorization: 'Bearer test-admin' }, protocol: 'http', get: key => key === 'host' ? 'localhost' : null });
     assert.equal(pdf.statusCode, 200); assert.equal(pdf.headers['Content-Type'], 'application/pdf'); assert.ok(pdf.body.toString().startsWith('%PDF'));
     for (const answer of Object.values(answers)) assert.ok(r.pdfHtml().includes(answer));
+  });
+  await t.test('lost receipt can be replayed after resolution without new writes or lifecycle changes', async () => {
+    const next = await panic();
+    // The client loses this first receipt after the transaction has committed.
+    await submit(next);
+    await pool.query("UPDATE incidents SET status='resolved', resolved_time=NOW() WHERE id=$1", [next]);
+    const before = (await pool.query('SELECT * FROM incident_guard_responses WHERE incident_id=$1 ORDER BY id', [next])).rows;
+    assert.equal((await submit(next)).body.responsesSaved, true);
+    assert.deepEqual((await pool.query('SELECT * FROM incident_guard_responses WHERE incident_id=$1 ORDER BY id', [next])).rows, before);
+    assert.equal((await pool.query('SELECT status FROM incidents WHERE id=$1', [next])).rows[0].status, 'resolved');
+    assert.equal((await submit(next, { incidentAnswers: { ...answers, location: 'changed' } })).body.code, 'GUARD_RESPONSES_CONFLICT');
+    const empty = await panic();
+    await pool.query("UPDATE incidents SET status='resolved' WHERE id=$1", [empty]);
+    assert.equal((await submit(empty)).body.code, 'INCIDENT_NOT_ACCEPTING_RESPONSES');
+    assert.equal(await count(empty), 0);
+  });
+  await t.test('legacy Guard payload is rejected without any fallback association', async () => {
+    const before = Number((await pool.query('SELECT count(*) FROM incident_guard_responses')).rows[0].count);
+    const res = await r.invoke('post /incident-log', { guard, body: { message: 'legacy followup', incidentAnswers: answers, sessionId: guard.session_id } });
+    assert.equal(res.body.code, 'INCIDENT_ASSOCIATION_REQUIRED');
+    assert.equal(Number((await pool.query('SELECT count(*) FROM incident_guard_responses')).rows[0].count), before);
+  });
+  await t.test('Athens storage convention is independent of company timezone, including DST', async t => {
+    const cases = [
+      ['Athens', 'Europe/Athens', '2026-11-24 07:55:20', '2026-11-24 06:02:17', true],
+      ['New York company', 'America/New_York', '2026-11-24 07:55:20', '2026-11-24 06:02:17', true],
+      ['Tokyo company', 'Asia/Tokyo', '2026-11-24 07:55:20', '2026-11-24 06:02:17', true],
+      ['spring-forward crossing', 'America/New_York', '2026-03-29 02:50:00', '2026-03-29 01:10:00', true],
+      ['fall-back crossing', 'Asia/Tokyo', '2026-10-25 02:50:00', '2026-10-25 01:10:00', true],
+      ['after fall-back', 'Europe/Athens', '2026-10-25 04:10:00', '2026-10-25 02:30:00', true],
+      ['ambiguous fall-back login', 'Europe/Athens', '2026-10-25 03:15:00', '2026-10-25 01:30:00', false],
+      ['nonexistent spring login', 'Europe/Athens', '2026-03-29 03:15:00', '2026-03-29 01:30:00', false],
+      ['incident predates this session', 'America/New_York', '2026-11-24 08:10:00', '2026-11-24 06:02:17', false],
+    ];
+    for (const [label, timezone, login, at, valid] of cases) await t.test(label, async () => {
+      await pool.query('UPDATE companies SET timezone=$1 WHERE id=1', [timezone]);
+      await pool.query('INSERT INTO guard_sessions(id,guard_id,site_id,login_time) VALUES(1001,77,1,$1)', [login]);
+      const inserted = await pool.query("INSERT INTO incidents(incident_ref,company_id,guard_ref,site_id,status,trigger_time) VALUES('timezone-fixture',1,77,1,'active',$1) RETURNING id", [at]);
+      const target = Number(inserted.rows[0].id);
+      try {
+        const res = await submit(target, {}, r, { ...guard, guard_id: 77, session_id: 1001 });
+        assert.equal(res.statusCode, valid ? 200 : 409, JSON.stringify(res.body));
+        assert.equal(await count(target), valid ? 3 : 0);
+      } finally {
+        await pool.query('DELETE FROM guard_sessions WHERE id=1001');
+        await pool.query("UPDATE companies SET timezone='Europe/Athens' WHERE id=1");
+      }
+    });
+  });
+  await t.test('another session cannot claim the incident, including overlaps and closure conventions', async t => {
+    for (const [label, otherLogin, otherLogout, status, valid] of [
+      ['overlapping active session', '2026-11-24 05:50', null, 'online', false],
+      ['prior auto-closed session UTC end', '2026-11-24 05:00', '2026-11-24 03:58', 'auto_closed', true],
+      ['prior explicit logout Athens end', '2026-11-24 05:00', '2026-11-24 05:58', 'logged_out', true],
+      ['other session still owned the incident instant', '2026-11-24 05:00', '2026-11-24 06:10', 'logged_out', false],
+    ]) await t.test(label, async () => {
+      await pool.query("INSERT INTO guard_sessions(id,guard_id,site_id,login_time) VALUES(1001,77,1,'2026-11-24 05:59')");
+      await pool.query('INSERT INTO guard_sessions(id,guard_id,site_id,login_time,logout_time,status) VALUES(1002,77,1,$1,$2,$3)', [otherLogin,otherLogout,status]);
+      const target = Number((await pool.query("INSERT INTO incidents(company_id,guard_ref,site_id,status,trigger_time) VALUES(1,77,1,'active','2026-11-24 04:00') RETURNING id")).rows[0].id);
+      try { const res=await submit(target, {}, r, { ...guard,guard_id:77,session_id:1001 }); assert.equal(res.statusCode,valid?200:409,JSON.stringify(res.body)); }
+      finally { await pool.query('DELETE FROM guard_sessions WHERE id IN(1001,1002)'); }
+    });
   });
   await t.test('editing investigation notes leaves structured Guard Responses intact', async () => {
     const before = (await pool.query('SELECT * FROM incident_guard_responses WHERE incident_id=$1 ORDER BY id', [id])).rows;
