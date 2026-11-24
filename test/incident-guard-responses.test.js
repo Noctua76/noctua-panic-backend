@@ -16,7 +16,7 @@ const responseSource = section('app.get(\n  "/incidents/:id/guard-responses"', '
 const reportSource = section('function formatDuration(', '// QR PATROL POINTS API');
 const guard = { guard_id: 1, site_id: 1, session_id: 253, company_id: 1 };
 const answers = { incident_type: 'Test incident', location: 'Main entrance', actions_taken: 'Contacted supervisor' };
-function routes(pool, ai = async () => 'summary') {
+function routes(pool, ai = async () => 'summary', Clock = Date) {
   const handlers = {}, dispatches = [], diagnostics = [];
   let aiCalls = 0, pdfHtml = '';
   const requireGuardAuth = () => {}, requireAuth = () => {};
@@ -26,7 +26,7 @@ function routes(pool, ai = async () => 'summary') {
         assert.equal(auth, ['/alert','/incident-log','/incident-log/guard-responses'].includes(endpoint) ? requireGuardAuth : requireAuth);
         handlers[`${method} ${endpoint}`] = handler;
       }
-    }])), pool, requireGuardAuth, requireAuth,
+    }])), pool, requireGuardAuth, requireAuth, Date: Clock,
     ensureIncidentGuardResponsesTable: async () => {},
     processIncidentLog: async text => { aiCalls++; return ai(text); },
     reverseGeocode: async () => 'Test address',
@@ -52,6 +52,14 @@ test('invalid correlation is rejected before any write connection; auth remains 
     assert.equal(res.statusCode, 400); assert.equal(res.body.code, 'INCIDENT_ASSOCIATION_REQUIRED');
   }
   assert.doesNotMatch(logSource, /ORDER BY trigger_time DESC|rows\[0\]\?\.id \|\| null/);
+});
+
+test('correlation follows existing timestamp writers without changing their conventions', () => {
+  const login = section('INSERT INTO guard_sessions (', 'RETURNING *');
+  assert.match(login, /NOW\(\) AT TIME ZONE 'Europe\/Athens'/);
+  assert.match(panicSource, /\$4::timestamptz/);
+  assert.match(logSource, /i\.trigger_time AT TIME ZONE current_setting\('TimeZone'\)/);
+  assert.doesNotMatch(logSource, /c\.timezone|i\.trigger_time AT TIME ZONE 'UTC'/);
 });
 
 test('real PostgreSQL: association, atomic persistence, retries and report separation', {
@@ -196,6 +204,64 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
         await pool.query('DELETE FROM guard_sessions WHERE id=1001');
         await pool.query("UPDATE companies SET timezone='Europe/Athens' WHERE id=1");
       }
+    });
+  });
+  await t.test('actual panic writes use DB TimeZone while login and explicit logout remain Athens-local', async t => {
+    const cases = [
+      ['UTC', 'UTC', '2026-11-24T06:02:17Z', '2026-11-24 07:55:20', true],
+      ['Athens DB / New York company', 'Europe/Athens', '2026-11-24T06:02:17Z', '2026-11-24 07:55:20', true],
+      ['New York DB / Tokyo company', 'America/New_York', '2026-11-24T06:02:17Z', '2026-11-24 07:55:20', true],
+      ['Tokyo DB', 'Asia/Tokyo', '2026-11-24T06:02:17Z', '2026-11-24 07:55:20', true],
+      ['New York spring-forward', 'America/New_York', '2026-03-08T07:10:00Z', '2026-03-08 08:00:00', true],
+      ['New York repeated incident hour / first occurrence', 'America/New_York', '2026-11-01T05:30:00Z', '2026-11-01 06:00:00', false],
+      ['New York repeated incident hour / second occurrence', 'America/New_York', '2026-11-01T06:30:00Z', '2026-11-01 06:00:00', false],
+      ['Athens repeated incident hour', 'Europe/Athens', '2026-10-25T01:30:00Z', '2026-10-25 02:30:00', false],
+    ];
+    for (const [label, dbTimezone, instant, login, valid] of cases) await t.test(label, async () => {
+      const zoned = new Pool({ connectionString: process.env.TEST_DATABASE_URL, options: `-c search_path=${schema} -c TimeZone=${dbTimezone}` });
+      class Clock extends Date {
+        constructor(...args) { super(...(args.length ? args : [instant])); }
+        static now() { return new Date(instant).getTime(); }
+      }
+      const instance = routes(zoned, async () => assert.fail('AI must not gate persistence'), Clock);
+      const auth = { ...guard, guard_id: 77, session_id: 1001 };
+      try {
+        assert.equal((await zoned.query('SHOW TimeZone')).rows[0].TimeZone, dbTimezone);
+        await zoned.query("UPDATE companies SET timezone='Asia/Tokyo' WHERE id=1");
+        await zoned.query('INSERT INTO guard_sessions(id,guard_id,site_id,login_time) VALUES(1001,77,1,$1)', [login]);
+        const activated = await instance.invoke('post /alert', { guard: auth, body: { source: 'isolated-regression' } });
+        assert.equal(activated.statusCode, 200, JSON.stringify(activated.body));
+        const target = Number(activated.body.incident.id);
+        const written = (await zoned.query("SELECT trigger_time = ($2::timestamptz AT TIME ZONE current_setting('TimeZone')) AS follows_writer FROM incidents WHERE id=$1", [target, instant])).rows[0];
+        assert.equal(written.follows_writer, true);
+        const res = await submit(target, {}, instance, auth);
+        assert.equal(res.statusCode, valid ? 200 : 409, JSON.stringify(res.body));
+        assert.equal(await count(target), valid ? 3 : 0);
+        if (valid) {
+          const wrongSession = { ...auth, session_id: 1003 };
+          await zoned.query("INSERT INTO guard_sessions(id,guard_id,site_id,login_time) VALUES(1003,77,1,($1::timestamptz AT TIME ZONE 'Europe/Athens') + INTERVAL '1 hour')", [instant]);
+          assert.equal((await submit(target, {}, instance, wrongSession)).body.code, 'INCIDENT_ASSOCIATION_INVALID');
+        }
+      } finally {
+        await zoned.query('DELETE FROM guard_sessions WHERE id IN (1001,1002,1003)');
+        await zoned.query("UPDATE companies SET timezone='Europe/Athens' WHERE id=1");
+        await zoned.end();
+      }
+    });
+    for (const dbTimezone of ['Europe/Athens', 'America/New_York']) await t.test(`${dbTimezone}: NOW() closure cannot be mistaken for Athens logout`, async () => {
+      const zoned = new Pool({ connectionString: process.env.TEST_DATABASE_URL, options: `-c search_path=${schema} -c TimeZone=${dbTimezone}` });
+      const instance = routes(zoned);
+      const auth = { ...guard, guard_id: 77, session_id: 1001 };
+      try {
+        await zoned.query("INSERT INTO guard_sessions(id,guard_id,site_id,login_time) VALUES(1001,77,1,'2026-11-24 07:55')");
+        await zoned.query("INSERT INTO guard_sessions(id,guard_id,site_id,login_time,logout_time,status) VALUES(1002,77,1,'2026-11-24 06:00',$1::timestamptz,'auto_closed')", ['2026-11-24T05:54:00Z']);
+        const target = Number((await zoned.query("INSERT INTO incidents(company_id,guard_ref,site_id,status,trigger_time) VALUES(1,77,1,'active',$1::timestamptz) RETURNING id", ['2026-11-24T06:02:17Z'])).rows[0].id);
+        assert.equal((await submit(target, {}, instance, auth)).statusCode, 200);
+        await zoned.query("UPDATE guard_sessions SET logout_time=$1::timestamptz WHERE id=1002", ['2026-11-24T06:10:00Z']);
+        assert.equal((await submit(target, {}, instance, auth)).body.code, 'INCIDENT_ASSOCIATION_INVALID');
+        await zoned.query("UPDATE guard_sessions SET logout_time='2026-11-24 07:54',status='logged_out' WHERE id=1002");
+        assert.equal((await submit(target, {}, instance, auth)).statusCode, 200);
+      } finally { await zoned.query('DELETE FROM guard_sessions WHERE id IN (1001,1002)'); await zoned.end(); }
     });
   });
   await t.test('another session cannot claim the incident, including overlaps and closure conventions', async t => {
