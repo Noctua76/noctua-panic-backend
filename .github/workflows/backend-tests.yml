@@ -28,7 +28,7 @@ jobs:
       CHROMIUM_PATH: /usr/bin/google-chrome
       AEGIS_PG_BIN: /usr/lib/postgresql/18/bin
       AEGIS_PG_SERVER_BIN: /usr/lib/postgresql/18/bin
-      AEGIS_GUARD_SOURCE: ${{ runner.temp }}/aegis-guard-source
+      AEGIS_GUARD_SOURCE: /tmp/aegis-guard-source-${{ github.run_id }}
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aegis_test
     steps:
       - name: Checkout
