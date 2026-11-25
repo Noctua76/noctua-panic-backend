@@ -637,10 +637,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
           }
         );
 
-        console.error(
-          `Tenant system status error for company ${company.id}:`,
-          error
-        );
+        console.error("APPLICATION_OPERATION_FAILED", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
 
         tenants.push({
           company_id: company.id,
@@ -664,7 +661,7 @@ function createSystemStatusService({ pool, env = process.env, fetchImpl = fetch,
   }
 
   async function runMonitor() {
-    try { await checkPlatform(); } catch (error) { console.error("Platform health monitor error:", error); }
+    try { await checkPlatform(); } catch (error) { console.error("Platform health monitor error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'}); }
   }
 
   function startMonitor() {

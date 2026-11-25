@@ -3,8 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require("crypto");
 const morgan = require('morgan');
+const {sensitiveResponseCache, SAFE_ACCESS_LOG_FORMAT, safeRequestError} = require('./security/sensitive-response-cache');
 const { Vonage } = require('@vonage/server-sdk');
 const pool = require("./db");
+const { createQuestionnaireRuntime } = require("./questionnaire/runtime");
+const { registerQuestionnaireRoutes } = require("./questionnaire/routes");
+const questionnaireRuntime = createQuestionnaireRuntime();
 const bcrypt = require("bcrypt");
 const puppeteer = require("puppeteer");
 const multer = require("multer");
@@ -111,10 +115,7 @@ async function ensurePatrolOccurrenceIntegrity() {
   };
 
   if (integrity.duplicate_groups > 0 || integrity.legacy_outcome_rows > 0) {
-    console.warn(
-      "[PATROL INTEGRITY] Historical anomalies detected; records were not changed:",
-      integrity
-    );
+    console.warn("[PATROL INTEGRITY] Historical anomalies detected; records were not changed:");
   }
 
   return {
@@ -308,7 +309,7 @@ to_char(
 
     try {
       console.log("SHIFT DELAY EVENT:");
-console.dir(event, { depth: null });
+console.log("BACKEND_SERVER_JS_DIAG_001");
 
 const emailResult = await sendShiftDelayEmail(event);
 
@@ -326,10 +327,7 @@ const emailResult = await sendShiftDelayEmail(event);
         [emailResult.recipients.join(", "), event.id]
       );
 
-      console.log(
-        `[SHIFT DELAY EMAIL] Event ${event.id} sent to`,
-        emailResult.recipients
-      );
+      console.log("BACKEND_SERVER_JS_DIAG_002");
     } catch (err) {
       await pool.query(
         `
@@ -343,10 +341,7 @@ const emailResult = await sendShiftDelayEmail(event);
         [err.message, event.id]
       );
 
-      console.error(
-        `[SHIFT DELAY EMAIL ERROR] Event ${event.id}:`,
-        err.message
-      );
+      console.error("BACKEND_SERVER_JS_DIAG_003", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     }
   }
 }
@@ -401,9 +396,10 @@ const supabase = createClient(
   }
 );
 app.use(cors(createCorsOptions(process.env)));
+app.use(sensitiveResponseCache);
+app.use(morgan(SAFE_ACCESS_LOG_FORMAT));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
-app.use(morgan('dev'));
 app.use(
   "/runtime/install",
   createAnonymousInstallRouter()
@@ -429,11 +425,11 @@ async function processIncidentLog(message) {
       input: message
     });
 
-    console.log("Assistant log:", response.output[0].content[0].text);
+    // Model output and operational content are never logged.
     return response.output[0].content[0].text;
 
   } catch (err) {
-    console.error("Assistant error:", err);
+    console.error("OPTIONAL_AI_REQUEST_FAILED");
     return "Assistant failed to process log";
   }
 }
@@ -441,7 +437,17 @@ async function processIncidentLog(message) {
 // ----------------------------------------------------------
 // Endpoint: δέχεται incident logs από το webapp
 // ----------------------------------------------------------
+app.use((req, res, next) => {
+  if (/^\/(?:incidents(?:\/|$)|incident-log(?:\/|$)|alert$)/.test(req.path)) {
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Vary", "Authorization");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+  }
+  next();
+});
 app.post(['/incident-log', '/incident-log/guard-responses'], requireGuardAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.setHeader('Vary', 'Authorization');
   try {
     const {
   timestamp,
@@ -462,12 +468,7 @@ const {
     }
 
     // 1) Ωμό log για το backend / διαχειριστικό
-    console.log("RAW INCIDENT LOG:", {
-      guardId,
-      siteId,
-      timestamp,
-      message: incidentAnswers === undefined ? message : "[structured guard responses]"
-    });
+    console.log("INCIDENT_LOG_REQUEST");
 
     if (incidentAnswers !== undefined || req.path === "/incident-log/guard-responses") {
       const incidentId = Number(req.body.incidentId);
@@ -478,10 +479,7 @@ const {
       };
       const keys = Object.keys(questionLabels);
       const reject = (status, code) => {
-        console.warn("Guard response submission rejected", {
-          code, incidentId: Number.isSafeInteger(incidentId) ? incidentId : null,
-          guardId, siteId, sessionId,
-        });
+        console.warn("Guard response submission rejected");
         return res.status(status).json({ status: "error", code, responsesSaved: false });
       };
       if (!Number.isSafeInteger(incidentId) || incidentId <= 0 ||
@@ -495,6 +493,10 @@ const {
         return reject(400, "GUARD_RESPONSES_INVALID");
       }
 
+      if (questionnaireRuntime.enabled) {
+        const compatible = await questionnaireRuntime.service().submitCompatibleLegacy(req.guard, incidentId, incidentAnswers);
+        if (compatible) return res.json(compatible);
+      }
       await ensureIncidentGuardResponsesTable();
       const connection = await pool.connect();
       try {
@@ -583,7 +585,7 @@ const {
             keys.map(key => questionLabels[key]), keys.map(key => incidentAnswers[key].trim())]);
         }
         await connection.query("COMMIT");
-        console.log("GUARD_RESPONSES_SAVED", { incidentId, guardId, siteId, sessionId, responseCount: 3 });
+        console.log("GUARD_RESPONSES_SAVED");
         // Operational evidence is acknowledged without waiting for optional AI processing.
         return res.json({ status: "ok", incidentId, responsesSaved: true, responseCount: 3 });
       } catch (error) {
@@ -595,26 +597,20 @@ const {
     }
 
     // 2) Περνάμε το log στον Assistant για περίληψη / δομημένη καταγραφή
-    const assistantLog = await processIncidentLog(
-      `
-Guard ID: ${guardId}
-Site ID: ${siteId}
-Time: ${timestamp || new Date().toISOString()}
-
-Incident description:
-${message}
-      `.trim()
-    );
-
-    // 3) Εδώ αργότερα θα το γράψουμε σε DB ή θα το στείλουμε στο διαχειριστικό
-    console.log("ASSISTANT INCIDENT SUMMARY:", assistantLog);
+    const permittedEvent = "Panic button activated via Aegis Link Web App (Noctua Core). Guard confirmed real incident.";
+    if (message !== permittedEvent) return res.status(422).json({status:"error",code:"AI_OPERATIONAL_CONTENT_NOT_PERMITTED"});
+    // Existing optional AI receives only a generic event, not identities, answers or SOPs.
+    const assistantLog = await processIncidentLog(permittedEvent);
 
     return res.json({
       status: 'ok',
       assistantLog
     });
   } catch (err) {
-    console.error("Incident endpoint error:", err);
+    if (err.name === 'QuestionnaireError' && Number.isInteger(err.status) && err.status >= 400 && err.status <= 503 && /^[A-Z_]{3,70}$/.test(err.code || '')) {
+      return res.status(err.status).json({status: 'error', code: err.code, recoverable: err.status === 503, responsesSaved: false});
+    }
+    console.error("INCIDENT_LOG_REQUEST_FAILED");
     return res
       .status(500)
       .json({ error: 'Server error while processing incident.' });
@@ -741,11 +737,11 @@ app.get("/admin/active", requireAuth, async (req, res) => {
         temporaryGuardPreviewResult.rows,
     });
   } catch (err) {
-    console.error("Active admins error:", err);
+    console.error("Active admins error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -790,11 +786,11 @@ app.post("/admin/heartbeat", requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Admin heartbeat error:", err);
+    console.error("Admin heartbeat error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -839,11 +835,11 @@ SET
         result.rows[0].session_duration_seconds,
     });
   } catch (err) {
-    console.error("Admin logout error:", err);
+    console.error("Admin logout error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -1073,14 +1069,11 @@ app.get(
         sessions,
       });
     } catch (err) {
-      console.error(
-        "Admin session history error:",
-        err
-      );
+      console.error("Admin session history error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -1378,14 +1371,11 @@ app.get(
 
       return res.send(csv);
     } catch (err) {
-      console.error(
-        "Admin session export error:",
-        err
-      );
+      console.error("Admin session export error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -1425,16 +1415,13 @@ app.post('/send-sms', requireAuth, async (req, res) => {
     return res.json({ status: 'ok', data });
 
     console.log("PDF RAW FIRST ROW:");
-console.dir(history[0], { depth: null });
+console.log("BACKEND_SERVER_JS_DIAG_004");
 
 console.log("PDF FIRST 10 scheduled_at:");
-console.dir(
-  history.slice(0, 10).map((r) => r.scheduled_at),
-  { depth: null }
-);
+console.log("BACKEND_SERVER_JS_DIAG_005");
 
   } catch (error) {
-    console.error('SMS Error:', error);
+    console.error("SMS Error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
     return res.status(500).json({ error: 'SMS sending failed' });
   }
 });
@@ -1502,11 +1489,11 @@ ORDER BY id ASC
         : result.rows.filter((user) => !user.is_legacy_role),
     });
   } catch (err) {
-    console.error("Fetch admin users error:", err);
+    console.error("Fetch admin users error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -1582,11 +1569,11 @@ WHERE id = $1
       user: result.rows[0],
     });
   } catch (err) {
-    console.error("Fetch admin user error:", err);
+    console.error("Fetch admin user error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -1647,9 +1634,9 @@ app.post("/admin/users", requireAuth, async (req, res) => {
       user: { ...user, role_id: targetRole.id, role_code: targetRole.code, role_name: targetRole.name } });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Create admin user error:", err);
+    console.error("Create admin user error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     if (err.code === "23505") return res.status(409).json({ status: "error", message: "Username already exists" });
-    return res.status(500).json({ status: "error", message: err.message });
+    return res.status(500).json({ status: "error", message: "The request could not be completed." });
   } finally { client.release(); }
 });
 
@@ -1735,9 +1722,9 @@ app.put("/admin/users/:id", requireAuth, async (req, res) => {
       user: { ...result.rows[0], role_id: targetRole?.id || null, role_code: canonicalRole, role_name: targetRole?.name || "Legacy Dashboard Role" } });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Update admin user error:", err);
+    console.error("Update admin user error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     if (err.code === "23505") return res.status(409).json({ status: "error", message: "Username already exists" });
-    return res.status(500).json({ status: "error", message: err.message });
+    return res.status(500).json({ status: "error", message: "The request could not be completed." });
   } finally { client.release(); }
 });
 
@@ -2405,11 +2392,11 @@ temporary_access_expiry_reason:
       },
     });
   } catch (err) {
-    console.error("Admin login error:", err);
+    console.error("Admin login error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -2684,11 +2671,11 @@ company_id: auth.company_id,
 
     dashboardRbac.enforceRequestPermission(req, res, next);
   } catch (err) {
-    console.error("Authentication middleware error:", err);
+    console.error("Authentication middleware error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 }
@@ -2827,7 +2814,7 @@ if (
 
 next();
   } catch (err) {
-    console.error("Guard auth failed:", err);
+    console.error("Guard auth failed:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
@@ -3039,10 +3026,7 @@ app.get(
         temporary_access: temporaryAccess,
       });
     } catch (err) {
-      console.error(
-        "Temporary access list error:",
-        err
-      );
+      console.error("Temporary access list error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -3364,10 +3348,7 @@ app.post(
         .query("ROLLBACK")
         .catch(() => {});
 
-      console.error(
-        "Temporary access creation error:",
-        err
-      );
+      console.error("Temporary access creation error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       if (err.code === "23505") {
         return res.status(409).json({
@@ -3564,10 +3545,7 @@ app.post(
         .query("ROLLBACK")
         .catch(() => {});
 
-      console.error(
-        "Temporary access revoke error:",
-        err
-      );
+      console.error("Temporary access revoke error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -3638,11 +3616,11 @@ app.put("/admin/users/:id/reset-password", requireAuth, async (req, res) => {
       user: result.user
     });
   } catch (err) {
-    console.error("User reset password error:", err);
+    console.error("User reset password error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(err.statusCode || 500).json({
       status: "error",
-      message: err.message
+      message: err.statusCode && err.statusCode < 500 ? err.message : "Unable to reset password"
     });
   }
 });
@@ -3667,11 +3645,11 @@ app.post("/auth/change-password", requireAuth, async (req, res) => {
       user,
     });
   } catch (err) {
-    console.error("Change password error:", err);
+    console.error("Change password error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(err.statusCode || 500).json({
       status: "error",
-      message: err.statusCode ? err.message : "Unable to change password",
+      message: err.statusCode && err.statusCode < 500 ? err.message : "Unable to change password",
     });
   }
 });
@@ -3964,22 +3942,16 @@ async function generateScheduledShiftsForAllSites(targetDate) {
     WHERE c.status IN ('active', 'pilot')
   `);
 
-  console.log("[SHIFT GENERATOR] Found", sites.rows.length, "sites");
+  console.log("[SHIFT GENERATOR] Found");
 
   const created = [];
 
   for (const site of sites.rows) {
-    console.log("[SHIFT GENERATOR] Processing site", site.id);
+    console.log("[SHIFT GENERATOR] Processing site");
 
     const result = await generateScheduledShiftsForSite(site.id, targetDate);
 
-    console.log(
-      "[SHIFT GENERATOR] Site",
-      site.id,
-      "created",
-      result.length,
-      "shifts"
-    );
+    console.log("[SHIFT GENERATOR] Site");
 
     created.push(...result);
   }
@@ -4002,7 +3974,7 @@ function startScheduledShiftGenerator() {
         return `${dateParts.year}-${pad2(dateParts.month)}-${pad2(dateParts.day)}`;
       });
 
-      console.log("[SHIFT GENERATOR] Running for", targetDates.join(", "));
+      console.log("[SHIFT GENERATOR] Running for");
 
       const created = [];
 
@@ -4012,17 +3984,13 @@ function startScheduledShiftGenerator() {
         );
       }
 
-      console.log(
-        "[SHIFT GENERATOR] Created",
-        created.length,
-        "scheduled shifts"
-      );
+      console.log("[SHIFT GENERATOR] Created");
 
     } catch (err) {
-  console.error("[SHIFT GENERATOR ERROR]", err.message);
+  console.error("[SHIFT GENERATOR ERROR]", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       if (err.stack) {
-        console.error(err.stack);
+        console.error("BACKEND_SERVER_JS_DIAG_006", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
       }
     }
   };
@@ -4121,13 +4089,9 @@ async function detectShiftDelayEvents() {
   `);
 
   if (result.rows.length > 0) {
-    console.log(
-      "[SHIFT DELAY] Created",
-      result.rows.length,
-      "operational event(s)"
-    );
+    console.log("[SHIFT DELAY] Created");
 
-    console.log("[SHIFT DELAY EVENTS]", result.rows);
+    console.log("[SHIFT DELAY EVENTS]");
   }
 
   return result.rows;
@@ -4140,10 +4104,10 @@ function startShiftDelayMonitor() {
       await detectShiftDelayEvents();
       await processPendingShiftDelayEmails();
     } catch (err) {
-      console.error("[SHIFT TRANSITION MONITOR ERROR]", err.message);
+      console.error("[SHIFT TRANSITION MONITOR ERROR]", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       if (err.stack) {
-        console.error(err.stack);
+        console.error("BACKEND_SERVER_JS_DIAG_007", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
       }
     }
   };
@@ -4199,8 +4163,8 @@ app.get("/admin/roles", requireAuth, async (req, res) => {
     const roles = result.rows.filter((role) => req.auth.is_system_owner || role.code !== "system_owner");
     return res.json({ status: "ok", roles });
   } catch (err) {
-    console.error("Fetch dashboard roles error:", err);
-    return res.status(500).json({ status: "error", message: err.message });
+    console.error("Fetch dashboard roles error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
+    return res.status(500).json({ status: "error", message: "The request could not be completed." });
   }
 });
 
@@ -4236,8 +4200,8 @@ app.post("/admin/roles", requireAuth, dashboardRbac.requireSystemOwner, async (r
     return res.status(201).json({ status: "ok", role: { ...role, permissions: permissionCodes, user_count: 0 } });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Create dashboard role error:", err);
-    return res.status(500).json({ status: "error", message: err.message });
+    console.error("Create dashboard role error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
+    return res.status(500).json({ status: "error", message: "The request could not be completed." });
   } finally { client.release(); }
 });
 
@@ -4270,7 +4234,7 @@ app.post("/admin/roles/:id/clone", requireAuth, dashboardRbac.requireSystemOwner
     return res.status(201).json({ status: "ok", role: { ...role, permissions: original.permissions, user_count: 0 } });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    return res.status(500).json({ status: "error", message: err.message });
+    return res.status(500).json({ status: "error", message: "The request could not be completed." });
   } finally { client.release(); }
 });
 
@@ -4313,8 +4277,8 @@ app.put("/admin/roles/:id", requireAuth, dashboardRbac.requireSystemOwner, async
     return res.json({ status: "ok", role: { ...updated.rows[0], permissions: permissionCodes } });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Update dashboard role error:", err);
-    return res.status(500).json({ status: "error", message: err.message });
+    console.error("Update dashboard role error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
+    return res.status(500).json({ status: "error", message: "The request could not be completed." });
   } finally { client.release(); }
 });
 
@@ -4552,11 +4516,7 @@ async function expireGuardSessionsPastShiftGrace() {
     }
 
     if (closedResult.rows.length > 0) {
-      console.log(
-        "[SHIFT SESSION EXPIRY] Closed",
-        closedResult.rows.length,
-        "session(s) after the shift handover window"
-      );
+      console.log("[SHIFT SESSION EXPIRY] Closed");
     }
 
     return closedResult.rows;
@@ -4771,7 +4731,7 @@ const scheduledShift =
     ? getScheduledShiftFromRules(siteResult.rows[0].shift_rules)
     : null;
 
-    console.log("SCHEDULED SHIFT:", scheduledShift);
+    console.log("SCHEDULED SHIFT:");
 
     const sessionResult = await pool.query(
       `
@@ -4833,7 +4793,7 @@ if (sessionResult.rows.length === 0) {
   });
 }
 
-console.log("NEW SESSION:", sessionResult.rows[0]);
+console.log("GUARD_SESSION_CREATED");
 
 if (
   guard.access_mode !== ACCESS_MODE_READ_ONLY
@@ -4882,10 +4842,10 @@ temporary_access_expiry_reason:
     });
 
   } catch (err) {
-    console.error("Guard login error:", err);
+    console.error("Guard login error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -4973,7 +4933,7 @@ app.post("/guard/change-password", async (req, res) => {
     return res.json({ status: "ok", message: "Password created. Sign in with your new password." });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Guard change password error:", err);
+    console.error("Guard change password error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({ status: "error", message: "Unable to change password." });
   } finally {
     client.release();
@@ -5047,14 +5007,11 @@ app.post(
         scheduled_shifts: created,
       });
     } catch (err) {
-      console.error(
-        "Generate scheduled shifts error:",
-        err
-      );
+      console.error("Generate scheduled shifts error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -5100,10 +5057,10 @@ for (const row of logoutResult.rows) {
     res.json({ status: "ok" });
 
   } catch (err) {
-    console.error("Guard logout error:", err);
+    console.error("Guard logout error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -5143,10 +5100,10 @@ app.post("/guard/heartbeat", requireGuardAuth, async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Guard heartbeat error:", err);
+    console.error("Guard heartbeat error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -5244,11 +5201,11 @@ LEFT JOIN guards g
         guards: result.rows,
       });
     } catch (err) {
-      console.error("Active guards error:", err);
+      console.error("Active guards error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -5389,10 +5346,7 @@ WHERE gs.logout_time IS NULL
         guardsResult.rows[0]?.count || 0,
     });
   } catch (err) {
-    console.error(
-      "Dashboard metrics error:",
-      err
-    );
+    console.error("Dashboard metrics error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
@@ -5714,11 +5668,11 @@ events.sort((a, b) => {
       events
     });
   } catch (err) {
-    console.error("Dashboard incident timeline error:", err);
+    console.error("Dashboard incident timeline error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -5997,10 +5951,10 @@ ORDER BY ss.scheduled_start ASC
     });
 
   } catch (err) {
-    console.error("Guard shift history error:", err);
+    console.error("Guard shift history error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -6059,11 +6013,11 @@ app.get(
         guards: result.rows,
       });
     } catch (err) {
-      console.error("All guards error:", err);
+      console.error("All guards error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -6204,11 +6158,11 @@ app.put(
     } catch (err) {
       await client.query("ROLLBACK");
 
-      console.error("Guard profile update error:", err);
+      console.error("Guard profile update error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     } finally {
       client.release();
@@ -6360,10 +6314,10 @@ ORDER BY s.id ASC
     });
 
   } catch (err) {
-    console.error("Sites error:", err);
+    console.error("Sites error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -6446,11 +6400,11 @@ app.get("/settings/alert-recipients", requireAuth, async (req, res) => {
       recipients,
     });
   } catch (err) {
-    console.error("Alert recipients GET error:", err);
+    console.error("Alert recipients GET error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message || String(err),
+      message: "Failed to load alert recipients",
     });
   }
 });
@@ -6493,11 +6447,11 @@ app.post("/settings/alert-recipients", requireAuth, async (req, res) => {
       recipient: result.rows[0],
     });
   } catch (err) {
-    console.error("Alert recipient POST error:", err);
+    console.error("Alert recipient POST error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -6535,11 +6489,11 @@ app.put(
         recipient: result.rows[0],
       });
     } catch (err) {
-      console.error("Alert recipient toggle error:", err);
+      console.error("Alert recipient toggle error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -6576,11 +6530,11 @@ app.delete(
         status: "ok",
       });
     } catch (err) {
-      console.error("Alert recipient DELETE error:", err);
+      console.error("Alert recipient DELETE error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -6654,11 +6608,11 @@ app.get("/settings/sites", requireAuth, async (req, res) => {
       sites: result.rows,
     });
   } catch (err) {
-    console.error("Settings sites GET error:", err);
+    console.error("Settings sites GET error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -6711,6 +6665,7 @@ app.post("/settings/sites", requireAuth, async (req, res) => {
     const site = await createSiteWithOperationalId({
       pool, companyId: targetCompanyId, name: siteName,
       location: siteLocation, requiredShifts,
+      questionnaire: questionnaireRuntime.enabled ? {beforeCreate: db => questionnaireRuntime.service().prepareSiteCreation(db,targetCompanyId,req.auth.user_id)} : null,
     });
 
     if (!site) {
@@ -6725,11 +6680,11 @@ app.post("/settings/sites", requireAuth, async (req, res) => {
       site,
     });
   } catch (err) {
-    console.error("Settings site POST error:", err);
+    console.error("Settings site POST error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -6857,16 +6812,17 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
       site: result.rows[0],
     });
   } catch (err) {
-    console.error("Settings site PUT error:", err);
+    console.error("Settings site PUT error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     return res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
 
 registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload });
+registerQuestionnaireRoutes({ app, requireAuth, requireGuardAuth, runtime: questionnaireRuntime });
 
 app.post(
   "/settings/sites/:id/documents/:slot/upload",
@@ -6948,10 +6904,7 @@ app.post(
         });
 
       if (uploadError) {
-        console.error(
-          "Supabase site document upload error:",
-          uploadError
-        );
+        console.error("Supabase site document upload error:");
 
         return res.status(500).json({
           status: "error",
@@ -6997,7 +6950,7 @@ app.post(
         document_url: data.publicUrl,
       });
     } catch (err) {
-      console.error("Site document upload error:", err);
+      console.error("Site document upload error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -7060,11 +7013,11 @@ RETURNING *
         site: result.rows[0],
       });
     } catch (err) {
-      console.error("Site toggle error:", err);
+      console.error("Site toggle error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -7115,11 +7068,11 @@ app.put(
         site: result.rows[0],
       });
     } catch (err) {
-      console.error("Settings site archive error:", err);
+      console.error("Settings site archive error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -7188,11 +7141,11 @@ app.get(
         guards: result.rows,
       });
     } catch (err) {
-      console.error("Settings guards GET error:", err);
+      console.error("Settings guards GET error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -7322,7 +7275,7 @@ app.post(
       });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
-      console.error("Settings guard POST error:", err);
+      console.error("Settings guard POST error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       if (err.code === "23505") {
         return res.status(409).json({ status: "error", message: "Username already exists" });
@@ -7330,7 +7283,7 @@ app.post(
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     } finally {
       client.release();
@@ -7459,11 +7412,11 @@ app.put(
     } catch (err) {
       await client.query("ROLLBACK");
 
-      console.error("Settings guard PUT error:", err);
+      console.error("Settings guard PUT error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     } finally {
       client.release();
@@ -7519,11 +7472,11 @@ app.put(
         guard: result.rows[0],
       });
     } catch (err) {
-      console.error("Settings guard toggle error:", err);
+      console.error("Settings guard toggle error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -7612,7 +7565,7 @@ async function resetGuardPassword(req, res) {
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Settings guard reset password error:", err);
+    console.error("Settings guard reset password error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({ status: "error", message: "Unable to reset guard password." });
   } finally {
     client.release();
@@ -7692,14 +7645,11 @@ app.post(
         scheduled_shifts: created,
       });
     } catch (err) {
-      console.error(
-        "Generate scheduled shifts error:",
-        err
-      );
+      console.error("Generate scheduled shifts error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -7737,11 +7687,11 @@ app.get(
         logs: result.rows,
       });
     } catch (err) {
-      console.error("Event logs error:", err);
+      console.error("Event logs error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "The request could not be completed.",
       });
     }
   }
@@ -7874,11 +7824,11 @@ WHERE
     });
 
   } catch (err) {
-    console.error("Analytics summary error:", err);
+    console.error("Analytics summary error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
-      message: err.message
+      message: "The request could not be completed."
     });
   }
 });
@@ -8046,7 +7996,7 @@ app.post("/alerts/test", requireAuth, async (req, res) => {
       result,
     });
   } catch (err) {
-    console.error("Test alert dispatch error:", err);
+    console.error("Test alert dispatch error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       status: "error",
       message: "Test alert could not be dispatched",
@@ -8072,7 +8022,7 @@ app.get("/settings/test-alerts/:testId", requireAuth, async (req, res) => {
 
     return res.json({ status: "ok", result });
   } catch (err) {
-    console.error("Test alert result error:", err);
+    console.error("Test alert result error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       status: "error",
       message: "Failed to load test alert result",
@@ -8129,7 +8079,7 @@ app.get("/settings/test-alert-history", requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Test alert history error:", err);
+    console.error("Test alert history error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       status: "error",
       message: "Failed to load test alert history",
@@ -8161,7 +8111,7 @@ app.get("/settings/alert-configuration", requireAuth, async (req, res) => {
       last_test: savedResult,
     });
   } catch (err) {
-    console.error("Alert configuration error:", err);
+    console.error("Alert configuration error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       status: "error",
       message: "Failed to load alert configuration",
@@ -8231,12 +8181,12 @@ app.get("/system/status", async (_req, res) => {
   try {
     return res.json(await systemStatusService.getPublicStatus());
   } catch (err) {
-    console.error("Public system status error:", err);
+    console.error("Public system status error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(503).json({
       overall_status: "offline",
       scope: "platform",
       checked_at: new Date().toISOString(),
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -8247,12 +8197,12 @@ app.get("/system/status/tenant", requireAuth, async (req, res) => {
       await systemStatusService.getTenantStatus(req.auth.effective_company_id)
     );
   } catch (err) {
-    console.error("Tenant system status error:", err);
+    console.error("Tenant system status error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       overall_status: "offline",
       scope: "tenant",
       checked_at: new Date().toISOString(),
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -8268,12 +8218,12 @@ app.get("/system/status/global", requireAuth, async (req, res) => {
   try {
     return res.json(await systemStatusService.getGlobalStatus());
   } catch (err) {
-    console.error("Global system status error:", err);
+    console.error("Global system status error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       overall_status: "offline",
       scope: "global",
       checked_at: new Date().toISOString(),
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -8319,14 +8269,14 @@ app.post('/test-sms', requireAuth, async (req, res) => {
     const data = await sendVonageSms(to, text);
     res.json({ status: 'ok', data });
   } catch (err) {
-    console.error('Vonage SMS Error:', err);
-    res.status(500).json({ error: 'SMS failed', details: err.message });
+    console.error("Vonage SMS Error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
+    res.status(500).json({ error: 'SMS failed', details: "The request could not be completed." });
   }
 });
 
 // === ALERT ENDPOINT used by the WebApp ===
 app.post('/alert', requireGuardAuth, async (req, res) => {
-  console.log('ALERT ENDPOINT HIT:', req.body);
+  // No request-body logging: alert metadata may identify an operational incident.
 
   const {
   triggeredAt,
@@ -8347,9 +8297,6 @@ const {
 
   const alertTime = new Date();
 
-console.log("Server now:", alertTime);
-console.log("ISO:", alertTime.toISOString());
-console.log("Locale:", alertTime.toLocaleString("el-GR"));
 
   const incidentRef = `INC-${Date.now()}`;
 
@@ -8381,7 +8328,7 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
     incident_battery_level,
     incident_address,
     incident_location_timestamp,
-    created_at
+    created_at${questionnaireRuntime.captureColumns}
   )
   SELECT
     $1,
@@ -8401,7 +8348,7 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
     $9,
     $10,
     $11::timestamptz,
-    NOW()
+    NOW()${questionnaireRuntime.captureValues}
   FROM sites s
   WHERE s.id = $2::int
   RETURNING *
@@ -8419,7 +8366,8 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
     latitude && longitude
   ? await reverseGeocode(latitude, longitude)
   : locationAddress || null,
-    triggeredAt || alertTime
+    triggeredAt || alertTime,
+    ...(questionnaireRuntime.enabled ? [sessionId] : [])
   ]
 );
 
@@ -8438,6 +8386,8 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
       guard_id: guardId,
     });
 
+    questionnaireRuntime.enqueue(incident.id);
+
     return res.json({
       status: 'ok',
       message: 'Alert received, incident created, notification attempts processed',
@@ -8453,12 +8403,12 @@ console.log("Locale:", alertTime.toLocaleString("el-GR"));
     });
 
   } catch (err) {
-    console.error('Error processing panic alert from /alert:', err);
+    console.error("ALERT_PROCESSING_FAILED");
 
     return res.status(500).json({
       status: 'error',
       message: 'Alert received but processing failed',
-      error: err.message
+      code: 'ALERT_PROCESSING_FAILED'
     });
   }
 });
@@ -8523,7 +8473,7 @@ async function smsDeliveryHook(req, res) {
 
     return res.status(200).send("ok");
   } catch (err) {
-    console.error("Vonage SMS delivery webhook error:", err);
+    console.error("Vonage SMS delivery webhook error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(200).send("ok");
   }
 }
@@ -8534,7 +8484,7 @@ app.post("/webhooks/sms-delivery", smsDeliveryHook);
 // Vonage Voice Webhooks (match Vonage Application URLs)
 
 function answerNcco(req, res) {
-  console.log("VONAGE ANSWER HIT:", { method: req.method, query: req.query, body: req.body });
+  console.log("VONAGE ANSWER HIT:");
 
   const audioUrl = process.env.ALERT_AUDIO_URL;
 
@@ -8574,11 +8524,7 @@ async function eventHook(req, res) {
 
     const incidentInfo = incidentLookup.rows[0] || {};
 
-    console.log("VONAGE VOICE EVENT:", {
-      method: req.method,
-      query: req.query,
-      body: payload
-    });
+    console.log("VONAGE VOICE EVENT:");
 
     await ensureAlertEventsTable();
 
@@ -8629,7 +8575,7 @@ async function eventHook(req, res) {
 
     return res.status(200).send("ok");
   } catch (err) {
-    console.error("Vonage voice webhook error:", err);
+    console.error("Vonage voice webhook error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(200).send("ok");
   }
 }
@@ -8691,7 +8637,7 @@ app.get("/incidents/live", requireAuth, async (req, res) => {
     res.json(result.rows);
 
   } catch (err) {
-    console.error(err);
+    console.error("BACKEND_SERVER_JS_DIAG_008", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       error: "live incidents failed"
@@ -8918,11 +8864,11 @@ aiStatus: row.incident_id
       cards,
     });
   } catch (err) {
-    console.error("Site monitoring error:", err);
+    console.error("Site monitoring error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -8975,6 +8921,10 @@ app.get(
         });
       }
 
+      if (questionnaireRuntime.enabled) {
+        const canonical = await questionnaireRuntime.service().report({auth:req.auth,companyId:Number(req.auth.effective_company_id),actorId:Number(req.auth.user_id)},incidentId,'report');
+        if (canonical) return res.json({status:"ok",responses:canonical.responses,questionnaire:canonical,guard_notes:""});
+      }
       const result = await pool.query(
         `
         SELECT
@@ -9005,14 +8955,11 @@ app.get(
           .join("\n\n"),
       });
     } catch (err) {
-      console.error(
-        "Guard responses error:",
-        err
-      );
+      console.error("GUARD_RESPONSES_READ_FAILED");
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "Guard responses unavailable",
       });
     }
   }
@@ -9142,11 +9089,11 @@ app.post(
         message: "Incident resolved",
       });
     } catch (err) {
-      console.error(err);
+      console.error("BACKEND_SERVER_JS_DIAG_009", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
-        message: err.message,
+        message: "Guard responses unavailable",
       });
     }
   }
@@ -9271,7 +9218,6 @@ app.get("/incidents/resolved", requireAuth, async (req, res) => {
   ),
 }));
 
-console.log(incidents[0]);
 
     res.json({
   status: "ok",
@@ -9279,11 +9225,11 @@ console.log(incidents[0]);
 });
 
   } catch (err) {
-    console.error("Resolved incidents error:", err);
+    console.error("RESOLVED_INCIDENTS_READ_FAILED");
 
     res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "Failed to load resolved incidents",
     });
   }
 });
@@ -9396,7 +9342,8 @@ i.incident_location_timestamp,
 
     const incident = incidentResult.rows[0];
 
-    const guardResponsesResult = await pool.query(
+    const canonicalQuestionnaire = questionnaireRuntime.enabled ? await questionnaireRuntime.service().report({auth:req.auth,companyId:Number(req.auth.effective_company_id),actorId:Number(req.auth.user_id)},incidentId,'export') : null;
+    const guardResponsesResult = canonicalQuestionnaire ? {rows:canonicalQuestionnaire.responses} : await pool.query(
       `
       SELECT
         question_key,
@@ -9552,7 +9499,7 @@ alertEvents.forEach((event) => {
   }
 });
 
-if (guardResponses.length > 0) {
+if (guardResponses.length > 0 && guardResponses[0].submitted !== false) {
   const lastResponse = guardResponses[guardResponses.length - 1];
 
   timeline.push({
@@ -9662,8 +9609,11 @@ incident_location_timestamp_display: formatReportTime(
 
       timeline,
 
+      questionnaire: canonicalQuestionnaire ? {snapshotId:canonicalQuestionnaire.snapshotId,versionId:canonicalQuestionnaire.versionId,digest:canonicalQuestionnaire.digest,submitted:canonicalQuestionnaire.submitted} : null,
       guard_responses: guardResponses.map((row) => ({
         question_key: row.question_key,
+        position: row.position, required: row.required, type: row.type,
+        provenance: row.provenance, omitted: row.omitted, submitted: row.submitted,
         question_text: row.question_text,
         answer: row.answer,
         created_at: row.created_at,
@@ -9692,12 +9642,12 @@ incident_location_timestamp_display: formatReportTime(
         : null,
     });
   } catch (err) {
-    console.error("Incident report error:", err);
+    console.error("INCIDENT_REPORT_READ_FAILED");
 
     res.status(500).json({
       status: "error",
       message: "Failed to generate incident report",
-      error: err.message,
+      code: "INCIDENT_REPORT_UNAVAILABLE",
     });
   }
 });
@@ -9732,11 +9682,9 @@ if (
   });
 }
 
-const forwardedProtocol =
-  req.get("x-forwarded-proto") || req.protocol;
-
+// Never forward bearer credentials to a client-controlled Host/Forwarded header.
 const reportResponse = await fetch(
-  `${forwardedProtocol}://${req.get("host")}/incidents/${incidentId}/report`,
+  `http://127.0.0.1:${Number(process.env.PORT) || 8080}/incidents/${incidentId}/report`,
   {
     headers: {
       Authorization: req.headers.authorization,
@@ -9773,6 +9721,7 @@ const reportResponse = await fetch(
         (item) => `
           <div style="margin-bottom:12px">
             <strong>${escapeHtml(item.question_text)}</strong><br/>
+            <small>${escapeHtml(item.provenance || "Legacy response")}${escapeHtml(item.position ? " · Question " + item.position : "")}${escapeHtml(item.required === false ? " · Optional" : "")}</small><br/>
             ${escapeHtml(item.answer)}
           </div>
         `
@@ -9990,6 +9939,7 @@ const reportResponse = await fetch(
           <table>${timelineHtml}</table>
 
           <h2>Guard Responses</h2>
+          <p>Questionnaire version: ${escapeHtml(data.questionnaire?.versionId || "Legacy unversioned")}</p>
           ${responsesHtml}
 
           <h2>Investigation Notes</h2>
@@ -10031,6 +9981,9 @@ const reportResponse = await fetch(
     });
 
     const page = await browser.newPage();
+    await page.setJavaScriptEnabled(false);
+    await page.setRequestInterception(true);
+    page.on('request', request => /^(data:|about:)/.test(request.url()) ? request.continue() : request.abort());
 
     await page.setContent(html, {
       waitUntil: "networkidle0",
@@ -10055,12 +10008,12 @@ const reportResponse = await fetch(
       await browser.close();
     }
 
-    console.error("Incident PDF report error:", err);
+    console.error("INCIDENT_PDF_RENDER_FAILED");
 
     res.status(500).json({
       status: "error",
       message: "Failed to generate PDF report",
-      error: err.message,
+      code: "INCIDENT_PDF_RENDER_FAILED",
     });
   }
 });
@@ -10133,7 +10086,7 @@ app.get(
         points: result.rows,
       });
     } catch (err) {
-      console.error("Load patrol points error:", err);
+      console.error("Load patrol points error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -10544,12 +10497,12 @@ app.get(
       completed_patrols: completedResult.rows,
     });
   } catch (err) {
-    console.error("Guard patrol board error:", err);
+    console.error("Guard patrol board error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to load guard patrol board",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -10662,12 +10615,12 @@ app.post("/push/subscribe", requireGuardAuth, async (req, res) => {
       subscription: result.rows[0],
     });
   } catch (err) {
-    console.error("Push subscribe error:", err);
+    console.error("Push subscribe error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to save push subscription",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -10695,11 +10648,11 @@ app.post("/push/unsubscribe", requireGuardAuth, async (req, res) => {
       deactivated_count: result.rowCount,
     });
   } catch (err) {
-    console.error("Push unsubscribe error:", err);
+    console.error("Push unsubscribe error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return res.status(500).json({
       status: "error",
       message: "Failed to deactivate push subscription",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -10768,7 +10721,7 @@ async function sendPushNotificationToGuard({
         success: true,
       });
     } catch (err) {
-      console.error("Push send error:", err);
+      console.error("Push send error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       if (err.statusCode === 404 || err.statusCode === 410) {
         await pool.query(
@@ -10782,7 +10735,7 @@ async function sendPushNotificationToGuard({
       results.push({
         subscription_id: sub.id,
         success: false,
-        error: err.message,
+        error: "PUSH_DELIVERY_FAILED",
       });
     }
   }
@@ -10807,7 +10760,7 @@ async function sendPushNotificationToGuard({
   for (const [companyId, delivery] of resultsByCompany) {
     await systemStatusService
       .recordTenantPush(companyId, delivery)
-      .catch((err) => console.error("Push health telemetry error:", err));
+      .catch((err) => console.error("Push health telemetry error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'}));
   }
 
   return {
@@ -11167,7 +11120,7 @@ ORDER BY
       },
     });
   } catch (err) {
-    console.error("Patrol push scheduler error:", err);
+    console.error("Patrol push scheduler error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     await systemStatusService
       .recordPatrolSchedulerRun({
         status: "offline",
@@ -11180,7 +11133,7 @@ ORDER BY
         },
       })
       .catch((telemetryError) =>
-        console.error("Patrol scheduler telemetry error:", telemetryError)
+        console.error("Patrol scheduler telemetry error:")
       );
   } finally {
     patrolPushSchedulerRunning = false;
@@ -11214,11 +11167,11 @@ app.post("/push/test", requireGuardAuth, async (req, res) => {
       result,
     });
   } catch (err) {
-    console.error("Push test error:", err);
+    console.error("Push test error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
-      message: err.message,
+      message: "The request could not be completed.",
     });
   }
 });
@@ -11683,7 +11636,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Patrol scan error:", err);
+    console.error("Patrol scan error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     if (
       err.code === "23505" &&
@@ -11698,7 +11651,7 @@ app.post("/patrol/scan", requireGuardAuth, async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Failed to complete patrol scan",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -11810,7 +11763,7 @@ app.post(
         point: result.rows[0],
       });
     } catch (err) {
-      console.error("Create patrol point error:", err);
+      console.error("Create patrol point error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -11867,7 +11820,7 @@ app.put(
         point: result.rows[0],
       });
     } catch (err) {
-      console.error("Deactivate patrol point error:", err);
+      console.error("Deactivate patrol point error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -11927,7 +11880,7 @@ app.post(
         point: result.rows[0],
       });
     } catch (err) {
-      console.error("Generate QR error:", err);
+      console.error("Generate QR error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -12000,7 +11953,7 @@ app.put(
         point: result.rows[0],
       });
     } catch (err) {
-      console.error("Update patrol schedule error:", err);
+      console.error("Update patrol schedule error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -12150,7 +12103,7 @@ app.post(
         schedules: inserted,
       });
     } catch (err) {
-      console.error("Manual patrol schedule error:", err);
+      console.error("Manual patrol schedule error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -12361,7 +12314,7 @@ app.post(
     } catch (err) {
       await client.query("ROLLBACK");
 
-      console.error("Recurring patrol schedule error:", err);
+      console.error("Recurring patrol schedule error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -12440,12 +12393,12 @@ app.get(
         schedules: result.rows,
       });
     } catch (err) {
-      console.error("Get patrol schedules error:", err);
+      console.error("Get patrol schedules error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
         message: "Failed to load patrol schedules",
-        detail: err.message,
+        detail: "The request could not be completed.",
       });
     }
   }
@@ -12756,12 +12709,12 @@ END AS patrol_status,
       sites: result.rows,
     });
   } catch (err) {
-    console.error("Patrol sites load error:", err);
+    console.error("Patrol sites load error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to load patrol sites",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -12826,12 +12779,12 @@ FROM patrol_points
       points: pointsResult.rows,
     });
   } catch (err) {
-    console.error("Patrol site details error:", err);
+    console.error("Patrol site details error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to load patrol site details",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -12879,12 +12832,12 @@ app.get("/patrol-points/:id/qr", requireAuth, async (req, res) => {
       point: result.rows[0],
     });
   } catch (err) {
-    console.error("Patrol QR load error:", err);
+    console.error("Patrol QR load error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to load patrol QR",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -12908,12 +12861,11 @@ async function reverseGeocode(latitude, longitude) {
 });
 
     if (!response.ok) {
-      console.error("Reverse geocoding HTTP error:", response.status);
+      console.error("Reverse geocoding HTTP error:");
       return null;
     }
 
     const data = await response.json();
-    console.log("NOMINATIM RAW RESPONSE:", JSON.stringify(data, null, 2));
 
     const road =
       data.address?.road ||
@@ -12937,8 +12889,6 @@ async function reverseGeocode(latitude, longitude) {
     const streetWithNumber = [road, houseNumber].filter(Boolean).join(" ");
     const shortAddress = [streetWithNumber, area].filter(Boolean).join(", ");
 
-    console.log("NOMINATIM ADDRESS:", data.address);
-console.log("SHORT ADDRESS:", shortAddress);    
     if (shortAddress) {
       return shortAddress;
     }
@@ -12949,13 +12899,13 @@ console.log("SHORT ADDRESS:", shortAddress);
 
     return null;
   } catch (err) {
-    console.error("Reverse geocoding failed:", err);
+    console.error("REVERSE_GEOCODING_FAILED");
     return null;
   }
 }
 
 app.post("/guard/location", requireGuardAuth, async (req, res) => {
-  console.log("GPS REQUEST BODY:", req.body);
+  // Operational GPS payloads must not be logged.
   try {
     const {
   latitude,
@@ -13018,7 +12968,7 @@ if (needsReverseGeocoding) {
   try {
     locationAddress = await reverseGeocode(parsedLatitude, parsedLongitude);
   } catch (geoErr) {
-    console.error("Reverse geocoding skipped:", geoErr);
+    console.error("Reverse geocoding skipped:", {code: /^[0-9A-Z]{5}$/.test(geoErr?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(geoErr?.code) ? geoErr.code : 'INTERNAL'});
     locationAddress = null;
   }
 }
@@ -13040,12 +12990,12 @@ if (needsReverseGeocoding) {
       message: "Location updated"
     });
   } catch (err) {
-    console.error("Guard location update failed:", err);
+    console.error("Guard location update failed:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
   status: "error",
   message: "Location update failed",
-  detail: err.message
+  detail: "The request could not be completed."
 });
   }
 });
@@ -13095,7 +13045,7 @@ app.get(
       locations: result.rows
     });
   } catch (err) {
-    console.error("Live locations failed:", err);
+    console.error("Live locations failed:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
@@ -13165,7 +13115,7 @@ if (
 
     return `${matchedShift.start} - ${matchedShift.end}`;
   } catch (err) {
-    console.error("Shift resolution error:", err);
+    console.error("Shift resolution error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
     return "Shift resolution failed";
   }
 }
@@ -13526,26 +13476,19 @@ const historyWithShift = historyWithCorrections.map((row) => {
 });
 
 console.log("FIRST 10 HISTORY ROWS:");
-console.dir(
-  historyWithShift.slice(0, 10).map((r) => ({
-    scheduled_at: r.scheduled_at,
-    scheduled_at_display: r.scheduled_at_display,
-    shift_label: r.shift_label,
-  })),
-  { depth: null }
-);
+console.log("BACKEND_SERVER_JS_DIAG_010");
 
 res.json({
   status: "ok",
   history: historyWithShift,
 });
   } catch (err) {
-    console.error("Missed patrol history load error:", err);
+    console.error("Missed patrol history load error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to load missed patrol history",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -13599,10 +13542,7 @@ if (!historyResponse.ok) {
     }
 
     const history = data.history || [];
-    console.log(
-  "PDF FIRST 10:",
-  history.slice(0, 10).map((r) => r.scheduled_at)
-);
+    console.log("PDF FIRST 10:");
 
     const totalMissed = history.length;
     const routineMissed = history.filter(
@@ -13884,12 +13824,12 @@ res.setHeader(
       await browser.close();
     }
 
-    console.error("Missed patrol history PDF error:", err);
+    console.error("Missed patrol history PDF error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
         res.status(500).json({
       status: "error",
       message: "Failed to generate missed patrol PDF report",
-      error: err.message,
+      error: "The request could not be completed.",
     });
   }
 });
@@ -13957,7 +13897,7 @@ app.put(
         manual_patrol: result.rows[0],
       });
     } catch (err) {
-      console.error("Manual patrol cancel error:", err);
+      console.error("Manual patrol cancel error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
@@ -14170,12 +14110,12 @@ app.get(
       manual_history: result.rows,
     });
   } catch (err) {
-    console.error("Manual patrol history load error:", err);
+    console.error("Manual patrol history load error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to load manual patrol history",
-      detail: err.message,
+      detail: "The request could not be completed.",
     });
   }
 });
@@ -14277,12 +14217,12 @@ app.get(
         completed_by_site: countResult.rows,
       });
     } catch (err) {
-      console.error("Patrol history load error:", err);
+      console.error("Patrol history load error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
         message: "Failed to load patrol history",
-        detail: err.message,
+        detail: "The request could not be completed.",
       });
     }
   }
@@ -14494,16 +14434,13 @@ app.get(
         history: filteredHistory,
       });
     } catch (err) {
-      console.error(
-        "Completed patrol history load error:",
-        err
-      );
+      console.error("Completed patrol history load error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
       return res.status(500).json({
         status: "error",
         message:
           "Failed to load completed patrol history",
-        detail: err.message,
+        detail: "The request could not be completed.",
       });
     }
   }
@@ -14876,28 +14813,32 @@ if (!historyResponse.ok) {
       await browser.close();
     }
 
-    console.error("Completed patrol history PDF error:", err);
+    console.error("Completed patrol history PDF error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
 
     res.status(500).json({
       status: "error",
       message: "Failed to generate completed patrol PDF report",
-      error: err.message,
+      error: "The request could not be completed.",
     });
   }
 });
 
+// Last error boundary: never let parser/driver errors print request data.
+app.use(safeRequestError);
+
 async function startBackend() {
   await runMigrations(pool);
+  questionnaireRuntime.start();
   await refreshTemporaryAccessExpirations();
   await systemStatusService.initialize();
 
   const patrolIntegrity =
     await ensurePatrolOccurrenceIntegrity();
 
-  console.log("Patrol occurrence integrity ready:", patrolIntegrity);
+  console.log("Patrol occurrence integrity ready:");
 
   app.listen(PORT, () => {
-    console.log(`Backend server running on port ${PORT}`);
+    console.log("BACKEND_SERVER_JS_DIAG_011");
   });
 
   startScheduledShiftGenerator();
@@ -14906,7 +14847,7 @@ async function startBackend() {
 
   setInterval(() => {
     refreshTemporaryAccessExpirations().catch((error) => {
-      console.error("Temporary access expiration refresh failed:", error);
+      console.error("Temporary access expiration refresh failed:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
     });
   }, 5 * 60 * 1000);
 
@@ -14915,14 +14856,14 @@ async function startBackend() {
 
   const runRandomPatrolGenerator = () =>
     generateRandomPatrolsForCurrentLocalDay(pool).catch((error) => {
-      console.error("Random Patrol generator error:", error);
+      console.error("Random Patrol generator error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
     });
   setTimeout(runRandomPatrolGenerator, 15000);
   setInterval(runRandomPatrolGenerator, 60000);
 }
 
 startBackend().catch((err) => {
-  console.error("Backend startup failed:", err);
+  console.error("Backend startup failed:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
   process.exit(1);
 });
 

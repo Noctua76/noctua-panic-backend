@@ -1,0 +1,10 @@
+{
+  "collectorSha256": "b746ac81d25b05399cd8b359f022f889fe5a52ac0345adad39594cdaaa7bc2f4",
+  "procedureSha256": "4edfaf56ccdfb54f322728199a27deb0b36f1e830d9b0881bab12b66576447d6",
+  "collectorVersion": 2,
+  "launcherVersion": 3,
+  "productionMutationsAllowed": false,
+  "projectId": "0233d8e5-8437-4d94-ad0c-3f24deb1902e",
+  "environmentId": "aa887588-a793-47b7-b789-df297f78ef8d",
+  "serviceId": "75a4edb0-86fb-4fb6-b7d7-3f88880503ec"
+}

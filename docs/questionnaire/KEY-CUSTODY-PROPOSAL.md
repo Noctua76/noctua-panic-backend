@@ -1,0 +1,17 @@
+# Production custody proposal — approval required, not provisioned
+
+Historical initial file-provider proposal. The concrete Railway delivery recommendation is now KEY-CUSTODY-RAILWAY-V2.md (sealed memory provider plus reviewed Docker build isolation). That document supersedes deploy-specific delivery statements below; cryptographic custody principles remain applicable. Neither option is provisioned.
+
+Use the existing backend infrastructure and an Owner-controlled secret source. Supply a versioned keyring to the backend as a restricted file owned by the process (0600); `Keyring.fromFile` opens without following symlinks and validates ownership, mode, size, key pairing and historical entries. Do not put this file in source, images, build artifacts, browser storage or reports. The present implementation consumes `QUESTIONNAIRE_KEYRING_FILE`; a deploy-specific secure mount/bootstrap procedure must be accepted against actual Railway capabilities before activation. No bootstrap that writes keys from ordinary visible variables is approved by this proposal.
+
+No new KMS/HSM service is required by the proposal and no purchase is authorized. Incremental provider subscription cost proposed: zero; existing compute/storage/secret features remain subject to the Owner's plan and observed capabilities. This is not a provider pricing guarantee. If existing secret delivery cannot meet this model, leave activation disabled and submit the bounded alternative for approval.
+
+Every checkpoint has an independent random AES key and nonce. A versioned RSA wrapping key unwraps it; scope/identity/revision are authenticated. Tenant HMAC keys derive from a versioned integrity root. Current wrapping roots are shared across tenant envelopes; this is not a claim of independent per-tenant RSA custody. Root compromise affects the retained scopes and requires security incident handling.
+
+Access: backend runtime only; Owner authorizes custodians, recovery reviewers and independent access review. Questionnaire permissions never grant filesystem/key export. Supabase service-role credentials remain separate from questionnaire keys. Record key IDs and audit metadata, never key bytes.
+
+Rotation: provision a fresh key version only after separate Owner authorization; retain old unwrap/integrity versions until all evidence, receipts and recoverable backups can be read. Switch active writes only after round-trip and historical tests. Never delete a key to perform retention cleanup. Rewrap/re-encrypt existing envelopes only under a separate bounded, reversible migration with manifest and recovery proof.
+
+Backup: keep an independently protected encrypted key backup outside the application database and deployment image, with at least two Owner-designated custodians/recovery paths. The Owner must approve RPO/RTO, retention and legal holds. Test isolated database restore plus matching old keys before production. The synthetic SQL restore proves code compatibility, not provider backup encryption or key-escrow recoverability.
+
+Compromise response: disable new questionnaire configuration/finalization as needed while preserving ciphertext and panic delivery; revoke compromised access; issue separately authorized fresh keys; inventory affected key IDs; preserve original authorship, receipts and historical bindings. Do not erase evidence or silently substitute today's questionnaire. Lost keys are a recoverable availability incident only when a verified escrow exists; otherwise affected evidence remains unreadable and must not be relabeled as recovered.

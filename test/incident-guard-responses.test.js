@@ -16,11 +16,13 @@ const responseSource = section('app.get(\n  "/incidents/:id/guard-responses"', '
 const reportSource = section('function formatDuration(', '// QR PATROL POINTS API');
 const guard = { guard_id: 1, site_id: 1, session_id: 253, company_id: 1 };
 const answers = { incident_type: 'Test incident', location: 'Main entrance', actions_taken: 'Contacted supervisor' };
-function routes(pool, ai = async () => 'summary', Clock = Date) {
+function routes(pool, ai = async () => 'summary', Clock = Date, nativeRenderer = null) {
   const handlers = {}, dispatches = [], diagnostics = [];
   let aiCalls = 0, pdfHtml = '';
   const requireGuardAuth = () => {}, requireAuth = () => {};
   const sandbox = {
+    process: { env: { PORT: '8080' } },
+    questionnaireRuntime: { enabled:false,captureColumns:'',captureValues:'',enqueue() {} },
     app: Object.fromEntries(['get','post'].map(method => [method, (route, auth, handler) => {
       for (const endpoint of Array.isArray(route) ? route : [route]) {
         assert.equal(auth, ['/alert','/incident-log','/incident-log/guard-responses'].includes(endpoint) ? requireGuardAuth : requireAuth);
@@ -33,7 +35,7 @@ function routes(pool, ai = async () => 'summary', Clock = Date) {
     alertDispatcher: { dispatchAlertNotifications: async args => { dispatches.push(args); return { notifications: { sms: [{ phone: 'test' }], voice: [{ phone: 'test' }] } }; } },
     console: { log() {}, error: (...a) => diagnostics.push(a), warn: (...a) => diagnostics.push(a) },
     getCompanyTimezone: async () => 'Europe/Athens',
-    puppeteer: { launch: async () => ({ newPage: async () => ({ setContent: async html => { pdfHtml = html; }, pdf: async () => Buffer.from('%PDF-test') }), close: async () => {} }) },
+    puppeteer: nativeRenderer || { launch: async () => ({ newPage: async () => ({ setJavaScriptEnabled: async value => assert.equal(value,false), setRequestInterception: async value => assert.equal(value,true), on() {}, setContent: async html => { pdfHtml = html; }, pdf: async () => Buffer.from('%PDF-test') }), close: async () => {} }) },
     fetch: async (_url, options) => { assert.equal(options.headers.Authorization, 'Bearer test-admin'); const res = await invoke('get /incidents/:id/report', { params: { id: sandbox.reportId }, auth: { effective_company_id: 1 } }); return { json: async () => res.body }; },
   };
   vm.runInNewContext(logSource + panicSource + responseSource + reportSource, sandbox);
@@ -157,6 +159,27 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
     const pdf = await r.invoke('get /incidents/:id/report/pdf', { params: { id }, headers: { authorization: 'Bearer test-admin' }, protocol: 'http', get: key => key === 'host' ? 'localhost' : null });
     assert.equal(pdf.statusCode, 200); assert.equal(pdf.headers['Content-Type'], 'application/pdf'); assert.ok(pdf.body.toString().startsWith('%PDF'));
     for (const answer of Object.values(answers)) assert.ok(r.pdfHtml().includes(answer));
+  });
+  await t.test('native Chromium PDF: Greek, Unicode, long answers and adversarial text with no external requests', async () => {
+    const puppeteer = require('puppeteer');
+    const next = await panic(); await submit(next);
+    const adversarial = '<img src="https://native-canary.invalid/leak" onerror="globalThis.pwned=true"><script>globalThis.pwned=true</script>';
+    const synthetic = 'Συνθετική καταγραφή — έλεγχος ελληνικών και Unicode 😀.\n'.repeat(75);
+    await pool.query('UPDATE incident_guard_responses SET question_text=$2, answer=$3 WHERE incident_id=$1',[next,'Συνθετική ερώτηση '+adversarial,synthetic+adversarial]);
+    const out = process.env.AEGIS_TEST_ARTIFACT_DIR || require('node:os').tmpdir();
+    fs.mkdirSync(out,{recursive:true}); const requests=[]; let captured='';
+    const renderer = {launch: async options => {
+      const browser=await puppeteer.launch({...options,executablePath:process.env.CHROMIUM_PATH || '/usr/bin/google-chrome'});
+      const newPage=browser.newPage.bind(browser);
+      browser.newPage=async()=>{const page=await newPage();page.on('request',request=>requests.push(request.url()));
+        const content=page.setContent.bind(page);page.setContent=async(html,opts)=>{captured=html;return content(html,opts);};
+        const pdf=page.pdf.bind(page);page.pdf=async opts=>{await page.screenshot({path:path.join(out,'incident-report-native.png'),fullPage:true});return pdf(opts);};return page;};return browser;
+    }};
+    const native=routes(pool,undefined,Date,renderer);native.sandbox.reportId=next;
+    const result=await native.invoke('get /incidents/:id/report/pdf',{params:{id:next},headers:{authorization:'Bearer test-admin'},protocol:'https',get:()=> 'attacker.invalid'});
+    assert.equal(result.statusCode,200,JSON.stringify(result.body));assert.ok(Buffer.from(result.body).subarray(0,4).toString()==='%PDF');
+    assert.ok(captured.includes('&lt;script&gt;'));assert.ok(!captured.includes(adversarial));assert.ok(!requests.some(url=>url.includes('native-canary.invalid')));
+    fs.writeFileSync(path.join(out,'incident-report-native.pdf'),result.body);
   });
   await t.test('lost receipt can be replayed after resolution without new writes or lifecycle changes', async () => {
     const next = await panic();
@@ -289,4 +312,14 @@ test('real PostgreSQL: association, atomic persistence, retries and report separ
     assert.equal(res.body.investigation.guard_notes, 'Edited investigation note');
     assert.deepEqual(Array.from(res.body.guard_responses, row => row.answer), Object.values(answers));
   });
+});
+
+
+test('alert processing failures disclose neither request content nor raw driver diagnostics',async()=>{
+ const secret='SYNTHETIC_PRIVATE_ALERT_CANARY';
+ const r=routes({query:async()=>{throw Object.assign(new Error(secret),{code:'SYNTHETIC-'+secret});}});
+ const response=await r.invoke('post /alert',{guard,body:{message:secret},headers:{}});
+ assert.equal(response.statusCode,500);assert.equal(response.body.code,'ALERT_PROCESSING_FAILED');
+ assert.ok(!JSON.stringify(response.body).includes(secret));assert.ok(!JSON.stringify(r.diagnostics).includes(secret));
+ assert.doesNotMatch(panicSource,/console\.log\([^\n]*(?:req\.body|alertTime)/);
 });

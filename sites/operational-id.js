@@ -16,10 +16,11 @@ function formatSiteCode(prefix, number) {
   return `${prefix}-${String(number).padStart(3, "0")}`;
 }
 
-async function createSiteWithOperationalId({ pool, companyId, name, location, requiredShifts }) {
+async function createSiteWithOperationalId({ pool, companyId, name, location, requiredShifts, questionnaire = null }) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const initializeQuestionnaire = questionnaire ? await questionnaire.beforeCreate(client) : null;
     const company = await client.query(
       `SELECT site_prefix, next_site_number FROM companies WHERE id = $1 FOR UPDATE`,
       [companyId]
@@ -40,6 +41,7 @@ async function createSiteWithOperationalId({ pool, companyId, name, location, re
       `UPDATE companies SET next_site_number = $2 WHERE id = $1`,
       [companyId, number + 1]
     );
+    if (initializeQuestionnaire) await initializeQuestionnaire(result.rows[0]);
     await client.query("COMMIT");
     return result.rows[0];
   } catch (error) {

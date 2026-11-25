@@ -83,7 +83,7 @@ async function enforceTenantContextBoundary(req, res, pool, requestPath) {
       await recordTenantAudit(pool, auth, "TENANT_MUTATION_ATTEMPT", auth.effective_company_id,
         req.method, requestPath, null, "administrative", auth.tenant_context_reason, requestId);
     } catch (error) {
-      console.error("CRITICAL Tenant mutation attempt audit unavailable", requestId, error);
+      console.error("CRITICAL Tenant mutation attempt audit unavailable", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       res.status(503).json({ status: "error", code: "TENANT_AUDIT_UNAVAILABLE" });
       return true;
     }
@@ -93,7 +93,7 @@ async function enforceTenantContextBoundary(req, res, pool, requestPath) {
     res.once("finish", () => {
       recordTenantAudit(pool, auditAuth, "TENANT_MUTATION_RESULT", auditAuth.effective_company_id,
         req.method, requestPath, res.statusCode, "administrative", auditAuth.tenant_context_reason, requestId)
-        .catch(error => console.error("CRITICAL Tenant mutation result audit failed", requestId, error));
+        .catch(error => console.error("CRITICAL Tenant mutation result audit failed", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'}));
     });
   }
   return false;

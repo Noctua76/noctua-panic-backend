@@ -1,0 +1,11 @@
+{
+  "procedureVersion": 4,
+  "collectorVersion": 2,
+  "collectorSha256": "39118dd89e94551950a1915d434bb4d61189004d2dae8f02ef42c2abf3605db8",
+  "procedureSha256": "c76b3acfb39b3a9ad84a04b67d8b38811146f988ab3015014891d0abc3e8fdd5",
+  "totalBudgetMs": 600000,
+  "collectorBudgetMs": 300000,
+  "transportBudgetMs": 330000,
+  "stdinMode": "OS_FILE_BACKED_EOF",
+  "productionMutationsAllowed": false
+}
