@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 10
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -26,10 +26,15 @@ jobs:
     env:
       PUPPETEER_SKIP_DOWNLOAD: "true"
       CHROMIUM_PATH: /usr/bin/google-chrome
+      AEGIS_PG_BIN: /usr/lib/postgresql/18/bin
+      AEGIS_PG_SERVER_BIN: /usr/lib/postgresql/18/bin
+      AEGIS_GUARD_SOURCE: ${{ runner.temp }}/aegis-guard-source
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aegis_test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use Node.js 20
         uses: actions/setup-node@v4
@@ -38,10 +43,16 @@ jobs:
           cache: npm
 
       - name: Install transport test prerequisites
-        run: sudo apt-get update && sudo apt-get install -y openssh-server
+        run: sudo apt-get update && sudo apt-get install -y openssh-server postgresql-18 postgresql-client-18
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Fetch exact public Guard compatibility source
+        run: |
+          git clone --quiet https://github.com/Noctua76/noctua-panic-webapp.git "$AEGIS_GUARD_SOURCE"
+          git -C "$AEGIS_GUARD_SOURCE" checkout --quiet 751eb02166221a8e97471e3b1ce693948e37c9c9
+          test "$(git -C "$AEGIS_GUARD_SOURCE" rev-parse 'HEAD^{tree}')" = 473f77806584b699ae80a46206390ddef03c22e5
 
       - name: Run test suite
         run: npm test
