@@ -20,6 +20,7 @@ const MIGRATIONS = [
   "2026-09-30-system-owner-mutation-audit.sql",
   "2026-10-01-operational-site-id.sql",
   "2026-10-02-private-site-sop.sql",
+  "2026-11-25-incident-questionnaires.sql",
 ];
 
 async function runMigrations(pool) {

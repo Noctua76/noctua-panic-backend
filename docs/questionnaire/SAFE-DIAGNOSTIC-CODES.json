@@ -1,0 +1,54 @@
+[
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_001",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_002",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_003",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_004",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_005",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_006",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_007",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_008",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_009",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_010",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "BACKEND_SERVER_JS_DIAG_011",
+    "file": "backend/server.js"
+  },
+  {
+    "code": "DASHBOARD_SRC_APP_JSX_DIAG_001",
+    "file": "dashboard/src/App.jsx"
+  },
+  {
+    "code": "DASHBOARD_SRC_APP_JSX_DIAG_002",
+    "file": "dashboard/src/App.jsx"
+  }
+]

@@ -274,7 +274,7 @@ function createRandomPatrolRouter({ pool, requireAuth, requirePermission, requir
       );
       return res.json({ status: "ok", site, points: result.rows });
     } catch (error) {
-      console.error("Random patrol config load error:", error);
+      console.error("Random patrol config load error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({ status: "error", message: "Failed to load Random Patrol configuration" });
     }
   });
@@ -399,7 +399,7 @@ function createRandomPatrolRouter({ pool, requireAuth, requirePermission, requir
       });
     } catch (error) {
       if (transactionStarted) await client.query("ROLLBACK");
-      console.error("Random patrol config save error:", error);
+      console.error("Random patrol config save error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({ status: "error", message: "Failed to save Random Patrol configuration" });
     } finally {
       client.release();
@@ -439,7 +439,7 @@ function createRandomPatrolRouter({ pool, requireAuth, requirePermission, requir
       if (!schedule) return res.status(404).json({ status: "error", message: "Site not found" });
       return res.json({ status: "ok", ...schedule });
     } catch (error) {
-      console.error("Random schedule load error:", error);
+      console.error("Random schedule load error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({ status: "error", message: "Failed to load Random Patrol schedule" });
     }
   });
@@ -487,7 +487,7 @@ function createRandomPatrolRouter({ pool, requireAuth, requirePermission, requir
       return res.send(pdf);
     } catch (error) {
       if (browser) await browser.close();
-      console.error("Random schedule PDF error:", error);
+      console.error("Random schedule PDF error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({ status: "error", message: "Failed to generate Random Patrol PDF" });
     }
   });

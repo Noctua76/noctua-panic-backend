@@ -56,7 +56,7 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
       res.set("X-Content-Type-Options", "nosniff");
       return res.send(Buffer.from(await data.arrayBuffer()));
     } catch (error) {
-      console.error("Private SOP download failed", error);
+      console.error("Private SOP download failed", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(503).json({ status: "error", message: "SOP temporarily unavailable" });
     }
   });
@@ -104,7 +104,7 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
             if (!removal.error) publicCopyRemoved = true;
           }
         } catch (cleanupError) {
-          console.error("Legacy public SOP cleanup failed", cleanupError);
+          console.error("Legacy public SOP cleanup failed", {code: /^[0-9A-Z]{5}$/.test(cleanupError?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(cleanupError?.code) ? cleanupError.code : 'INTERNAL'});
         }
       }
       if (publicCopyRemoved || !site.sop_file_url) {
@@ -114,7 +114,7 @@ function registerSiteSopRoutes({ app, pool, supabase, requireAuth, upload }) {
       return res.json({ status: "ok", site: updated.rows[0], sop_available: true,
         public_copy_removed: publicCopyRemoved, legacy_public_copy_pending: Boolean(site.sop_file_url && !publicCopyRemoved) });
     } catch (error) {
-      console.error("Private SOP upload failed", error);
+      console.error("Private SOP upload failed", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(503).json({ status: "error", message: "Private SOP storage unavailable" });
     }
   });

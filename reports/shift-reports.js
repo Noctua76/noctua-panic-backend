@@ -316,11 +316,11 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
       if (client) await client.query("ROLLBACK").catch(() => {});
       if (uploadedPaths.length) {
         await removeStorageWithRetry(storage, uploadedPaths).catch((cleanupError) =>
-          console.error("Shift Report storage cleanup failed after retries:", cleanupError)
+          console.error("Shift Report storage cleanup failed after retries:", {code: /^[0-9A-Z]{5}$/.test(cleanupError?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(cleanupError?.code) ? cleanupError.code : 'INTERNAL'})
         );
       }
       const status = error instanceof multer.MulterError ? 400 : (error.statusCode || 500);
-      console.error("Create Shift Report error:", error);
+      console.error("Create Shift Report error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(status).json({ status: "error", message: status === 500 ? "Could not create Shift Report" : error.message });
     } finally {
       client?.release();
@@ -338,7 +338,7 @@ function createShiftReportsRouter({ pool, requireAuth, requireGuardAuth, storage
       );
       return res.json({ status: "ok", reports: result.rows.map(mapReport) });
     } catch (error) {
-      console.error("Current Shift Reports error:", error);
+      console.error("Current Shift Reports error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({ status: "error", message: "Could not load Shift Reports" });
     }
   });

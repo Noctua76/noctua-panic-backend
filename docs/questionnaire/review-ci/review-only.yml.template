@@ -1,0 +1,41 @@
+# Install ONLY in an Owner-approved PRIVATE review repository. No publication performed.
+name: Aegis private review only
+on:
+  workflow_dispatch:
+    inputs:
+      archive_sha256:
+        description: Independently reviewed SHA-256 of review-input/candidate.zip
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: aegis-private-review
+  cancel-in-progress: false
+jobs:
+  isolated-review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      AEGIS_ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20.20.2'
+      - name: Reconstruct and verify isolated candidate
+        run: bash review-ci/run-private-review.sh review-input/candidate.zip "$AEGIS_ARCHIVE_SHA256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: aegis-private-review-evidence
+          path: |
+            review-results/*.tap
+            review-results/*.log
+            review-results/*.json
+            review-results/native/*.pdf
+          retention-days: 7
+          if-no-files-found: error

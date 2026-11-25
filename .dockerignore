@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+.env
+.env.*
+*.key
+*.pem
+*.age
+*keyring*.json
+output
+evidence
+test
+security-tests
+docs
+
+questionnaire/development-schema.sql

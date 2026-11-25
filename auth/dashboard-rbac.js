@@ -20,6 +20,8 @@ function normalizeCode(value) {
 }
 
 function routePermission(method, path) {
+  const questionnaire = require('../questionnaire/route-policy').classifyQuestionnaireRoute(method, path);
+  if (questionnaire !== undefined) return questionnaire;
   const mutation = !SAFE_METHODS.has(method);
 
   if (path === "/admin/heartbeat" || path === "/admin/logout" || path === "/auth/change-password" || path === "/auth/context") return null;

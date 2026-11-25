@@ -388,7 +388,7 @@ function createCompaniesRouter({
     try {
       return res.json({ status: "ok", companies: await listCompanies(pool) });
     } catch (error) {
-      console.error("List companies error:", error);
+      console.error("List companies error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(error.status || 500).json({
         status: "error",
         code: error.code || "COMPANIES_LIST_FAILED",
@@ -408,7 +408,7 @@ function createCompaniesRouter({
       });
       return res.status(201).json({ status: "ok", ...result });
     } catch (error) {
-      console.error("Create company error:", error);
+      console.error("Create company error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       if (error.code === "23505") {
         if (error.constraint === "companies_site_prefix_unique") {
           return res.status(409).json({ status: "error", code: "SITE_PREFIX_EXISTS", message: "Operational Site Prefix is already assigned to another company" });
@@ -434,7 +434,7 @@ function createCompaniesRouter({
       });
       return res.json({ status: "ok", ...result });
     } catch (error) {
-      console.error("Change company status error:", error);
+      console.error("Change company status error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(error.status || 500).json({
         status: "error",
         code: error.code || "COMPANY_STATUS_CHANGE_FAILED",

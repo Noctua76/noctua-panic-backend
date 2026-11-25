@@ -484,7 +484,7 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
 
       return res.json({ status: "ok", occurrences });
     } catch (error) {
-      console.error("Patrol corrections occurrence load error:", error);
+      console.error("Patrol corrections occurrence load error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({
         status: "error",
         message: "Unable to load patrol occurrences",
@@ -572,7 +572,7 @@ function createPatrolCorrectionsRouter({ pool, requireAuth, requirePermission })
         correction: insertResult.rows[0],
       });
     } catch (error) {
-      console.error("Patrol correction creation error:", error);
+      console.error("Patrol correction creation error:", {code: /^[0-9A-Z]{5}$/.test(error?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(error?.code) ? error.code : 'INTERNAL'});
       return res.status(500).json({
         status: "error",
         message: "Unable to create patrol correction",
