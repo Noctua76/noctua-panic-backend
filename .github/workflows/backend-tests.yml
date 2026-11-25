@@ -24,6 +24,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      POWERSHELL_TELEMETRY_OPTOUT: "1"
+      POWERSHELL_UPDATECHECK: "Off"
       PUPPETEER_SKIP_DOWNLOAD: "true"
       CHROMIUM_PATH: /usr/bin/google-chrome
       AEGIS_PG_BIN: /usr/lib/postgresql/18/bin
@@ -54,8 +56,11 @@ jobs:
           git -C "$AEGIS_GUARD_SOURCE" checkout --quiet 751eb02166221a8e97471e3b1ce693948e37c9c9
           test "$(git -C "$AEGIS_GUARD_SOURCE" rev-parse 'HEAD^{tree}')" = 473f77806584b699ae80a46206390ddef03c22e5
 
+      - name: Warm bounded PowerShell test runtime
+        run: timeout 30s pwsh -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+
       - name: Run test suite
-        run: npm test
+        run: npm test -- --test-concurrency=2
 
   runtime-image:
     runs-on: ubuntu-latest
