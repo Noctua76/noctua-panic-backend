@@ -6735,7 +6735,6 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         name = COALESCE($1, name),
         location = COALESCE($2, location),
         required_shifts = COALESCE($3, required_shifts),
-        status = COALESCE($4, status),
         full_address = COALESCE($5, full_address),
         site_phone = COALESCE($6, site_phone),
         shift_schedule = COALESCE($7, shift_schedule),
@@ -6750,7 +6749,7 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         sop_version = COALESCE($16, sop_version),
         sop_updated_at = CASE
           WHEN $13 IS NOT NULL
-            OR $14 IS NOT NULL
+            OR $14::text IS NOT NULL
             OR $15 IS NOT NULL
             OR $16 IS NOT NULL
           THEN NOW()
@@ -6764,11 +6763,13 @@ app.put("/settings/sites/:id", requireAuth, async (req, res) => {
         emergency_instructions = COALESCE($22, emergency_instructions),
         special_warnings = COALESCE($23, special_warnings)
       WHERE id = $24
-        AND (
-          $25::boolean IS FALSE
-          AND company_id = $26
-        )
-      RETURNING *
+  AND (
+    $25::boolean IS FALSE
+    AND company_id = $26
+  )
+  AND status IN ('active', 'inactive')
+  AND ($4::text IS NULL OR status::text = $4::text)
+RETURNING *
       `,
       [
         name || null,
@@ -6960,122 +6961,117 @@ app.post(
   }
 );
 
-app.put(
-  "/settings/sites/:id/toggle-active",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const siteId = Number(req.params.id);
-      const tenantBypass = false;
+async function handleSiteLifecycle(req, res, action) {
+  try {
+    const siteId = Number(req.params.id);
+    const companyId = Number(req.auth.effective_company_id);
 
-      if (!Number.isInteger(siteId) || siteId <= 0) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid site id",
-        });
-      }
+    if (!Number.isInteger(siteId) || siteId <= 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid site id",
+      });
+    }
 
-      const result = await pool.query(
-        `
-        UPDATE sites
-SET
-  status =
-    CASE
-      WHEN status = 'active' THEN 'inactive'
-      ELSE 'active'
-    END,
-  active_changed_at = NOW(),
-  active_changed_by = $4
-WHERE id = $1
-  AND (
-    $2::boolean IS FALSE
-    AND company_id = $3
-  )
-RETURNING *
-        `,
-        [
-  siteId,
-  tenantBypass,
-  req.auth.effective_company_id,
-  req.auth.user_id,
-]
+    if (!Number.isInteger(companyId) || companyId <= 0) {
+      return res.status(403).json({
+        status: "error",
+        message: "Company context required",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE sites
+      SET
+        status = CASE
+          WHEN $3::text = 'archive' THEN 'archived'
+          WHEN $3::text = 'restore' THEN 'inactive'
+          WHEN $3::text = 'toggle'
+            AND status = 'active' THEN 'inactive'
+          WHEN $3::text = 'toggle'
+            AND status = 'inactive' THEN 'active'
+          ELSE status
+        END,
+        active_changed_at = NOW(),
+        active_changed_by = $4
+      WHERE id = $1
+        AND company_id = $2
+        AND (
+          (
+            $3::text IN ('toggle', 'archive')
+            AND status IN ('active', 'inactive')
+          )
+          OR (
+            $3::text = 'restore'
+            AND status = 'archived'
+          )
+        )
+      RETURNING *
+      `,
+      [
+        siteId,
+        companyId,
+        action,
+        req.auth.user_id,
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      const existing = await pool.query(
+        `SELECT id FROM sites
+         WHERE id = $1 AND company_id = $2`,
+        [siteId, companyId]
       );
 
-      if (result.rows.length === 0) {
+      if (existing.rows.length === 0) {
         return res.status(404).json({
           status: "error",
           message: "Site not found",
         });
       }
 
-      return res.json({
-        status: "ok",
-        site: result.rows[0],
-      });
-    } catch (err) {
-      console.error("Site toggle error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
-
-      return res.status(500).json({
+      return res.status(409).json({
         status: "error",
-        message: "The request could not be completed.",
+        message: "Site status does not allow this action",
       });
     }
+
+    return res.json({
+      status: "ok",
+      site: result.rows[0],
+    });
+
+  } catch (err) {
+    console.error("Site lifecycle error", {
+      code: /^[0-9A-Z]{5}$/.test(err?.code || "")
+        ? err.code
+        : "INTERNAL",
+    });
+
+    return res.status(500).json({
+      status: "error",
+      message: "The request could not be completed.",
+    });
   }
+}
+
+app.put(
+  "/settings/sites/:id/toggle-active",
+  requireAuth,
+  (req, res) => handleSiteLifecycle(req, res, "toggle")
 );
 
 app.put(
   "/settings/sites/:id/archive",
   requireAuth,
-  async (req, res) => {
-    try {
-      const siteId = Number(req.params.id);
-      const tenantBypass = false;
+  (req, res) => handleSiteLifecycle(req, res, "archive")
+);
 
-      if (!Number.isInteger(siteId) || siteId <= 0) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid site id",
-        });
-      }
-
-      const result = await pool.query(
-        `
-        UPDATE sites
-        SET status = 'archived'
-        WHERE id = $1
-          AND (
-            $2::boolean IS FALSE
-            AND company_id = $3
-          )
-        RETURNING *
-        `,
-        [
-          siteId,
-          tenantBypass,
-          req.auth.effective_company_id,
-        ]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          status: "error",
-          message: "Site not found",
-        });
-      }
-
-      return res.json({
-        status: "ok",
-        site: result.rows[0],
-      });
-    } catch (err) {
-      console.error("Settings site archive error:", {code: /^[0-9A-Z]{5}$/.test(err?.code || '') || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND'].includes(err?.code) ? err.code : 'INTERNAL'});
-
-      return res.status(500).json({
-        status: "error",
-        message: "The request could not be completed.",
-      });
-    }
-  }
+app.put(
+  "/settings/sites/:id/restore",
+  requireAuth,
+  (req, res) => handleSiteLifecycle(req, res, "restore")
 );
 
 // ----------------------------------------------------------
@@ -7717,6 +7713,7 @@ const tenantBypass =
 FROM sites
 WHERE
   ($1::boolean IS FALSE AND company_id = $2)
+  AND status = 'active'
       `,
       [
     tenantBypass,
@@ -7751,6 +7748,7 @@ WHERE
   WHERE
   g.active = true
   AND g.access_mode = 'standard'
+  AND s.status = 'active'
   AND ($1::boolean IS FALSE AND s.company_id = $2)
   `,
   [
@@ -7777,7 +7775,7 @@ WHERE
     let readinessRatio = null;
     let readinessLevel = "No Data";
 
-    if (assignedGuards > 0 && requiredShifts > 0) {
+    if (requiredShifts > 0) {
       readinessRatio = Number(
         (assignedGuards / requiredShifts).toFixed(2)
       );
